@@ -103,9 +103,9 @@ async fn main() {
     let upstash = UpstashStore::from_env();
     if let Some(store) = &upstash {
         if store.ping().await {
-            tracing::info!("Upstash Redis sync enabled");
+            tracing::info!("Redis sync enabled (backend: {})", store.backend_kind());
         } else {
-            tracing::warn!("Upstash Redis unreachable at startup — running degraded (local-only) until it recovers");
+            tracing::warn!("Redis unreachable at startup — running degraded (local-only) until it recovers");
         }
         // Fleet convergence: seed-if-empty, then adopt the shared values.
         // (Local DB/env already loaded above as the fallback/seed source.)

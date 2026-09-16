@@ -1,8 +1,16 @@
-//! Shared cross-instance state via Upstash Redis (REST API).
+//! Shared cross-instance state via Redis.
 //!
-//! When `UPSTASH_REDIS_REST_URL` + `UPSTASH_REDIS_REST_TOKEN` are set, every
-//! instance coordinates through one Redis database instead of drifting apart:
-//! app settings, Tidal access tokens, API-key usage, and credential backups.
+//! Two backends, one key layout (`hifi:*`):
+//! - **Upstash REST** (`UPSTASH_REDIS_REST_URL` + `UPSTASH_REDIS_REST_TOKEN`):
+//!   the private fleet's database, spoken over HTTPS (`GET /CMD/args…`,
+//!   `POST /pipeline`).
+//! - **Native** (`PUBLIC_POOL_REDIS_URL=rediss://…`): the public fleet's
+//!   Redis/Valkey, spoken as raw RESP2 over TLS. Selected when set — it wins
+//!   over the Upstash pair, because a host belongs to exactly one pool.
+//!
+//! When every instance of a fleet points at the same database they coordinate
+//! through it instead of drifting apart: app settings, Tidal access tokens,
+//! API-key usage, and credential backups.
 //!
 //! Design rules:
 //! - **Fail-open.** Redis is an accelerator, not a dependency: every call has
@@ -11,12 +19,11 @@
 //! - **Local fast path stays.** Hot paths (account selection, token fast
 //!   path) never block on Redis; sync is write-through on
 //!   state changes plus periodic reconcile on the existing 60s ticks.
-//! - **No new crates.** Uses the existing `reqwest` client against the
-//!   Upstash REST API (`GET /CMD/args…`, `POST /pipeline`).
-//! - **Secrets stay in env.** The token lives only in memory; values are
-//!   never logged (only key names and counts, at debug level).
+//! - **Secrets stay in env.** Tokens live only in memory; values are
+//!   never logged (only key names and counts, at debug level). The native URL
+//!   embeds its password, so it is never logged either — see `backend_kind`.
 //!
-//! Key layout (prefix `hifi`):
+//! Key layout (prefix `hifi`), identical on both backends:
 //! - `hifi:settings:<name>` — app settings (plain strings)
 //! - `hifi:token:<account_id>` — `{"t": access_token, "e": expires_at}`
 //! - `hifi:apikey:<key_id>` — consumed quota units (int)
@@ -33,10 +40,16 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use redis::AsyncCommands;
 use serde_json::Value;
 
 const REST_TIMEOUT: Duration = Duration::from_secs(3);
+const NATIVE_TIMEOUT: Duration = Duration::from_secs(3);
 const PREFIX: &str = "hifi";
+
+/// Env var selecting the native backend (public pool). Wins over the Upstash
+/// pair when set; a host belongs to exactly one pool.
+const NATIVE_URL_ENV: &str = "PUBLIC_POOL_REDIS_URL";
 
 /// Percent-encode a single REST path segment (RFC3986 unreserved set passes
 /// through; everything else — including `/`, spaces, `+`, `=` in tokens —
@@ -70,11 +83,21 @@ fn result_i64(v: &Value) -> Option<i64> {
     }
 }
 
+enum Backend {
+    Rest {
+        client: reqwest::Client,
+        base: String,
+        token: String,
+    },
+    Native {
+        client: redis::Client,
+        mgr: tokio::sync::OnceCell<redis::aio::ConnectionManager>,
+    },
+}
+
 #[derive(Clone)]
 pub struct UpstashStore {
-    client: reqwest::Client,
-    base: String,
-    token: String,
+    backend: Arc<Backend>,
     /// Cached liveness probe: (reachable, unix timestamp). Health endpoints
     /// must never block on a dead Redis, so at most one real PING happens
     /// per interval and every other caller gets the cached verdict.
@@ -82,9 +105,45 @@ pub struct UpstashStore {
 }
 
 impl UpstashStore {
-    /// Build from env. `None` unless both vars are set and well-formed —
+    fn new(backend: Backend) -> Arc<Self> {
+        Arc::new(Self {
+            backend: Arc::new(backend),
+            last_check: Arc::new(std::sync::Mutex::new((false, 0))),
+        })
+    }
+
+    /// Build from env. `None` unless exactly one backend is configured —
     /// callers treat `None` as "single-host mode, skip all sync".
+    ///
+    /// When `PUBLIC_POOL_REDIS_URL` is present but unusable the store stays
+    /// disabled rather than silently syncing to the other pool.
     pub fn from_env() -> Option<Arc<Self>> {
+        let native_url = std::env::var(NATIVE_URL_ENV)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if !native_url.is_empty() {
+            if !(native_url.starts_with("redis://") || native_url.starts_with("rediss://")) {
+                tracing::warn!(
+                    "{} must be a redis:// or rediss:// URL; Redis sync disabled",
+                    NATIVE_URL_ENV
+                );
+                return None;
+            }
+            match redis::Client::open(native_url.as_str()) {
+                Ok(client) => {
+                    return Some(Self::new(Backend::Native {
+                        client,
+                        mgr: tokio::sync::OnceCell::new(),
+                    }));
+                }
+                Err(e) => {
+                    tracing::warn!("{} invalid ({}); Redis sync disabled", NATIVE_URL_ENV, e);
+                    return None;
+                }
+            }
+        }
+
         let base = std::env::var("UPSTASH_REDIS_REST_URL")
             .unwrap_or_default()
             .trim()
@@ -102,19 +161,40 @@ impl UpstashStore {
             return None;
         }
         let client = reqwest::Client::builder().timeout(REST_TIMEOUT).build().ok()?;
-        Some(Arc::new(Self {
+        Some(Self::new(Backend::Rest {
             client,
             base,
             token,
-            last_check: Arc::new(std::sync::Mutex::new((false, 0))),
         }))
+    }
+
+    /// Backend label for startup logs. Never includes secrets (the native URL
+    /// embeds its password, so only the kind is exposed).
+    pub fn backend_kind(&self) -> &'static str {
+        match self.backend.as_ref() {
+            Backend::Rest { .. } => "upstash-rest",
+            Backend::Native { .. } => "native-redis",
+        }
     }
 
     /// Liveness probe used once at startup (logs the outcome, never fatal).
     pub async fn ping(&self) -> bool {
-        match self.cmd(vec!["PING".to_string()]).await {
-            Some(body) => result_str(&body).as_deref() == Some("PONG"),
-            None => false,
+        match self.backend.as_ref() {
+            Backend::Rest { .. } => match self.cmd(vec!["PING".to_string()]).await {
+                Some(body) => result_str(&body).as_deref() == Some("PONG"),
+                None => false,
+            },
+            Backend::Native { .. } => {
+                matches!(
+                    self.native_run(|mut m| async move {
+                        let v: String = redis::cmd("PING").query_async(&mut m).await?;
+                        Ok(v)
+                    })
+                    .await
+                    .as_deref(),
+                    Some("PONG")
+                )
+            }
         }
     }
 
@@ -138,8 +218,8 @@ impl UpstashStore {
         ok
     }
 
-    fn single_url(&self, parts: &[String]) -> String {
-        let mut u = self.base.clone();
+    fn single_url(base: &str, parts: &[String]) -> String {
+        let mut u = base.to_string();
         for p in parts {
             u.push('/');
             u.push_str(&enc(p));
@@ -148,12 +228,14 @@ impl UpstashStore {
     }
 
     /// One command via `GET /CMD/arg…`. Returns the `result` payload, or
-    /// `None` on any transport/Redis error (fail-open).
+    /// `None` on any transport/Redis error (fail-open). REST only.
     async fn cmd(&self, parts: Vec<String>) -> Option<Value> {
-        let res = self
-            .client
-            .get(self.single_url(&parts))
-            .header("Authorization", format!("Bearer {}", self.token))
+        let Backend::Rest { client, base, token } = self.backend.as_ref() else {
+            return None;
+        };
+        let res = client
+            .get(Self::single_url(base, &parts))
+            .header("Authorization", format!("Bearer {}", token))
             .send()
             .await
             .ok()?;
@@ -169,15 +251,17 @@ impl UpstashStore {
     }
 
     /// Batch via `POST /pipeline` with `[["CMD","arg"…], …]`. Returns the
-    /// per-command payloads in order (shorter on transport error).
+    /// per-command payloads in order (shorter on transport error). REST only.
     async fn pipeline(&self, cmds: Vec<Vec<String>>) -> Option<Vec<Value>> {
+        let Backend::Rest { client, base, token } = self.backend.as_ref() else {
+            return None;
+        };
         if cmds.is_empty() {
             return Some(Vec::new());
         }
-        let res = self
-            .client
-            .post(format!("{}/pipeline", self.base))
-            .header("Authorization", format!("Bearer {}", self.token))
+        let res = client
+            .post(format!("{}/pipeline", base))
+            .header("Authorization", format!("Bearer {}", token))
             .json(&cmds)
             .send()
             .await
@@ -189,98 +273,301 @@ impl UpstashStore {
         body.as_array().cloned()
     }
 
+    /// Run one native command against a managed connection with connect +
+    /// command timeouts. `None` on any error (fail-open). Native only.
+    async fn native_run<T, F, Fut>(&self, f: F) -> Option<T>
+    where
+        F: FnOnce(redis::aio::ConnectionManager) -> Fut,
+        Fut: std::future::Future<Output = redis::RedisResult<T>>,
+    {
+        let Backend::Native { client, mgr } = self.backend.as_ref() else {
+            return None;
+        };
+        let m = if let Some(m) = mgr.get() {
+            m.clone()
+        } else {
+            match tokio::time::timeout(
+                NATIVE_TIMEOUT,
+                redis::aio::ConnectionManager::new(client.clone()),
+            )
+            .await
+            {
+                Ok(Ok(m)) => {
+                    // A lost race just connects twice; harmless.
+                    let _ = mgr.set(m.clone());
+                    m
+                }
+                Ok(Err(e)) => {
+                    tracing::debug!("native redis connect failed: {}", e);
+                    return None;
+                }
+                Err(_) => {
+                    tracing::debug!("native redis connect timed out");
+                    return None;
+                }
+            }
+        };
+        match tokio::time::timeout(NATIVE_TIMEOUT, f(m)).await {
+            Ok(Ok(v)) => Some(v),
+            Ok(Err(e)) => {
+                tracing::debug!("native redis command failed: {}", e);
+                None
+            }
+            Err(_) => {
+                tracing::debug!("native redis command timed out");
+                None
+            }
+        }
+    }
+
     // --- primitives ---
 
     pub async fn get(&self, key: &str) -> Option<String> {
-        let body = self.cmd(vec!["GET".into(), key.into()]).await?;
-        result_str(&body)
+        match self.backend.as_ref() {
+            Backend::Rest { .. } => {
+                let body = self.cmd(vec!["GET".into(), key.into()]).await?;
+                result_str(&body)
+            }
+            Backend::Native { .. } => {
+                self.native_run(|mut m| async move {
+                    let v: Option<String> = m.get(key).await?;
+                    Ok(v)
+                })
+                .await?
+            }
+        }
     }
 
     pub async fn set(&self, key: &str, value: &str, ex_secs: Option<u64>) {
-        let mut parts = vec!["SET".to_string(), key.to_string(), value.to_string()];
-        if let Some(ex) = ex_secs {
-            parts.push("EX".to_string());
-            parts.push(ex.max(1).to_string());
+        match self.backend.as_ref() {
+            Backend::Rest { .. } => {
+                let mut parts = vec!["SET".to_string(), key.to_string(), value.to_string()];
+                if let Some(ex) = ex_secs {
+                    parts.push("EX".to_string());
+                    parts.push(ex.max(1).to_string());
+                }
+                let _ = self.cmd(parts).await;
+            }
+            Backend::Native { .. } => {
+                let ex = ex_secs.map(|e| e.max(1));
+                self.native_run(|mut m| async move {
+                    if let Some(n) = ex {
+                        let (): () = m.set_ex(key, value, n).await?;
+                    } else {
+                        let (): () = m.set(key, value).await?;
+                    }
+                    Ok(())
+                })
+                .await;
+            }
         }
-        let _ = self.cmd(parts).await;
     }
 
     /// Set only if absent. Returns true when this call created the key.
     pub async fn set_nx(&self, key: &str, value: &str, ex_secs: Option<u64>) -> bool {
-        let mut parts = vec!["SET".to_string(), key.to_string(), value.to_string()];
-        if let Some(ex) = ex_secs {
-            parts.push("EX".to_string());
-            parts.push(ex.max(1).to_string());
+        match self.backend.as_ref() {
+            Backend::Rest { .. } => {
+                let mut parts = vec!["SET".to_string(), key.to_string(), value.to_string()];
+                if let Some(ex) = ex_secs {
+                    parts.push("EX".to_string());
+                    parts.push(ex.max(1).to_string());
+                }
+                parts.push("NX".to_string());
+                self.cmd(parts)
+                    .await
+                    .and_then(|b| result_str(&b))
+                    .map(|r| r == "OK")
+                    .unwrap_or(false)
+            }
+            Backend::Native { .. } => {
+                let ex = ex_secs.map(|e| e.max(1));
+                self.native_run(|mut m| async move {
+                    let mut opts =
+                        redis::SetOptions::default().conditional_set(redis::ExistenceCheck::NX);
+                    if let Some(n) = ex {
+                        opts = opts.with_expiration(redis::SetExpiry::EX(n));
+                    }
+                    let v: Option<String> = m.set_options(key, value, opts).await?;
+                    Ok(v)
+                })
+                .await
+                .map(|v| v.as_deref() == Some("OK"))
+                .unwrap_or(false)
+            }
         }
-        parts.push("NX".to_string());
-        self.cmd(parts)
-            .await
-            .and_then(|b| result_str(&b))
-            .map(|r| r == "OK")
-            .unwrap_or(false)
     }
 
     pub async fn incr(&self, key: &str) -> Option<i64> {
-        let body = self.cmd(vec!["INCR".into(), key.into()]).await?;
-        result_i64(&body)
+        match self.backend.as_ref() {
+            Backend::Rest { .. } => {
+                let body = self.cmd(vec!["INCR".into(), key.into()]).await?;
+                result_i64(&body)
+            }
+            Backend::Native { .. } => {
+                self.native_run(|mut m| async move {
+                    let n: i64 = m.incr(key, 1).await?;
+                    Ok(n)
+                })
+                .await
+            }
+        }
     }
 
     /// INCR + EXPIRE in one round trip (counters self-clean).
     pub async fn incr_expire(&self, key: &str, ex_secs: u64) -> Option<i64> {
-        let out = self
-            .pipeline(vec![
-                vec!["INCR".into(), key.into()],
-                vec!["EXPIRE".into(), key.into(), ex_secs.max(1).to_string()],
-            ])
-            .await?;
-        out.first().and_then(result_i64)
+        match self.backend.as_ref() {
+            Backend::Rest { .. } => {
+                let out = self
+                    .pipeline(vec![
+                        vec!["INCR".into(), key.into()],
+                        vec!["EXPIRE".into(), key.into(), ex_secs.max(1).to_string()],
+                    ])
+                    .await?;
+                out.first().and_then(result_i64)
+            }
+            Backend::Native { .. } => {
+                self.native_run(|mut m| async move {
+                    let (n, _): (i64, bool) = redis::pipe()
+                        .cmd("INCR")
+                        .arg(key)
+                        .cmd("EXPIRE")
+                        .arg(key)
+                        .arg(ex_secs.max(1))
+                        .query_async(&mut m)
+                        .await?;
+                    Ok(n)
+                })
+                .await
+            }
+        }
     }
 
     pub async fn incrby(&self, key: &str, delta: i64) -> Option<i64> {
-        let body = self
-            .cmd(vec!["INCRBY".into(), key.into(), delta.to_string()])
-            .await?;
-        result_i64(&body)
+        match self.backend.as_ref() {
+            Backend::Rest { .. } => {
+                let body = self
+                    .cmd(vec!["INCRBY".into(), key.into(), delta.to_string()])
+                    .await?;
+                result_i64(&body)
+            }
+            Backend::Native { .. } => {
+                self.native_run(|mut m| async move {
+                    let n: i64 = m.incr(key, delta).await?;
+                    Ok(n)
+                })
+                .await
+            }
+        }
     }
 
     pub async fn mget(&self, keys: &[String]) -> Vec<Option<String>> {
-        let cmds: Vec<Vec<String>> =
-            keys.iter().map(|k| vec!["GET".into(), k.clone()]).collect();
-        match self.pipeline(cmds).await {
-            Some(out) => out.iter().map(result_str).collect(),
-            None => vec![None; keys.len()],
+        match self.backend.as_ref() {
+            Backend::Rest { .. } => {
+                let cmds: Vec<Vec<String>> =
+                    keys.iter().map(|k| vec!["GET".into(), k.clone()]).collect();
+                match self.pipeline(cmds).await {
+                    Some(out) => out.iter().map(result_str).collect(),
+                    None => vec![None; keys.len()],
+                }
+            }
+            Backend::Native { .. } => {
+                if keys.is_empty() {
+                    return Vec::new();
+                }
+                self.native_run(|mut m| async move {
+                    let mut c = redis::cmd("MGET");
+                    for k in keys {
+                        c.arg(k);
+                    }
+                    let v: Vec<Option<String>> = c.query_async(&mut m).await?;
+                    Ok(v)
+                })
+                .await
+                .unwrap_or_else(|| vec![None; keys.len()])
+            }
         }
     }
 
     pub async fn del_many(&self, keys: &[String]) {
-        if keys.is_empty() {
-            return;
+        match self.backend.as_ref() {
+            Backend::Rest { .. } => {
+                if keys.is_empty() {
+                    return;
+                }
+                let cmds: Vec<Vec<String>> =
+                    keys.iter().map(|k| vec!["DEL".into(), k.clone()]).collect();
+                let _ = self.pipeline(cmds).await;
+            }
+            Backend::Native { .. } => {
+                if keys.is_empty() {
+                    return;
+                }
+                self.native_run(|mut m| async move {
+                    let mut c = redis::cmd("DEL");
+                    for k in keys {
+                        c.arg(k);
+                    }
+                    let (): () = c.query_async(&mut m).await?;
+                    Ok(())
+                })
+                .await;
+            }
         }
-        let cmds: Vec<Vec<String>> =
-            keys.iter().map(|k| vec!["DEL".into(), k.clone()]).collect();
-        let _ = self.pipeline(cmds).await;
     }
 
     // --- set helpers (membership indexes for restorable collections) ---
 
     pub async fn sadd(&self, set: &str, member: &str) {
-        let _ = self.cmd(vec!["SADD".into(), set.into(), member.into()]).await;
+        match self.backend.as_ref() {
+            Backend::Rest { .. } => {
+                let _ = self.cmd(vec!["SADD".into(), set.into(), member.into()]).await;
+            }
+            Backend::Native { .. } => {
+                self.native_run(|mut m| async move {
+                    let (): () = m.sadd(set, member).await?;
+                    Ok(())
+                })
+                .await;
+            }
+        }
     }
 
     pub async fn srem(&self, set: &str, member: &str) {
-        let _ = self.cmd(vec!["SREM".into(), set.into(), member.into()]).await;
+        match self.backend.as_ref() {
+            Backend::Rest { .. } => {
+                let _ = self.cmd(vec!["SREM".into(), set.into(), member.into()]).await;
+            }
+            Backend::Native { .. } => {
+                self.native_run(|mut m| async move {
+                    let (): () = m.srem(set, member).await?;
+                    Ok(())
+                })
+                .await;
+            }
+        }
     }
 
     pub async fn smembers(&self, set: &str) -> Option<Vec<String>> {
-        let body = self.cmd(vec!["SMEMBERS".into(), set.into()]).await?;
-        match body.get("result")? {
-            Value::Array(items) => Some(
-                items
-                    .iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                    .collect(),
-            ),
-            _ => None,
+        match self.backend.as_ref() {
+            Backend::Rest { .. } => {
+                let body = self.cmd(vec!["SMEMBERS".into(), set.into()]).await?;
+                match body.get("result")? {
+                    Value::Array(items) => Some(
+                        items
+                            .iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect(),
+                    ),
+                    _ => None,
+                }
+            }
+            Backend::Native { .. } => {
+                self.native_run(|mut m| async move {
+                    let v: Vec<String> = m.smembers(set).await?;
+                    Ok(v)
+                })
+                .await
+            }
         }
     }
 
@@ -321,6 +608,43 @@ mod tests {
     use serde_json::json;
     use std::sync::Arc;
 
+    /// Serialize env-mutating tests in this module: they share the process
+    /// environment and must not interleave.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct EnvGuard {
+        saved: Vec<(String, Option<String>)>,
+    }
+
+    impl EnvGuard {
+        fn take(keys: &[&str]) -> Self {
+            let saved = keys
+                .iter()
+                .map(|k| (k.to_string(), std::env::var(k).ok()))
+                .collect();
+            Self { saved }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in self.saved.drain(..) {
+                unsafe {
+                    match v {
+                        Some(val) => std::env::set_var(&k, val),
+                        None => std::env::remove_var(&k),
+                    }
+                }
+            }
+        }
+    }
+
+    const STORE_KEYS: &[&str] = &[
+        "UPSTASH_REDIS_REST_URL",
+        "UPSTASH_REDIS_REST_TOKEN",
+        "PUBLIC_POOL_REDIS_URL",
+    ];
+
     #[test]
     fn path_segments_encoded() {
         assert_eq!(enc("hifi:usage:123:abc"), "hifi%3Ausage%3A123%3Aabc");
@@ -352,12 +676,14 @@ mod tests {
         assert_eq!(UpstashStore::k_apikeys_set(), "hifi:apikeys");
     }
 
-        #[test]
-    fn disabled_without_env() {        let saved_url = std::env::var("UPSTASH_REDIS_REST_URL").ok();
-        let saved_tok = std::env::var("UPSTASH_REDIS_REST_TOKEN").ok();
+    #[test]
+    fn disabled_without_env() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::take(STORE_KEYS);
         unsafe {
             std::env::remove_var("UPSTASH_REDIS_REST_URL");
             std::env::remove_var("UPSTASH_REDIS_REST_TOKEN");
+            std::env::remove_var("PUBLIC_POOL_REDIS_URL");
         }
         assert!(UpstashStore::from_env().is_none());
         unsafe {
@@ -365,16 +691,51 @@ mod tests {
         }
         // Token still missing → still disabled.
         assert!(UpstashStore::from_env().is_none());
+    }
+
+    #[test]
+    fn native_backend_wins_over_upstash() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::take(STORE_KEYS);
         unsafe {
-            match saved_url {
-                Some(v) => std::env::set_var("UPSTASH_REDIS_REST_URL", v),
-                None => std::env::remove_var("UPSTASH_REDIS_REST_URL"),
-            }
-            match saved_tok {
-                Some(v) => std::env::set_var("UPSTASH_REDIS_REST_TOKEN", v),
-                None => std::env::remove_var("UPSTASH_REDIS_REST_TOKEN"),
-            }
+            // Both backends configured: the native pool must win — a host
+            // belongs to exactly one pool.
+            std::env::set_var("UPSTASH_REDIS_REST_URL", "https://example.upstash.io");
+            std::env::set_var("UPSTASH_REDIS_REST_TOKEN", "dummy");
+            std::env::set_var(
+                "PUBLIC_POOL_REDIS_URL",
+                "rediss://default:pw@public.example.dev:6379",
+            );
         }
+        // Client::open only parses (no I/O), so this is offline-safe.
+        let store = UpstashStore::from_env().expect("native backend should build");
+        assert_eq!(store.backend_kind(), "native-redis");
+    }
+
+    #[test]
+    fn invalid_native_url_disables() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::take(STORE_KEYS);
+        unsafe {
+            std::env::remove_var("UPSTASH_REDIS_REST_URL");
+            std::env::remove_var("UPSTASH_REDIS_REST_TOKEN");
+            // Present but unusable: stay disabled rather than syncing nowhere.
+            std::env::set_var("PUBLIC_POOL_REDIS_URL", "not-a-redis-url");
+        }
+        assert!(UpstashStore::from_env().is_none());
+    }
+
+    #[test]
+    fn wrong_scheme_native_url_disables() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::take(STORE_KEYS);
+        unsafe {
+            std::env::remove_var("UPSTASH_REDIS_REST_URL");
+            std::env::remove_var("UPSTASH_REDIS_REST_TOKEN");
+            // An Upstash REST URL pasted into the wrong var must not sync.
+            std::env::set_var("PUBLIC_POOL_REDIS_URL", "https://example.upstash.io");
+        }
+        assert!(UpstashStore::from_env().is_none());
     }
 
     #[tokio::test]
@@ -384,9 +745,11 @@ mod tests {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
         let mk = |verdict: bool| UpstashStore {
-            client: reqwest::Client::new(),
-            base: "https://invalid.invalid".into(),
-            token: "x".into(),
+            backend: Arc::new(super::Backend::Rest {
+                client: reqwest::Client::new(),
+                base: "https://invalid.invalid".into(),
+                token: "x".into(),
+            }),
             last_check: Arc::new(std::sync::Mutex::new((verdict, now))),
         };
         // Fresh cache entries are served without any HTTP request (an
