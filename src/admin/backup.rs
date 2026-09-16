@@ -216,6 +216,7 @@ pub async fn restore_backup(
                 ("user_id", NullableText),
                 ("is_active", Int),
                 ("auto_disabled", Int),
+                ("is_catalog", Int),
                 ("notes", Text),
                 ("created_at", Int),
                 ("updated_at", Int),
@@ -271,15 +272,13 @@ pub async fn restore_backup(
     // Reload all in-memory state from the restored database.
     state.account_manager.reload_from_db().await?;
     state.api_keys.reload_from_db().await?;
-    state.rate_limits.load_from_db(db).await;
-    // Publish the restored settings fleet-wide (reload_* above already
-    // merged usage/cooldowns from Redis).
-    state.rate_limits.save_to_redis().await;
+    state.settings.load_from_db(db).await;
+    // Publish the restored settings fleet-wide.
+    state.settings.save_to_redis().await;
     // The restore wins: republish the restored roster and drop anything the
     // backup intentionally removed, or the next merge resurrects it.
     state.account_manager.publish_all_to_redis().await;
     state.api_keys.publish_all_to_redis().await;
-    state.anti_ban.reload_limiter();
 
     let (healthy, total) = state.account_manager.healthy_count().await;
     Ok(Json(json!({

@@ -26,21 +26,13 @@ pub async fn get_artist(
         return Err(AppError::BadRequest("Provide id or f query param".into()));
     }
 
-    let account = state.account_manager.select_account().await?;
-    let hc = state.tidal_client.working_client().await?;
-    let token = state
-        .token_manager
-        .get_token(&account, &hc)
-        .await?;
-
     if let Some(id) = params.id {
         let artist_url = format!("https://api.tidal.com/v1/artists/{}", id);
         let data = state
             .tidal_client
-            .make_authed_request(
+            .make_catalog_authed_request(
                 &artist_url,
                 Some(vec![("countryCode", &state.config.country_code)]),
-                &token,
             )
             .await?;
 
@@ -79,18 +71,27 @@ pub async fn get_artist(
 
     let f_id = params.f.unwrap();
     let albums_url = format!("https://api.tidal.com/v1/artists/{}/albums", f_id);
-    let cc = &state.config.country_code;
+    let cc = state.config.country_code.clone();
 
-    let fetch_albums = state.tidal_client.make_authed_request(
-        &albums_url,
-        Some(vec![("countryCode", cc), ("limit", "100")]),
-        &token,
-    );
-    let fetch_singles = state.tidal_client.make_authed_request(
-        &albums_url,
-        Some(vec![("countryCode", cc), ("limit", "100"), ("filter", "EPSANDSINGLES")]),
-        &token,
-    );
+    let tc1 = state.tidal_client.clone();
+    let tc2 = state.tidal_client.clone();
+    let cc1 = cc.clone();
+    let cc2 = cc.clone();
+    let albums_url2 = albums_url.clone();
+    let fetch_albums = async move {
+        tc1.make_catalog_authed_request(
+            &albums_url,
+            Some(vec![("countryCode", &cc1), ("limit", "100")]),
+        )
+        .await
+    };
+    let fetch_singles = async move {
+        tc2.make_catalog_authed_request(
+            &albums_url2,
+            Some(vec![("countryCode", &cc2), ("limit", "100"), ("filter", "EPSANDSINGLES")]),
+        )
+        .await
+    };
 
     let (albums_res, singles_res) = tokio::join!(fetch_albums, fetch_singles);
 
@@ -123,10 +124,9 @@ pub async fn get_artist(
         let top_url = format!("https://api.tidal.com/v1/artists/{}/toptracks", f_id);
         let top_tracks = state
             .tidal_client
-            .make_authed_request(
+            .make_catalog_authed_request(
                 &top_url,
-                Some(vec![("countryCode", cc), ("limit", "15")]),
-                &token,
+                Some(vec![("countryCode", &cc), ("limit", "15")]),
             )
             .await
             .ok()
@@ -153,24 +153,24 @@ pub async fn get_artist(
 
     for aid in &album_ids {
         let sem = sem.clone();
-        let client = state.tidal_client.working_client().await?;
-        let token = token.clone();
+        let tc = state.tidal_client.clone();
         let cc = state.config.country_code.clone();
         let aid = aid.clone();
 
         track_tasks.push(async move {
             let _permit = sem.acquire().await.unwrap();
-            let url = format!("https://api.tidal.com/v1/pages/album");
-            let req = client
-                .get(&url)
-                .header("authorization", format!("Bearer {}", token))
-                .query(&[
-                    ("albumId", aid.as_str()),
-                    ("countryCode", cc.as_str()),
-                    ("deviceType", "BROWSER"),
-                ]);
-            let resp = req.send().await.ok()?;
-            let data: Value = resp.json().await.ok()?;
+            let url = "https://api.tidal.com/v1/pages/album".to_string();
+            let data: Value = tc
+                .make_catalog_authed_request(
+                    &url,
+                    Some(vec![
+                        ("albumId", aid.as_str()),
+                        ("countryCode", cc.as_str()),
+                        ("deviceType", "BROWSER"),
+                    ]),
+                )
+                .await
+                .ok()?;
 
             let tracks: Vec<Value> = data
                 .get("rows")

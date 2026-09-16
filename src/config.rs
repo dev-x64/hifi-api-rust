@@ -14,6 +14,23 @@ pub struct Config {
     pub max_retries: u32,
     pub discord_webhook_url: String,
     pub api_version: String,
+    /// Upstream User-Agent (upstream: USER_AGENT, default okhttp/5.3.2).
+    pub user_agent: String,
+    /// Verbose upstream logging (upstream: DEV_MODE).
+    pub dev_mode: bool,
+    /// Rotate proxy on every token refresh (upstream: ROTATE_PROXIES_ON_REFRESH).
+    pub rotate_proxies_on_refresh: bool,
+    /// Dedicated metadata credential (upstream: CATALOG_CLIENT_ID/...).
+    /// Kept out of the playback pool.
+    pub catalog_client_id: String,
+    pub catalog_client_secret: String,
+    pub catalog_refresh_token: String,
+    pub catalog_user_id: Option<String>,
+    /// Static bearer token for metadata (upstream: CATALOG_TOKEN). No refresh.
+    pub catalog_token: String,
+    /// Legacy credential file (upstream: TOKEN_FILE, default token.json).
+    /// Imported into the DB on startup when present.
+    pub token_file: String,
     /// Upstash Redis REST base URL (empty = multi-host sync disabled).
     pub upstash_url: String,
     /// Upstash Redis REST token. Kept in memory only; redacted from Debug.
@@ -36,6 +53,13 @@ impl std::fmt::Debug for Config {
             .field("max_retries", &self.max_retries)
             .field("discord_webhook_url", &self.discord_webhook_url)
             .field("api_version", &self.api_version)
+            .field("user_agent", &self.user_agent)
+            .field("dev_mode", &self.dev_mode)
+            .field("rotate_proxies_on_refresh", &self.rotate_proxies_on_refresh)
+            .field("catalog_client_id", &self.catalog_client_id)
+            .field("catalog_refresh_token", &"<redacted>")
+            .field("catalog_token", &"<redacted>")
+            .field("token_file", &self.token_file)
             .field("upstash_url", &self.upstash_url)
             .field("upstash_token", &"<redacted>")
             .finish()
@@ -73,6 +97,25 @@ impl Config {
             .unwrap_or(2)
             .max(1);
         let discord_webhook_url = std::env::var("DISCORD_WEBHOOK_URL").unwrap_or_default();
+        let user_agent = std::env::var("USER_AGENT").unwrap_or_else(|_| "okhttp/5.3.2".into());
+        let dev_mode = env_flag("DEV_MODE", false);
+        let rotate_proxies_on_refresh = env_flag("ROTATE_PROXIES_ON_REFRESH", false);
+        // Dedicated metadata credential (upstream CATALOG_*). Falls back to
+        // the main CLIENT_ID/SECRET when only a refresh token is given.
+        let main_client_id = std::env::var("CLIENT_ID").unwrap_or_default();
+        let main_client_secret = std::env::var("CLIENT_SECRET").unwrap_or_default();
+        let catalog_client_id =
+            std::env::var("CATALOG_CLIENT_ID").unwrap_or_else(|_| main_client_id.clone());
+        let catalog_client_secret =
+            std::env::var("CATALOG_CLIENT_SECRET").unwrap_or_else(|_| main_client_secret.clone());
+        let catalog_refresh_token = std::env::var("CATALOG_REFRESH_TOKEN").unwrap_or_default();
+        let catalog_user_id = std::env::var("CATALOG_USER_ID")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let catalog_token = std::env::var("CATALOG_TOKEN")
+            .or_else(|_| std::env::var("CATALOG_ACCESS_TOKEN"))
+            .unwrap_or_default();
+        let token_file = std::env::var("TOKEN_FILE").unwrap_or_else(|_| "token.json".into());
         let upstash_url = std::env::var("UPSTASH_REDIS_REST_URL")
             .unwrap_or_default()
             .trim()
@@ -96,8 +139,104 @@ impl Config {
             max_retries,
             discord_webhook_url,
             api_version: "2.10".into(),
+            user_agent,
+            dev_mode,
+            rotate_proxies_on_refresh,
+            catalog_client_id,
+            catalog_client_secret,
+            catalog_refresh_token,
+            catalog_user_id,
+            catalog_token,
+            token_file,
             upstash_url,
             upstash_token,
         }
+    }
+}
+
+fn env_flag(key: &str, default: bool) -> bool {
+    std::env::var(key)
+        .ok()
+        .map(|v| {
+            let v = v.to_lowercase();
+            v == "true" || v == "1" || v == "yes"
+        })
+        .unwrap_or(default)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+
+    struct EnvGuard {
+        saved: Vec<(String, Option<String>)>,
+    }
+
+    impl EnvGuard {
+        fn take(keys: &[&str]) -> Self {
+            let saved = keys
+                .iter()
+                .map(|k| (k.to_string(), std::env::var(k).ok()))
+                .collect();
+            Self { saved }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in self.saved.drain(..) {
+                unsafe {
+                    match v {
+                        Some(val) => std::env::set_var(&k, val),
+                        None => std::env::remove_var(&k),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn upstream_env_parity() {
+        let _guard = EnvGuard::take(&[
+            "USER_AGENT",
+            "DEV_MODE",
+            "ROTATE_PROXIES_ON_REFRESH",
+            "CATALOG_TOKEN",
+            "CATALOG_ACCESS_TOKEN",
+            "TOKEN_FILE",
+        ]);
+        unsafe {
+            std::env::remove_var("USER_AGENT");
+            std::env::remove_var("DEV_MODE");
+            std::env::remove_var("ROTATE_PROXIES_ON_REFRESH");
+            std::env::remove_var("CATALOG_TOKEN");
+            std::env::remove_var("CATALOG_ACCESS_TOKEN");
+            std::env::remove_var("TOKEN_FILE");
+        }
+        let cfg = Config::from_env();
+        assert_eq!(cfg.user_agent, "okhttp/5.3.2");
+        assert!(!cfg.dev_mode);
+        assert!(!cfg.rotate_proxies_on_refresh);
+        assert!(cfg.catalog_token.is_empty());
+        assert_eq!(cfg.token_file, "token.json");
+
+        unsafe {
+            std::env::set_var("USER_AGENT", "test-agent/1.0");
+            std::env::set_var("DEV_MODE", "true");
+            std::env::set_var("ROTATE_PROXIES_ON_REFRESH", "1");
+            std::env::set_var("CATALOG_ACCESS_TOKEN", "legacy-fallback");
+        }
+        let cfg = Config::from_env();
+        assert_eq!(cfg.user_agent, "test-agent/1.0");
+        assert!(cfg.dev_mode);
+        assert!(cfg.rotate_proxies_on_refresh);
+        // Legacy CATALOG_ACCESS_TOKEN is honored when CATALOG_TOKEN is unset.
+        assert_eq!(cfg.catalog_token, "legacy-fallback");
+
+        unsafe {
+            std::env::set_var("CATALOG_TOKEN", "primary");
+        }
+        let cfg = Config::from_env();
+        assert_eq!(cfg.catalog_token, "primary");
     }
 }

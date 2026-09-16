@@ -27,37 +27,26 @@ pub async fn get_album(
     State(state): State<AppState>,
     Query(params): Query<AlbumParams>,
 ) -> Result<Json<Value>, AppError> {
-    let account = state.account_manager.select_account().await?;
-    let hc = state.tidal_client.working_client().await?;
-    let token = state
-        .token_manager
-        .get_token(&account, &hc)
-        .await?;
-
     let album_url = format!("https://api.tidal.com/v1/albums/{}", params.id);
     let items_url = format!("https://api.tidal.com/v1/albums/{}/items", params.id);
 
-    let client = state.tidal_client.working_client().await?;
+    let tidal_client = state.tidal_client.clone();
     let cc = state.config.country_code.clone();
-    let token_arc = token;
 
     let mut tasks: Vec<
         Pin<Box<dyn Future<Output = Result<Value, AppError>> + Send>>,
     > = Vec::new();
 
     {
-        let client = client.clone();
-        let token = token_arc.clone();
+        let tc = tidal_client.clone();
         let url = album_url;
         let cc = cc.clone();
         tasks.push(Box::pin(async move {
-            let req = client
-                .get(&url)
-                .header("authorization", format!("Bearer {}", token))
-                .query(&[("countryCode", &cc)]);
-            let resp = req.send().await.map_err(AppError::from)?;
-            let data: Value = resp.json().await.map_err(AppError::from)?;
-            Ok(data)
+            tc.make_catalog_authed_request(
+                &url,
+                Some(vec![("countryCode", &cc)]),
+            )
+            .await
         }));
     }
 
@@ -70,21 +59,18 @@ pub async fn get_album(
         let offset_str = current_offset.to_string();
         let limit_str = chunk_size.to_string();
         let url = items_url.clone();
-        let client = client.clone();
-        let token = token_arc.clone();
+        let tc = tidal_client.clone();
         let cc = cc.clone();
         tasks.push(Box::pin(async move {
-            let req = client
-                .get(&url)
-                .header("authorization", format!("Bearer {}", token))
-                .query(&[
+            tc.make_catalog_authed_request(
+                &url,
+                Some(vec![
                     ("countryCode", &cc),
                     ("limit", &limit_str),
                     ("offset", &offset_str),
-                ]);
-            let resp = req.send().await.map_err(AppError::from)?;
-            let data: Value = resp.json().await.map_err(AppError::from)?;
-            Ok(data)
+                ]),
+            )
+            .await
         }));
         current_offset += chunk_size;
         remaining -= chunk_size;

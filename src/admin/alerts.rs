@@ -38,20 +38,13 @@ pub async fn alert_report(
     let payload = match body.kind.as_str() {
         "status" => {
             let accounts = state.account_manager.list_accounts().await;
-            let now = chrono::Utc::now().timestamp();
             let total = accounts.len();
             let mut healthy = 0usize;
-            let mut limited = 0usize;
             let mut total_requests = 0u64;
             let mut total_errors = 0u64;
             for a in &accounts {
-                let active = a.is_active.load(Ordering::Relaxed);
-                let cooling = a.rate_limited_until.load(Ordering::Relaxed) > now;
-                if active && !cooling {
+                if a.is_active.load(Ordering::Relaxed) {
                     healthy += 1;
-                }
-                if cooling {
-                    limited += 1;
                 }
                 total_requests += a.request_count.load(Ordering::Relaxed);
                 total_errors += a.error_count.load(Ordering::Relaxed);
@@ -72,31 +65,19 @@ pub async fn alert_report(
             } else {
                 "direct (proxies off)".to_string()
             };
-            let limits_summary = format!(
-                "per-IP {}/{} · tidal {}/{} · cooldowns {}/{}s",
-                state.rate_limits.ip_rps.load(Ordering::Relaxed),
-                state.rate_limits.ip_burst.load(Ordering::Relaxed),
-                state.rate_limits.tidal_rps.load(Ordering::Relaxed),
-                state.rate_limits.tidal_burst.load(Ordering::Relaxed),
-                state.rate_limits.cooldown_429_secs.load(Ordering::Relaxed),
-                state.rate_limits.cooldown_403_secs.load(Ordering::Relaxed),
-            );
             Notifier::status_report(
                 healthy,
                 total,
-                limited,
                 total_requests,
                 total_errors,
                 state.cache.hits.load(Ordering::Relaxed),
                 state.cache.misses.load(Ordering::Relaxed),
                 proxy_summary,
-                limits_summary,
             )
         }
         "accounts" => {
             let mut accounts = state.account_manager.list_accounts().await;
             accounts.sort_by(|a, b| a.id.cmp(&b.id));
-            let now = chrono::Utc::now().timestamp();
             let total = accounts.len();
             let lines: Vec<(String, String)> = accounts
                 .iter()
@@ -104,20 +85,16 @@ pub async fn alert_report(
                 .map(|(i, a)| {
                     let code = format!("TIDAL-{}", i + 1);
                     let active = a.is_active.load(Ordering::Relaxed);
-                    let until = a.rate_limited_until.load(Ordering::Relaxed);
-                    let state_str = if !active {
-                        "⛔ inactive".to_string()
-                    } else if until > now {
-                        format!("⏳ cooldown {}s", until - now)
-                    } else {
+                    let state_str = if active {
                         "✅ active".to_string()
+                    } else {
+                        "⛔ inactive".to_string()
                     };
                     let status = format!(
-                        "{} · {} req · {} err · {} RL-hits",
+                        "{} · {} req · {} err",
                         state_str,
                         a.request_count.load(Ordering::Relaxed),
                         a.error_count.load(Ordering::Relaxed),
-                        a.rate_limit_hits.load(Ordering::Relaxed),
                     );
                     (code, status)
                 })

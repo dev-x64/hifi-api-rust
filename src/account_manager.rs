@@ -2,7 +2,6 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use chrono::Utc;
-use rand::Rng;
 use serde::Deserialize;
 use sqlx::FromRow;
 use sqlx::SqlitePool;
@@ -10,7 +9,6 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::error::AppError;
-use crate::rate_limit::RateLimitSettings;
 use crate::upstash::UpstashStore;
 
 #[derive(Clone, Debug)]
@@ -40,6 +38,9 @@ pub struct AccountState {
     pub access_token: RwLock<Option<String>>,
     pub token_expires_at: AtomicI64,
     pub is_active: AtomicBool,
+    /// Dedicated metadata credential (upstream CATALOG_* / token.json role).
+    /// Never leased to playback: excluded from selection and pool counts.
+    pub is_catalog: AtomicBool,
     /// True when the system (not the owner) deactivated the account.
     /// Only these are eligible for auto-heal; manual OFF is never touched.
     pub auto_disabled: AtomicBool,
@@ -49,15 +50,6 @@ pub struct AccountState {
     pub last_used: AtomicI64,
     pub request_count: AtomicU64,
     pub error_count: AtomicU64,
-    pub rate_limit_hits: AtomicU64,
-    pub rate_limited_until: AtomicI64,
-    /// Tidal calls served this UTC day (resets on rollover). Bounded by
-    /// the per-account daily budget; persisted periodically.
-    pub day_requests: AtomicU64,
-    /// UTC day number (timestamp / 86400) the counter above belongs to.
-    pub day_start: AtomicI64,
-    /// UTC day number a budget alert was last sent for this account.
-    pub day_alerted: AtomicI64,
     /// Last mutation unix timestamp (local admin ops AND Redis merges).
     /// Drives newest-wins convergence across instances.
     pub updated_at: AtomicI64,
@@ -85,6 +77,7 @@ impl AccountState {
             access_token: RwLock::new(None),
             token_expires_at: AtomicI64::new(0),
             is_active: AtomicBool::new(is_active),
+            is_catalog: AtomicBool::new(false),
             auto_disabled: AtomicBool::new(false),
             heal_failures: AtomicU64::new(0),
             heal_next_retry: AtomicI64::new(0),
@@ -92,27 +85,18 @@ impl AccountState {
             last_used: AtomicI64::new(0),
             request_count: AtomicU64::new(0),
             error_count: AtomicU64::new(0),
-            rate_limit_hits: AtomicU64::new(0),
-            rate_limited_until: AtomicI64::new(0),
-            day_requests: AtomicU64::new(0),
-            day_start: AtomicI64::new(0),
-            day_alerted: AtomicI64::new(0),
             updated_at: AtomicI64::new(0),
         }
     }
 
-    /// Copy live counters/leases from `old` into a rebuilt state, so admin
-    /// edits and cross-instance merges never wipe parks, budgets, or tokens.
+    /// Copy live counters from `old` into a rebuilt state, so admin
+    /// edits and cross-instance merges never wipe stats or tokens.
     pub fn carry_over(new: &AccountState, old: &AccountState) {
         new.last_used.store(old.last_used.load(Ordering::Relaxed), Ordering::Relaxed);
         new.request_count.store(old.request_count.load(Ordering::Relaxed), Ordering::Relaxed);
         new.error_count.store(old.error_count.load(Ordering::Relaxed), Ordering::Relaxed);
-        new.rate_limit_hits.store(old.rate_limit_hits.load(Ordering::Relaxed), Ordering::Relaxed);
-        new.rate_limited_until.store(old.rate_limited_until.load(Ordering::Relaxed), Ordering::Relaxed);
-        new.day_requests.store(old.day_requests.load(Ordering::Relaxed), Ordering::Relaxed);
-        new.day_start.store(old.day_start.load(Ordering::Relaxed), Ordering::Relaxed);
-        new.day_alerted.store(old.day_alerted.load(Ordering::Relaxed), Ordering::Relaxed);
         new.token_expires_at.store(old.token_expires_at.load(Ordering::Relaxed), Ordering::Relaxed);
+        new.is_catalog.store(old.is_catalog.load(Ordering::Relaxed), Ordering::Relaxed);
         new.auto_disabled.store(old.auto_disabled.load(Ordering::Relaxed), Ordering::Relaxed);
         new.heal_failures.store(old.heal_failures.load(Ordering::Relaxed), Ordering::Relaxed);
         new.heal_next_retry.store(old.heal_next_retry.load(Ordering::Relaxed), Ordering::Relaxed);
@@ -120,6 +104,7 @@ impl AccountState {
 }
 
 /// UTC day number for a unix timestamp. Pure function — unit tested.
+#[allow(dead_code)]
 pub fn utc_day(ts: i64) -> i64 {
     ts.div_euclid(86400)
 }
@@ -134,6 +119,7 @@ pub struct DbAccountRow {
     pub user_id: Option<String>,
     pub is_active: i32,
     pub auto_disabled: Option<i32>,
+    pub is_catalog: Option<i32>,
     pub notes: String,
     pub access_token: Option<String>,
     pub expires_at: Option<i64>,
@@ -155,22 +141,16 @@ fn user_id_from_label(label: &str) -> Option<&str> {
 pub struct AccountManager {
     accounts: RwLock<Vec<Arc<AccountState>>>,
     weights: SwitchingWeights,
-    settings: Arc<RateLimitSettings>,
     db: Option<SqlitePool>,
     /// Shared cross-instance state (None = single-host mode, skip sync).
     upstash: OnceLock<Arc<UpstashStore>>,
 }
 
 impl AccountManager {
-    pub fn new(
-        db: Option<SqlitePool>,
-        weights: SwitchingWeights,
-        settings: Arc<RateLimitSettings>,
-    ) -> Self {
+    pub fn new(db: Option<SqlitePool>, weights: SwitchingWeights) -> Self {
         Self {
             accounts: RwLock::new(Vec::new()),
             weights,
-            settings,
             db,
             upstash: OnceLock::new(),
         }
@@ -195,7 +175,7 @@ impl AccountManager {
 
         let rows: Vec<DbAccountRow> = sqlx::query_as::<_, DbAccountRow>(
             "SELECT a.id, a.label, a.client_id, a.client_secret, a.refresh_token,
-             a.user_id, a.is_active, a.auto_disabled, a.notes,
+             a.user_id, a.is_active, a.auto_disabled, a.is_catalog, a.notes,
              t.access_token, t.expires_at, a.updated_at
              FROM accounts a
              LEFT JOIN tokens t ON t.account_id = a.id
@@ -234,6 +214,9 @@ impl AccountManager {
             if row.auto_disabled.unwrap_or(0) != 0 {
                 state.auto_disabled.store(true, Ordering::Relaxed);
             }
+            if row.is_catalog.unwrap_or(0) != 0 {
+                state.is_catalog.store(true, Ordering::Relaxed);
+            }
             if let (Some(token), Some(expires)) = (row.access_token, row.expires_at) {
                 if !token.is_empty() && expires > 0 {
                     *state.access_token.write().await = Some(token);
@@ -252,79 +235,9 @@ impl AccountManager {
     pub async fn reload_from_db(&self) -> Result<(), AppError> {
         self.accounts.write().await.clear();
         self.load_from_db().await?;
-        self.load_daily_usage().await;
         // Converge with the fleet (backup restores only touch SQLite).
-        self.sync_usage_with_redis().await;
-        self.merge_remote_cooldowns().await;
         self.merge_accounts_from_redis().await;
         Ok(())
-    }
-
-    /// Load today's per-account counters (survives restarts mid-day).
-    pub async fn load_daily_usage(&self) {
-        let db = match &self.db {
-            Some(db) => db,
-            None => return,
-        };
-        let today = utc_day(Utc::now().timestamp());
-        let rows: Vec<(String, i64)> =
-            match sqlx::query_as("SELECT account_id, count FROM daily_usage WHERE day = ?")
-                .bind(today)
-                .fetch_all(db)
-                .await
-            {
-                Ok(r) => r,
-                Err(_) => return,
-            };
-        let accounts = self.accounts.read().await;
-        for (id, count) in rows {
-            if let Some(a) = accounts.iter().find(|a| a.id == id) {
-                a.day_start.store(today, Ordering::Relaxed);
-                a.day_requests.store(count.max(0) as u64, Ordering::Relaxed);
-            }
-        }
-    }
-
-    /// Persist today's per-account counters (called periodically; cheap).
-    pub async fn flush_daily_usage(&self) {
-        let db = match &self.db {
-            Some(db) => db,
-            None => return,
-        };
-        let today = utc_day(Utc::now().timestamp());
-        let snapshot: Vec<(String, u64, i64)> = {
-            let accounts = self.accounts.read().await;
-            accounts
-                .iter()
-                .map(|a| {
-                    (
-                        a.id.clone(),
-                        a.day_requests.load(Ordering::Relaxed),
-                        a.day_start.load(Ordering::Relaxed),
-                    )
-                })
-                .collect()
-        };
-        for (id, count, day) in snapshot {
-            // Only today's rows matter; stale days are dropped on read.
-            if day != 0 && day != today {
-                continue;
-            }
-            let _ = sqlx::query(
-                "INSERT INTO daily_usage (account_id, day, count) VALUES (?, ?, ?)
-                 ON CONFLICT(account_id) DO UPDATE SET day = excluded.day, count = excluded.count",
-            )
-            .bind(&id)
-            .bind(today)
-            .bind(count as i64)
-            .execute(db)
-            .await;
-        }
-        // Drop rows from previous days.
-        let _ = sqlx::query("DELETE FROM daily_usage WHERE day != ?")
-            .bind(today)
-            .execute(db)
-            .await;
     }
 
     pub async fn add_account(
@@ -392,7 +305,6 @@ impl AccountManager {
         if let Some(store) = self.upstash() {
             store.del_many(&[
                 UpstashStore::k_account(id),
-                UpstashStore::k_cooldown(id),
                 UpstashStore::k_token(id),
             ]).await;
             store.srem(&UpstashStore::k_accounts_set(), id).await;
@@ -423,24 +335,9 @@ impl AccountManager {
             if !account.is_active.load(Ordering::Relaxed) {
                 continue;
             }
-
-            let rate_limited_until = account.rate_limited_until.load(Ordering::Relaxed);
-            if rate_limited_until > now {
+            // Catalog-only credentials never serve playback.
+            if account.is_catalog.load(Ordering::Relaxed) {
                 continue;
-            }
-
-            // Daily budget: roll over at UTC midnight, exclude spent accounts.
-            // 0 budget = unlimited.
-            let budget = self.settings.daily_budget_per_account.load(Ordering::Relaxed);
-            if budget > 0 {
-                let today = utc_day(now);
-                if account.day_start.load(Ordering::Relaxed) != today {
-                    account.day_start.store(today, Ordering::Relaxed);
-                    account.day_requests.store(0, Ordering::Relaxed);
-                }
-                if account.day_requests.load(Ordering::Relaxed) >= budget {
-                    continue;
-                }
             }
 
             let usage = account.request_count.load(Ordering::Relaxed).max(1) as f64;
@@ -458,33 +355,14 @@ impl AccountManager {
             let recency_score = self.weights.recency * (recency / 3600.0).min(1.0).max(0.0);
             let error_score = self.weights.error * (1.0 - error_rate);
 
-            let mut score = usage_score + recency_score + error_score;
-            // Recovery ramp: a freshly unparked account scores highest on
-            // usage+recency and would absorb everything until re-parked.
-            // Ramp it back over 3 minutes so traffic spreads instead.
-            if rate_limited_until > 0 {
-                let recovered_ago = (now - rate_limited_until).max(0) as f64;
-                if recovered_ago < 180.0 {
-                    score *= (recovered_ago / 180.0).max(0.05);
-                }
-            }
+            let score = usage_score + recency_score + error_score;
 
             scored.push((score, i));
         }
 
         if scored.is_empty() {
-            // Tell clients how long to back off: soonest parked-account recovery.
-            let retry_after = accounts
-                .iter()
-                .filter(|a| a.is_active.load(Ordering::Relaxed))
-                .map(|a| a.rate_limited_until.load(Ordering::Relaxed) - now)
-                .filter(|&r| r > 0)
-                .min()
-                .unwrap_or(0)
-                .max(0) as u64;
-            return Err(AppError::ServiceUnavailableRetry(
-                "All accounts are inactive, rate-limited, or have expired tokens".into(),
-                retry_after,
+            return Err(AppError::ServiceUnavailable(
+                "All accounts are inactive or have expired tokens".into(),
             ));
         }
 
@@ -492,105 +370,86 @@ impl AccountManager {
         let best = &accounts[scored[0].1];
         best.last_used.store(now, Ordering::Relaxed);
         best.request_count.fetch_add(1, Ordering::Relaxed);
-        // Count toward the daily budget (rollover already ensured above when
-        // budgets are enabled; do it unconditionally here for fresh accounts
-        // added mid-day or budget toggled on later).
-        let today = utc_day(now);
-        if best.day_start.load(Ordering::Relaxed) != today {
-            best.day_start.store(today, Ordering::Relaxed);
-            best.day_requests.store(0, Ordering::Relaxed);
-        }
-        best.day_requests.fetch_add(1, Ordering::Relaxed);
-        // Global budget accounting: count this call in Redis without blocking
-        // the request path (fire-and-forget). The 60s reconcile folds the
-        // fleet-wide total back into the local enforcement counter.
-        if let Some(store) = self.upstash() {
-            let key = UpstashStore::k_usage(today, &best.id);
-            tokio::spawn(async move {
-                // Single round trip: INCR + self-cleaning expiry.
-                let _ = store.incr_expire(&key, 172_800).await;
-            });
-        }
         Ok(best.clone())
-    }
-
-    /// Pull the fleet-wide daily totals from Redis and raise the local
-    /// enforcement counters to at least the global value. Called at startup
-    /// (after the SQLite load) and on the 60s flush tick, so per-account
-    /// daily budgets are enforced fleet-wide within ~a minute. Overshoot is
-    /// bounded by one reconcile interval — acceptable next to a 12k budget.
-    pub async fn sync_usage_with_redis(&self) {
-        let store = match self.upstash() {
-            Some(s) => s,
-            None => return,
-        };
-        let today = utc_day(Utc::now().timestamp());
-        let ids: Vec<String> = {
-            let accounts = self.accounts.read().await;
-            accounts.iter().map(|a| a.id.clone()).collect()
-        };
-        if ids.is_empty() {
-            return;
-        }
-        let keys: Vec<String> =
-            ids.iter().map(|id| UpstashStore::k_usage(today, id)).collect();
-        let values = store.mget(&keys).await;
-        let accounts = self.accounts.read().await;
-        for (id, remote) in ids.iter().zip(values.iter()) {
-            let count = match remote {
-                Some(v) => v.parse::<i64>().unwrap_or(0).max(0) as u64,
-                None => continue,
-            };
-            if let Some(a) = accounts.iter().find(|a| &a.id == id) {
-                if a.day_start.load(Ordering::Relaxed) != today {
-                    a.day_start.store(today, Ordering::Relaxed);
-                    a.day_requests.store(0, Ordering::Relaxed);
-                }
-                // Only ever raise: Redis holds the fleet sum, which includes
-                // this host's own fire-and-forget increments.
-                let _ = a.day_requests.fetch_max(count, Ordering::Relaxed);
-            }
-        }
-    }
-
-    /// Pull 429/403 parks broadcast by sibling instances and apply any that
-    /// extend the local cooldown. Called at startup and on the 30s pool
-    /// tick, so one host's park protects the account fleet-wide within ~30s
-    /// instead of every host discovering the ban independently.
-    pub async fn merge_remote_cooldowns(&self) {
-        let store = match self.upstash() {
-            Some(s) => s,
-            None => return,
-        };
-        let ids: Vec<String> = {
-            let accounts = self.accounts.read().await;
-            accounts.iter().map(|a| a.id.clone()).collect()
-        };
-        if ids.is_empty() {
-            return;
-        }
-        let keys: Vec<String> =
-            ids.iter().map(|id| UpstashStore::k_cooldown(id)).collect();
-        let values = store.mget(&keys).await;
-        let accounts = self.accounts.read().await;
-        let now = Utc::now().timestamp();
-        for (id, remote) in ids.iter().zip(values.iter()) {
-            let until = match remote {
-                Some(v) => v.parse::<i64>().unwrap_or(0),
-                None => continue,
-            };
-            if until <= now {
-                continue;
-            }
-            if let Some(a) = accounts.iter().find(|a| &a.id == id) {
-                let _ = a.rate_limited_until.fetch_max(until, Ordering::Relaxed);
-                a.rate_limit_hits.fetch_add(1, Ordering::Relaxed);
-            }
-        }
     }
 
     pub async fn select_account(&self) -> Result<Arc<AccountState>, AppError> {
         self.select_account_excluding(&[]).await
+    }
+
+    /// Playback pool size (upstream: PlaybackCredentialPool.size).
+    /// Catalog-only credentials are excluded. Minimum 1 so callers
+    /// without playback accounts still run once and surface the real error.
+    pub async fn playback_slots(&self) -> usize {
+        self.accounts
+            .read()
+            .await
+            .iter()
+            .filter(|a| !a.is_catalog.load(Ordering::Relaxed))
+            .count()
+            .max(1)
+    }
+
+    /// Number of playback (non-catalog) accounts.
+    pub async fn playback_count(&self) -> usize {
+        self.accounts
+            .read()
+            .await
+            .iter()
+            .filter(|a| !a.is_catalog.load(Ordering::Relaxed))
+            .count()
+    }
+
+    /// Dedicated metadata credential (upstream _catalog_cred). Prefers an
+    /// active catalog account; returns None when none is flagged.
+    pub async fn find_catalog_account(&self) -> Option<Arc<AccountState>> {
+        let accounts = self.accounts.read().await;
+        accounts
+            .iter()
+            .find(|a| {
+                a.is_catalog.load(Ordering::Relaxed) && a.is_active.load(Ordering::Relaxed)
+            })
+            .cloned()
+            .or_else(|| {
+                accounts
+                    .iter()
+                    .find(|a| a.is_catalog.load(Ordering::Relaxed))
+                    .cloned()
+            })
+    }
+
+    /// Metadata account selection (upstream catalog=True): the catalog
+    /// credential when one is active, otherwise the normal playback pool.
+    pub async fn select_catalog_account(&self) -> Result<Arc<AccountState>, AppError> {
+        if let Some(acc) = self.find_catalog_account().await {
+            if acc.is_active.load(Ordering::Relaxed) {
+                return Ok(acc);
+            }
+        }
+        self.select_account_excluding(&[]).await
+    }
+
+    /// Flag or unflag an account as catalog-only (kept out of playback).
+    pub async fn set_account_catalog(&self, id: &str, catalog: bool) -> Result<(), AppError> {
+        if let Some(account) = self.get_account_by_id(id).await {
+            account.is_catalog.store(catalog, Ordering::Relaxed);
+            let now = Utc::now().timestamp();
+            account.updated_at.store(now, Ordering::Relaxed);
+            if let Some(db) = &self.db {
+                sqlx::query(
+                    "UPDATE accounts SET is_catalog = ?, updated_at = ? WHERE id = ?",
+                )
+                .bind(catalog as i32)
+                .bind(now)
+                .bind(id)
+                .execute(db)
+                .await?;
+            }
+            self.push_account_to_redis(&account).await;
+            Ok(())
+        } else {
+            Err(AppError::NotFound(format!("Account {} not found", id)))
+        }
     }
 
     pub async fn mark_account_error(&self, id: &str, message: &str) {
@@ -606,31 +465,6 @@ impl AccountManager {
                 .bind(id)
                 .execute(db)
                 .await;
-            }
-        }
-    }
-
-    pub async fn mark_account_rate_limited(&self, id: &str, duration_secs: i64) {
-        // Desync herd recoveries: without jitter every account parked by the
-        // same burst unparks simultaneously and gets re-slammed together.
-        let jitter = rand::thread_rng().gen_range(0..=(duration_secs.max(1) / 4));
-        let until = Utc::now().timestamp() + duration_secs + jitter;
-        if let Some(account) = self.get_account_by_id(id).await {
-            account.rate_limit_hits.fetch_add(1, Ordering::Relaxed);
-            account.rate_limited_until.store(until, Ordering::Relaxed);
-            if let Some(db) = &self.db {
-                let _ = sqlx::query(
-                    "UPDATE account_metrics SET rate_limit_hits = rate_limit_hits + 1 WHERE account_id = ?",
-                )
-                .bind(id)
-                .execute(db)
-                .await;
-            }
-            // Broadcast the park so sibling instances stop using this
-            // account too (merged by their 30s tick). Best-effort.
-            if let Some(store) = self.upstash() {
-                let ttl = (until - Utc::now().timestamp() + 120).max(60) as u64;
-                store.set(&UpstashStore::k_cooldown(id), &until.to_string(), Some(ttl.min(7200))).await;
             }
         }
     }
@@ -668,8 +502,8 @@ impl AccountManager {
             old.is_active.load(Ordering::Relaxed),
             new_notes,
         ));
-        // Preserve live counters/leases (an edit must not wipe parks,
-        // budgets, or tokens) and stamp the mutation for fleet merges.
+        // Preserve live counters (an edit must not wipe stats
+        // or tokens) and stamp the mutation for fleet merges.
         AccountState::carry_over(&updated, old);
         let now_mut = Utc::now().timestamp();
         updated.updated_at.store(now_mut, Ordering::Relaxed);
@@ -746,29 +580,6 @@ impl AccountManager {
         }
     }
 
-    /// Emergency reset: clear all per-account rate-limit cooldowns.
-    pub async fn clear_all_rate_limits(&self) -> usize {
-        let accounts = self.accounts.read().await;
-        let mut cleared = 0;
-        let mut ids = Vec::new();
-        for a in accounts.iter() {
-            if a.rate_limited_until.swap(0, Ordering::Relaxed) > 0 {
-                cleared += 1;
-            }
-            ids.push(a.id.clone());
-        }
-        drop(accounts);
-        // Clear the broadcast parks too, or the next 30s merge re-parks them.
-        if cleared > 0 {
-            if let Some(store) = self.upstash() {
-                let keys: Vec<String> =
-                    ids.iter().map(|id| UpstashStore::k_cooldown(id)).collect();
-                store.del_many(&keys).await;
-            }
-        }
-        cleared
-    }
-
     // --- Redis credential sync ---
 
     /// Serialize one account for Redis. Contains Tidal secrets — the
@@ -783,6 +594,7 @@ impl AccountManager {
             "user_id": acc.user_id.read().await.clone(),
             "is_active": acc.is_active.load(Ordering::Relaxed),
             "auto_disabled": acc.auto_disabled.load(Ordering::Relaxed),
+            "is_catalog": acc.is_catalog.load(Ordering::Relaxed),
             "notes": acc.notes.read().await.clone(),
             "updated_at": acc.updated_at.load(Ordering::Relaxed),
         })
@@ -839,6 +651,8 @@ impl AccountManager {
                 let is_active = v.get("is_active").and_then(|x| x.as_bool()).unwrap_or(true);
                 let auto_disabled =
                     v.get("auto_disabled").and_then(|x| x.as_bool()).unwrap_or(false);
+                let is_catalog =
+                    v.get("is_catalog").and_then(|x| x.as_bool()).unwrap_or(false);
                 if let Some(pos) = accounts.iter().position(|a| &a.id == id) {
                     if remote_updated <= accounts[pos].updated_at.load(Ordering::Relaxed) {
                         continue;
@@ -859,12 +673,15 @@ impl AccountManager {
                     if auto_disabled {
                         rebuilt.auto_disabled.store(true, Ordering::Relaxed);
                     }
+                    if is_catalog {
+                        rebuilt.is_catalog.store(true, Ordering::Relaxed);
+                    }
                     rebuilt.updated_at.store(remote_updated, Ordering::Relaxed);
                     if let Some(db) = &self.db {
                         let _ = sqlx::query(
                             "UPDATE accounts SET label = ?, client_id = ?, client_secret = ?,
                              refresh_token = ?, user_id = ?, is_active = ?, auto_disabled = ?,
-                             notes = ?, updated_at = ? WHERE id = ?",
+                             is_catalog = ?, notes = ?, updated_at = ? WHERE id = ?",
                         )
                         .bind(&rebuilt.label)
                         .bind(&rebuilt.client_id)
@@ -873,6 +690,7 @@ impl AccountManager {
                         .bind(&user_id)
                         .bind(is_active as i32)
                         .bind(auto_disabled as i32)
+                        .bind(is_catalog as i32)
                         .bind(&notes)
                         .bind(remote_updated)
                         .bind(&rebuilt.id)
@@ -897,13 +715,16 @@ impl AccountManager {
                     if auto_disabled {
                         state.auto_disabled.store(true, Ordering::Relaxed);
                     }
+                    if is_catalog {
+                        state.is_catalog.store(true, Ordering::Relaxed);
+                    }
                     state.updated_at.store(remote_updated, Ordering::Relaxed);
                     if let Some(db) = &self.db {
                         let now = Utc::now().timestamp();
                         let _ = sqlx::query(
                             "INSERT INTO accounts (id, label, client_id, client_secret, refresh_token,
-                             user_id, is_active, auto_disabled, notes, created_at, updated_at)
-                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                             user_id, is_active, auto_disabled, is_catalog, notes, created_at, updated_at)
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                              ON CONFLICT(id) DO NOTHING",
                         )
                         .bind(id)
@@ -914,6 +735,7 @@ impl AccountManager {
                         .bind(&user_id)
                         .bind(is_active as i32)
                         .bind(auto_disabled as i32)
+                        .bind(is_catalog as i32)
                         .bind(&notes)
                         .bind(now)
                         .bind(remote_updated)
@@ -982,14 +804,10 @@ impl AccountManager {
 
     pub async fn healthy_count(&self) -> (usize, usize) {
         let accounts = self.accounts.read().await;
-        let now = Utc::now().timestamp();
         let total = accounts.len();
         let healthy = accounts
             .iter()
-            .filter(|a| {
-                a.is_active.load(Ordering::Relaxed)
-                    && a.rate_limited_until.load(Ordering::Relaxed) <= now
-            })
+            .filter(|a| a.is_active.load(Ordering::Relaxed))
             .count();
         (healthy, total)
     }
@@ -1039,7 +857,6 @@ mod tests {
             "note".into(),
         );
         acc.updated_at.store(12345, Ordering::Relaxed);
-        acc.day_requests.store(77, Ordering::Relaxed);
         let raw = super::AccountManager::account_to_json(&acc).await;
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(v["id"], "id-1");
@@ -1066,9 +883,8 @@ mod tests {
             String::new(),
         );
         old.request_count.store(500, Ordering::Relaxed);
-        old.day_requests.store(9000, Ordering::Relaxed);
-        old.rate_limited_until.store(9_999_999, Ordering::Relaxed);
         old.token_expires_at.store(8_888_888, Ordering::Relaxed);
+        old.is_catalog.store(true, Ordering::Relaxed);
         let new = AccountState::new(
             "id-1".into(),
             "New".into(),
@@ -1082,8 +898,49 @@ mod tests {
         AccountState::carry_over(&new, &old);
         assert_eq!(new.label, "New");
         assert_eq!(new.request_count.load(Ordering::Relaxed), 500);
-        assert_eq!(new.day_requests.load(Ordering::Relaxed), 9000);
-        assert_eq!(new.rate_limited_until.load(Ordering::Relaxed), 9_999_999);
         assert_eq!(new.token_expires_at.load(Ordering::Relaxed), 8_888_888);
+        assert!(new.is_catalog.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn catalog_accounts_stay_out_of_playback() {
+        use super::{AccountManager, SwitchingWeights};
+        use std::sync::Arc;
+        let am = Arc::new(AccountManager::new(None, SwitchingWeights::default()));
+        let playback = am
+            .add_account("play".into(), "c".into(), "s".into(), "rt-play".into(), None)
+            .await
+            .unwrap();
+        let catalog = am
+            .add_account("cat".into(), "c".into(), "s".into(), "rt-cat".into(), None)
+            .await
+            .unwrap();
+        am.set_account_catalog(&catalog.id, true).await.unwrap();
+        assert_eq!(am.playback_count().await, 1);
+        assert_eq!(am.playback_slots().await, 1);
+        // Playback selection never returns the catalog account.
+        for _ in 0..3 {
+            let picked = am.select_account_excluding(&[]).await.unwrap();
+            assert_eq!(picked.id, playback.id);
+        }
+        // Catalog resolution finds the flagged account.
+        let found = am.find_catalog_account().await.unwrap();
+        assert_eq!(found.id, catalog.id);
+        let via_helper = am.select_catalog_account().await.unwrap();
+        assert_eq!(via_helper.id, catalog.id);
+    }
+
+    #[tokio::test]
+    async fn catalog_selection_falls_back_to_pool() {
+        use super::{AccountManager, SwitchingWeights};
+        use std::sync::Arc;
+        let am = Arc::new(AccountManager::new(None, SwitchingWeights::default()));
+        let playback = am
+            .add_account("play".into(), "c".into(), "s".into(), "rt-play".into(), None)
+            .await
+            .unwrap();
+        assert!(am.find_catalog_account().await.is_none());
+        let picked = am.select_catalog_account().await.unwrap();
+        assert_eq!(picked.id, playback.id);
     }
 }

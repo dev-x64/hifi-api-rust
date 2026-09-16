@@ -12,14 +12,14 @@ use tokio::sync::RwLock;
 use crate::config::Config;
 use crate::error::AppError;
 
-fn build_client(proxy_url: Option<&str>) -> Result<Client, String> {
+fn build_client(proxy_url: Option<&str>, user_agent: &str) -> Result<Client, String> {
     let mut builder = Client::builder()
         .gzip(true)
         .http2_prior_knowledge()
         .http2_adaptive_window(true)
         .pool_max_idle_per_host(500)
         .pool_idle_timeout(Duration::from_secs(30))
-        .user_agent("okhttp/5.3.2");
+        .user_agent(user_agent);
     if let Some(url) = proxy_url {
         let proxy =
             reqwest::Proxy::all(url).map_err(|e| format!("Invalid proxy URL: {}", e))?;
@@ -52,7 +52,7 @@ impl ProxyManager {
             Vec::new()
         };
 
-        let direct = build_client(None).expect("Failed to build HTTP client");
+        let direct = build_client(None, &config.user_agent).expect("Failed to build HTTP client");
         Self {
             config,
             proxies: RwLock::new(proxies),
@@ -143,7 +143,7 @@ impl ProxyManager {
     }
 
     async fn swap_to(&self, proxy: Option<String>) {
-        match build_client(proxy.as_deref()) {
+        match build_client(proxy.as_deref(), &self.config.user_agent) {
             Ok(client) => {
                 self.client.store(Arc::new(client));
                 *self.current.write().await = proxy.clone();
@@ -203,6 +203,17 @@ impl ProxyManager {
 
     /// Swap to the next proxy immediately (round-robin); health is verified
     /// in the background so a failing request never blocks on proxy tests.
+    /// Public entry point for refresh-triggered rotation (upstream:
+    /// ROTATE_PROXIES_ON_REFRESH).
+    pub fn rotate_now(self: &Arc<Self>) {
+        self.rotate();
+    }
+
+    /// True when token refreshes should rotate the proxy first.
+    pub fn should_rotate_on_refresh(&self) -> bool {
+        self.config.use_proxies && self.config.rotate_proxies_on_refresh
+    }
+
     fn rotate(self: &Arc<Self>) {
         if !self
             .rotating

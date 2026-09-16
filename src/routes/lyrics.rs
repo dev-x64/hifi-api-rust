@@ -15,24 +15,16 @@ pub async fn get_lyrics(
     State(state): State<AppState>,
     Query(params): Query<LyricsParams>,
 ) -> Result<Json<Value>, AppError> {
-    let account = state.account_manager.select_account().await?;
-    let hc = state.tidal_client.working_client().await?;
-    let token = state
-        .token_manager
-        .get_token(&account, &hc)
-        .await?;
-
     let url = format!("https://api.tidal.com/v1/tracks/{}/lyrics", params.id);
     let data = state
         .tidal_client
-        .make_authed_request(
+        .make_catalog_authed_request(
             &url,
             Some(vec![
                 ("countryCode", &state.config.country_code),
                 ("locale", "en_US"),
                 ("deviceType", "BROWSER"),
             ]),
-            &token,
         )
         .await?;
 

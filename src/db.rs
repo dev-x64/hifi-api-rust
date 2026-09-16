@@ -19,6 +19,7 @@ pub async fn init_pool(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
             user_id TEXT,
             is_active INTEGER NOT NULL DEFAULT 1,
             auto_disabled INTEGER NOT NULL DEFAULT 0,
+            is_catalog INTEGER NOT NULL DEFAULT 0,
             notes TEXT NOT NULL DEFAULT '',
             created_at INTEGER NOT NULL,
             updated_at INTEGER NOT NULL
@@ -37,6 +38,12 @@ pub async fn init_pool(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
             .execute(&pool)
             .await?;
         tracing::info!("Migrated accounts table: added auto_disabled");
+    }
+    if !cols.iter().any(|c| c.1 == "is_catalog") {
+        sqlx::query("ALTER TABLE accounts ADD COLUMN is_catalog INTEGER NOT NULL DEFAULT 0")
+            .execute(&pool)
+            .await?;
+        tracing::info!("Migrated accounts table: added is_catalog");
     }
 
     sqlx::query(

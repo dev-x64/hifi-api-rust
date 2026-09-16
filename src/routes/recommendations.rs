@@ -18,7 +18,7 @@ pub async fn get_recommendations(
     let url = format!("https://api.tidal.com/v1/tracks/{}/recommendations", params.id);
     let result = state
         .tidal_client
-        .make_request(
+        .make_catalog_request(
             &url,
             Some(vec![
                 ("limit", "20"),

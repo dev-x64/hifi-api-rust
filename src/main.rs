@@ -2,15 +2,14 @@ mod account_manager;
 mod admin;
 mod api_keys;
 mod autoheal;
-mod anti_ban;
 mod config;
 mod db;
 mod error;
 mod cache;
-mod ip_limiter;
 mod notifier;
+mod playback;
 mod proxy_manager;
-mod rate_limit;
+mod settings;
 mod request_log;
 mod routes;
 mod setup;
@@ -45,10 +44,10 @@ pub struct AppState {
     pub api_keys: Arc<ApiKeyManager>,
     pub tidal_client: Arc<tidal_client::TidalClient>,
     pub proxy_manager: Arc<proxy_manager::ProxyManager>,
-    pub anti_ban: Arc<anti_ban::AntiBan>,
     pub notifier: Arc<notifier::Notifier>,
+    pub playback: Arc<playback::PlaybackQueue>,
     pub cache: Arc<cache::ResponseCache>,
-    pub rate_limits: Arc<rate_limit::RateLimitSettings>,
+    pub settings: Arc<settings::AppSettings>,
     pub request_log: Arc<request_log::RequestLog>,
     pub db: Option<sqlx::SqlitePool>,
     pub setup_sessions: admin::setup::Sessions,
@@ -94,11 +93,9 @@ async fn main() {
     let http_client = Arc::new(proxy_manager.client());
 
     let switching_weights = SwitchingWeights::default();
-    // RateLimitSettings is built before the manager so selection policy
-    // (daily budgets) is available from the first request.
-    let rate_limits = Arc::new(rate_limit::RateLimitSettings::from_env());
+    let settings = Arc::new(settings::AppSettings::from_env());
     if let Some(db) = &db {
-        rate_limits.load_from_db(db).await;
+        settings.load_from_db(db).await;
     }
 
     // Shared cross-instance state (Upstash Redis). Absent unless both env
@@ -112,26 +109,53 @@ async fn main() {
         }
         // Fleet convergence: seed-if-empty, then adopt the shared values.
         // (Local DB/env already loaded above as the fallback/seed source.)
-        rate_limits.set_upstash(Some(store.clone()));
-        rate_limits.seed_and_load().await;
+        settings.set_upstash(Some(store.clone()));
+        settings.seed_and_load().await;
     }
 
-    let account_manager = Arc::new(AccountManager::new(
-        db.clone(),
-        switching_weights,
-        rate_limits.clone(),
-    ));
+    let account_manager = Arc::new(AccountManager::new(db.clone(), switching_weights));
 
     if let Err(e) = account_manager.load_from_db().await {
         tracing::warn!("Could not load accounts from DB: {}", e);
     }
-    account_manager.load_daily_usage().await;
     account_manager.set_upstash(upstash.clone());
-    // Converge budgets/parks/credentials with the fleet (SQLite only has
+    // Converge credentials with the fleet (SQLite only has
     // this host — a wiped disk restores its accounts from Redis here).
-    account_manager.sync_usage_with_redis().await;
-    account_manager.merge_remote_cooldowns().await;
     account_manager.merge_accounts_from_redis().await;
+
+    // Legacy credential file (upstream TOKEN_FILE, default token.json):
+    // imported once into the DB when present. Supports the upstream
+    // per-entry catalog marker (role="catalog" or catalog=true), which is
+    // kept out of the playback pool.
+    import_token_file(&account_manager, &config.token_file).await;
+
+    // Dedicated metadata credential from the environment (upstream
+    // CATALOG_REFRESH_TOKEN). Only when no catalog account exists yet.
+    if account_manager.find_catalog_account().await.is_none()
+        && !config.catalog_refresh_token.is_empty()
+    {
+        let secret = if config.catalog_client_secret.is_empty() {
+            "Y8tIpqKJxs9BEIwYr0I9bSbMWDsogXJx9LaN3mCHwD4%3D".to_string()
+        } else {
+            config.catalog_client_secret.clone()
+        };
+        match account_manager
+            .add_account(
+                "Catalog (env)".into(),
+                config.catalog_client_id.clone(),
+                secret,
+                config.catalog_refresh_token.clone(),
+                config.catalog_user_id.clone(),
+            )
+            .await
+        {
+            Ok(acc) => {
+                let _ = account_manager.set_account_catalog(&acc.id, true).await;
+                tracing::info!("Loaded catalog account from env vars ({})", acc.id);
+            }
+            Err(e) => tracing::warn!("Failed to load catalog account from env vars: {}", e),
+        }
+    }
 
     if account_manager.account_count().await == 0 {
         let env_client_id = std::env::var("CLIENT_ID").unwrap_or_default();
@@ -178,6 +202,7 @@ async fn main() {
 
     let token_manager = Arc::new(TokenManager::new(db.clone()));
     token_manager.set_account_manager(account_manager.clone());
+    token_manager.set_proxy_manager(proxy_manager.clone());
     token_manager.set_upstash(upstash.clone());
 
     let api_keys = Arc::new(ApiKeyManager::new(db.clone()));
@@ -188,26 +213,7 @@ async fn main() {
     api_keys.sync_usage_from_redis().await;
     api_keys.merge_keys_from_redis().await;
 
-    let anti_ban = Arc::new(anti_ban::AntiBan::new(rate_limits.clone()));
-    anti_ban.set_upstash(upstash.clone());
-
-    // Periodically rebuild the per-IP limiter so stale IP buckets are dropped
-    // (bounds memory) and no IP is throttled forever by past activity.
-    // Also evicts stale reputation entries.
-    {
-        let ab = anti_ban.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(600));
-            loop {
-                interval.tick().await;
-                ab.reload_limiter();
-                ab.evict_reputation(3600);
-            }
-        });
-    }
-
-    // Flush per-account daily usage to the DB every minute, and reconcile
-    // the fleet-wide counters/quotas/rosters from Redis.
+    // Reconcile the fleet-wide quotas/rosters from Redis.
     {
         let am = account_manager.clone();
         let ak = api_keys.clone();
@@ -215,11 +221,21 @@ async fn main() {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
             loop {
                 interval.tick().await;
-                am.flush_daily_usage().await;
-                am.sync_usage_with_redis().await;
                 ak.sync_usage_from_redis().await;
                 am.merge_accounts_from_redis().await;
                 ak.merge_keys_from_redis().await;
+            }
+        });
+    }
+
+    // Periodically adopt shared settings from Redis.
+    {
+        let st = settings.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                st.refresh_from_redis().await;
             }
         });
     }
@@ -230,8 +246,6 @@ async fn main() {
         proxy_manager.clone(),
         token_manager.clone(),
         account_manager.clone(),
-        anti_ban.clone(),
-        rate_limits.clone(),
         notifier.clone(),
         config.clone(),
     ));
@@ -244,9 +258,9 @@ async fn main() {
         notifier: notifier.clone(),
         tidal_client: tidal_client.clone(),
         proxy_manager: proxy_manager.clone(),
-        anti_ban,
+        playback: Arc::new(playback::PlaybackQueue::new()),
         cache: Arc::new(cache::ResponseCache::new()),
-        rate_limits: rate_limits.clone(),
+        settings: settings.clone(),
         request_log: Arc::new(request_log::RequestLog::new()),
         db,
         setup_sessions: admin::setup::new_session_store(),
@@ -264,50 +278,10 @@ async fn main() {
         account_manager.clone(),
         token_manager.clone(),
         proxy_manager.clone(),
-        rate_limits.clone(),
+        settings.clone(),
         notifier.clone(),
     )
     .await;
-
-    // Pool watcher (30s): adopt shared settings, merge sibling parks,
-    // rescale Tidal quotas to the live healthy count and flip conservation
-    // mode, alerting on transitions.
-    {
-        let ab = state.anti_ban.clone();
-        let am = state.account_manager.clone();
-        let nt = state.notifier.clone();
-        let rl = state.rate_limits.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
-            loop {
-                interval.tick().await;
-                // Shared settings first so the rescale below uses fresh values.
-                if rl.refresh_from_redis().await {
-                    ab.reload_limiter();
-                }
-                am.merge_remote_cooldowns().await;
-                let (healthy, total) = am.healthy_count().await;
-                let active = am.active_count().await;
-                match ab.refresh_for_pool(healthy, active) {
-                    Some(crate::anti_ban::PoolTransition::EnteredConservation) => {
-                        tracing::warn!(
-                            "Conservation mode ON ({} healthy of {} active) — shedding load to protect the reserve",
-                            healthy, active
-                        );
-                        nt.alert_conservation(true, healthy, total).await;
-                    }
-                    Some(crate::anti_ban::PoolTransition::ExitedConservation) => {
-                        tracing::info!(
-                            "Conservation mode OFF ({} healthy) — normal limits restored",
-                            healthy
-                        );
-                        nt.alert_conservation(false, healthy, total).await;
-                    }
-                    None => {}
-                }
-            }
-        });
-    }
 
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -337,11 +311,15 @@ async fn main() {
         .route("/topvideos/", get(routes::topvideos::get_top_videos))
         .route("/video/", get(routes::video::get_video))
         .route("/health", get(routes::health::health))
+        .route(
+            "/playback/requests/{request_id}",
+            get(playback::get_playback_request).delete(playback::cancel_playback_request),
+        )
         // Admin SPA (no auth — the SPA handles auth in-browser)
         .route("/admin", get(crate::admin::ui::admin_index))
         // Admin API routes (auth-protected)
         .nest("/admin", admin_api(state.clone()))
-        // Innermost: response cache (inside the limiters, so limits apply uniformly).
+        // Innermost: response cache.
         .layer(middleware::from_fn_with_state(
             state.clone(),
             cache::cache_responses,
@@ -349,10 +327,6 @@ async fn main() {
         .layer(middleware::from_fn_with_state(
             state.clone(),
             api_keys::ApiKeyManager::enforce_api_key,
-        ))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            ip_limiter::enforce_ip_rate_limit,
         ))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
@@ -374,15 +348,114 @@ async fn main() {
     .unwrap();
 }
 
-fn admin_api(state: AppState) -> Router<AppState> {
-    Router::new()
+/// Import a legacy upstream token.json file into the DB (once).
+/// Tolerates upstream key variants (client_ID, userID) and the catalog
+/// marker (role="catalog" / catalog=true). Duplicates by refresh token
+/// are skipped, matching the admin import endpoint.
+async fn import_token_file(manager: &Arc<AccountManager>, path: &str) {
+    if path.is_empty() {
+        return;
+    }
+    let raw = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => {
+            tracing::debug!("Token file {} not present, skipping", path);
+            return;
+        }
+    };
+    let parsed: Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("Cannot parse token file {}: {}", path, e);
+            return;
+        }
+    };
+    let entries: Vec<Value> = match parsed {
+        Value::Array(a) => a,
+        Value::Object(_) => vec![parsed],
+        _ => {
+            tracing::warn!("Token file {} has unexpected shape, skipping", path);
+            return;
+        }
+    };
+    let env_client_id = std::env::var("CLIENT_ID").unwrap_or_default();
+    let env_client_secret = std::env::var("CLIENT_SECRET").unwrap_or_default();
+    let existing: std::collections::HashSet<String> = manager
+        .list_accounts()
+        .await
+        .iter()
+        .map(|a| a.refresh_token.clone())
+        .collect();
+    let mut seen = existing;
+    let mut imported = 0usize;
+    for entry in &entries {
+        let s = |keys: &[&str]| {
+            keys.iter()
+                .filter_map(|k| entry.get(*k).and_then(|v| v.as_str()))
+                .next()
+                .unwrap_or("")
+                .to_string()
+        };
+        let client_id = s(&["client_id", "client_ID", "clientID"]);
+        let client_id = if client_id.is_empty() {
+            env_client_id.clone()
+        } else {
+            client_id
+        };
+        let mut client_secret = s(&["client_secret", "clientSecret"]);
+        if client_secret.is_empty() {
+            client_secret = env_client_secret.clone();
+        }
+        let refresh_token = s(&["refresh_token", "refreshToken"]);
+        if client_id.is_empty() || refresh_token.is_empty() || seen.contains(&refresh_token) {
+            continue;
+        }
+        let user_id = [entry.get("user_id"), entry.get("userID"), entry.get("userId")]
+            .into_iter()
+            .filter_map(|v| v.and_then(|x| x.as_str()))
+            .next()
+            .map(|x| x.to_string());
+        let label = entry
+            .get("label")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let is_catalog = entry
+            .get("role")
+            .and_then(|v| v.as_str())
+            .map(|r| r.eq_ignore_ascii_case("catalog"))
+            .unwrap_or(false)
+            || entry
+                .get("catalog")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+        match manager
+            .add_account(label, client_id, client_secret, refresh_token.clone(), user_id)
+            .await
+        {
+            Ok(acc) => {
+                if is_catalog {
+                    let _ = manager.set_account_catalog(&acc.id, true).await;
+                }
+                seen.insert(refresh_token);
+                imported += 1;
+            }
+            Err(e) => tracing::warn!("Token file entry skipped: {}", e),
+        }
+    }
+    if imported > 0 {
+        tracing::info!("Imported {} account(s) from {}", imported, path);
+    }
+}
+
+fn admin_api(state: AppState) -> Router<AppState> {    Router::new()
         .route("/accounts/export", get(crate::admin::accounts::export_accounts))
         .route("/accounts/import", post(crate::admin::accounts::import_accounts))
         .route("/accounts", get(crate::admin::accounts::list_accounts).post(crate::admin::accounts::add_account))
         .route("/accounts/{id}", patch(crate::admin::accounts::update_account).delete(crate::admin::accounts::remove_account))
         .route("/accounts/{id}/toggle", put(crate::admin::accounts::toggle_account))
+        .route("/accounts/{id}/catalog", put(crate::admin::accounts::set_account_catalog))
         .route("/accounts/test-all", post(crate::admin::accounts::test_all_accounts))
-        .route("/accounts/clear-rate-limits", post(crate::admin::accounts::clear_rate_limits))
         .route("/accounts/{id}/test", post(crate::admin::accounts::test_account))
         .route("/accounts/{id}/refresh", post(crate::admin::accounts::refresh_account_token))
         .route("/stats", get(crate::admin::stats::get_stats))

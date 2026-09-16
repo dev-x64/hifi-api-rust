@@ -19,6 +19,12 @@ pub struct AddAccountRequest {
     pub client_secret: String,
     pub refresh_token: String,
     pub user_id: Option<String>,
+    /// When true, the account serves metadata only (upstream catalog role).
+    #[serde(default)]
+    pub catalog: Option<bool>,
+    /// Upstream token.json style: role="catalog".
+    #[serde(default)]
+    pub role: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -45,11 +51,9 @@ pub async fn list_accounts(
             "heal_next_retry": a.heal_next_retry.load(std::sync::atomic::Ordering::Relaxed),
             "request_count": a.request_count.load(std::sync::atomic::Ordering::Relaxed),
             "error_count": a.error_count.load(std::sync::atomic::Ordering::Relaxed),
-            "rate_limit_hits": a.rate_limit_hits.load(std::sync::atomic::Ordering::Relaxed),
-            "rate_limited_until": a.rate_limited_until.load(std::sync::atomic::Ordering::Relaxed),
+            "is_catalog": a.is_catalog.load(std::sync::atomic::Ordering::Relaxed),
             "token_expires_at": a.token_expires_at.load(std::sync::atomic::Ordering::Relaxed),
             "last_used": a.last_used.load(std::sync::atomic::Ordering::Relaxed),
-            "day_requests": a.day_requests.load(std::sync::atomic::Ordering::Relaxed),
             "notes": a.notes.read().await.clone(),
         }));
     }
@@ -71,6 +75,11 @@ pub async fn add_account(
             body.user_id,
         )
         .await?;
+    let is_catalog = body.catalog.unwrap_or(false)
+        || body.role.as_deref().map(|r| r.eq_ignore_ascii_case("catalog")).unwrap_or(false);
+    if is_catalog {
+        state.account_manager.set_account_catalog(&account.id, true).await?;
+    }
 
     Ok(Json(json!({
         "message": "Account added",
@@ -79,6 +88,22 @@ pub async fn add_account(
             "label": account.label
         }
     })))
+}
+
+#[derive(Deserialize)]
+pub struct CatalogAccountRequest {
+    pub catalog: bool,
+}
+
+/// Flag or unflag an account as catalog-only (metadata, never playback).
+pub async fn set_account_catalog(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<CatalogAccountRequest>,
+) -> Result<Json<Value>, AppError> {
+    state.account_manager.set_account_catalog(&id, body.catalog).await?;
+    let status = if body.catalog { "catalog-only" } else { "playback" };
+    Ok(Json(json!({ "message": format!("Account {} set to {}", id, status) })))
 }
 
 pub async fn remove_account(
@@ -165,13 +190,6 @@ pub async fn refresh_account_token(
             ))
         }
     }
-}
-
-pub async fn clear_rate_limits(
-    State(state): State<AppState>,
-) -> Result<Json<Value>, AppError> {
-    let cleared = state.account_manager.clear_all_rate_limits().await;
-    Ok(Json(json!({"message": format!("Cleared rate-limit cooldowns on {} account(s)", cleared), "cleared": cleared})))
 }
 
 pub async fn test_all_accounts(
@@ -269,13 +287,18 @@ pub async fn export_accounts(
     let exported: Vec<Value> = accounts
         .iter()
         .map(|a| {
-            json!({
+            let is_catalog = a.is_catalog.load(std::sync::atomic::Ordering::Relaxed);
+            let mut obj = json!({
                 "label": a.label,
                 "client_id": a.client_id,
                 "client_secret": a.client_secret,
                 "refresh_token": a.refresh_token,
                 "user_id": futures::executor::block_on(async { a.user_id.read().await.clone() }),
-            })
+            });
+            if is_catalog {
+                obj["role"] = json!("catalog");
+            }
+            obj
         })
         .collect();
     Ok(Json(json!({ "accounts": exported })))
@@ -340,13 +363,24 @@ pub async fn import_accounts(
             .get("user_id")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
+        let is_catalog = val
+            .get("role")
+            .and_then(|v| v.as_str())
+            .map(|r| r.eq_ignore_ascii_case("catalog"))
+            .unwrap_or(false)
+            || val.get("catalog").and_then(|v| v.as_bool()).unwrap_or(false);
 
         match state
             .account_manager
             .add_account(label, client_id, client_secret, refresh_token, user_id)
             .await
         {
-            Ok(_) => imported += 1,
+            Ok(acc) => {
+                if is_catalog {
+                    let _ = state.account_manager.set_account_catalog(&acc.id, true).await;
+                }
+                imported += 1;
+            }
             Err(e) => {
                 errors.push(json!({"index": i, "error": format!("{:?}", e)}));
                 skipped += 1;

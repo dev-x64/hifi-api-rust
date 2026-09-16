@@ -71,10 +71,16 @@ The `CLIENT_ID` and `CLIENT_SECRET` above are Tidal's public OAuth credentials. 
 | `ADMIN_KEY` | (none) | Admin panel auth (empty = open) |
 | `COUNTRY_CODE` | `US` | Tidal region code |
 | `AUTO_SETUP` | `false` | Enable auto-OAuth-setup on first boot |
+| `TOKEN_FILE` | `token.json` | Legacy upstream credential file, imported into the DB on startup when present (supports `role: "catalog"` per entry) |
+| `CATALOG_CLIENT_ID` / `CATALOG_CLIENT_SECRET` / `CATALOG_REFRESH_TOKEN` / `CATALOG_USER_ID` | (none) | Dedicated metadata credential, kept out of the playback pool (upstream `CATALOG_*`) |
+| `CATALOG_TOKEN` | (none) | Static bearer token for metadata, no refresh (upstream `CATALOG_TOKEN`, legacy `CATALOG_ACCESS_TOKEN` also honored) |
 | `USE_PROXIES` | `false` | Enable proxy rotation for all Tidal traffic (optional; everything goes direct when off) |
 | `PROXIES_FILE` | `proxies.txt` | Proxy list (one per line, `http(s)://[user:pass@]host:port`) |
 | `FALLBACK_TO_DIRECT_CONNECTION` | `false` | If `true`, fall back to direct when no proxy works (**exposes host IP**); if `false`, Tidal traffic returns 503 until a proxy works |
 | `MAX_RETRIES` | `2` | Retry count on proxy failure |
+| `ROTATE_PROXIES_ON_REFRESH` | `false` | Rotate the proxy on every token refresh (upstream parity) |
+| `USER_AGENT` | `okhttp/5.3.2` | Upstream User-Agent override |
+| `DEV_MODE` | `false` | Verbose upstream logging (status + body preview) |
 | `RATE_LIMIT_RPS` | `20` | Per-IP requests/sec (editable in admin panel) |
 | `RATE_LIMIT_BURST` | `40` | Per-IP burst allowance (editable in admin panel) |
 | `TIDAL_RPS` | `20` | Global upstream Tidal requests/sec with jitter (editable in admin panel) |
@@ -1777,3 +1783,29 @@ https://im-fa.manifest.tidal.com/1/manifests/CAESCDQ4MjA0MTA2GAEiFjYwNWlPMWk4ME5
 #EXT-X-STREAM-INF:BANDWIDTH=5447000,AVERAGE-BANDWIDTH=5447000,CODECS="mp4a.40.2,avc1.640028",RESOLUTION=1920x1080
 https://im-fa.manifest.tidal.com/1/manifests/CAESCDQ4MjA0MTA2GAEiFldFanZRQnRnTGFfWGNzRzU0Z2trdkEoATACUAE.m3u8?token=1772574889~NGYzNmJjNjU4ZjQwNjZkODVhNThhZWI3Y2MwNTU3NzEzMWUzMWI0MQ==
 ```
+
+### `GET /playback/requests/{request_id}` / `DELETE /playback/requests/{request_id}`
+
+Upstream parity with `binimum/hifi-api`: playback traffic (`/track`, `/trackManifests`, `/dash`, `/widevine`, `/video`) is serialized — each playback account serves one request at a time. When all slots are busy the request becomes a pollable job instead of failing:
+
+```http
+HTTP/1.1 202 Accepted
+Location: /playback/requests/9d30c907688a41ab864df002ffcd6248
+Retry-After: 1
+X-Playback-Queue-Position: 2
+X-Playback-Request-Id: 9d30c907688a41ab864df002ffcd6248
+```
+
+```json
+{
+  "status": "pending",
+  "requestId": "9d30c907688a41ab864df002ffcd6248",
+  "queuePosition": 2,
+  "statusUrl": "/playback/requests/9d30c907688a41ab864df002ffcd6248",
+  "cancelUrl": "/playback/requests/9d30c907688a41ab864df002ffcd6248",
+  "playbackAccounts": 7,
+  "activePlaybackRequests": 7
+}
+```
+
+Poll `GET` until it returns the result (or a failure with its upstream status). `DELETE` cancels a pending/processing job (`410` once cancelled). Jobs expire 300s after finishing. Inside its slot each job still uses the normal multi-account failover.

@@ -8,9 +8,8 @@ use axum::http::Request;
 use axum::middleware::Next;
 use axum::response::Response;
 use serde_json::{json, Value};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
-use crate::ip_limiter;
 use crate::AppState;
 
 const MAX_ENTRIES: usize = 5000;
@@ -183,15 +182,11 @@ pub async fn log_requests(
     let raw_path = req.uri().path().to_string();
     let path = normalize_path(&raw_path);
     let detail = extract_detail(&raw_path, req.uri().query());
-    let junk = ip_limiter::is_junk_search(&raw_path, req.uri().query());
-    let ip = ip_limiter::client_ip(&state, &req, addr);
+    let ip = client_ip(&state, &req, addr);
     let start = Instant::now();
 
     let resp = next.run(req).await;
     let status = resp.status().as_u16();
-
-    // Feed the completed outcome back into IP reputation.
-    state.anti_ban.note_outcome(ip, status, junk);
 
     state.request_log.record(LogEntry {
         ts: chrono::Utc::now().timestamp(),
@@ -204,4 +199,30 @@ pub async fn log_requests(
     });
 
     resp
+}
+
+pub(crate) fn client_ip(state: &AppState, req: &Request<Body>, fallback: SocketAddr) -> IpAddr {
+    if state.config.trust_proxy {
+        if let Some(xff) = req
+            .headers()
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+        {
+            if let Some(first) = xff.split(',').next().map(|s| s.trim()) {
+                if let Ok(ip) = first.parse::<IpAddr>() {
+                    return ip.to_canonical();
+                }
+            }
+        }
+        if let Some(real) = req
+            .headers()
+            .get("x-real-ip")
+            .and_then(|v| v.to_str().ok())
+        {
+            if let Ok(ip) = real.trim().parse::<IpAddr>() {
+                return ip.to_canonical();
+            }
+        }
+    }
+    fallback.ip().to_canonical()
 }

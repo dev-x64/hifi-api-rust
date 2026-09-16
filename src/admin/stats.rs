@@ -21,18 +21,20 @@ pub async fn get_stats(
         .iter()
         .filter(|a| a.is_active.load(std::sync::atomic::Ordering::Relaxed))
         .count();
-    let rate_limited_count = accounts
-        .iter()
-        .filter(|a| {
-            a.rate_limited_until.load(std::sync::atomic::Ordering::Relaxed)
-                > chrono::Utc::now().timestamp()
+    let playback_count = state.account_manager.playback_count().await;
+    let pool = state.account_manager.playback_slots().await;
+    let playback = state.playback.stats(pool).await;
+    let catalog = if !state.config.catalog_token.is_empty() {
+        json!({"mode": "static_token"})
+    } else if let Some(acc) = state.account_manager.find_catalog_account().await {
+        json!({
+            "mode": "account",
+            "label": acc.label,
+            "active": acc.is_active.load(std::sync::atomic::Ordering::Relaxed),
         })
-        .count();
-
-    let day_used: u64 = accounts
-        .iter()
-        .map(|a| a.day_requests.load(std::sync::atomic::Ordering::Relaxed))
-        .sum();
+    } else {
+        json!({"mode": "pool"})
+    };
 
     let redis = match &state.upstash {
         None => json!({"configured": false, "status": "disabled"}),
@@ -53,10 +55,10 @@ pub async fn get_stats(
         } else { "0.00%".into() },
         "total_accounts": accounts.len(),
         "active_accounts": active_count,
-        "rate_limited_accounts": rate_limited_count,
-        "healthy_accounts": active_count.saturating_sub(rate_limited_count),
-        "conservation": state.anti_ban.in_conservation(),
-        "day_requests": day_used,
+        "healthy_accounts": active_count,
+        "playback_accounts": playback_count,
+        "playback": playback,
+        "catalog": catalog,
         "redis": redis,
     })))
 }

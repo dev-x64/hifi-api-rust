@@ -80,7 +80,7 @@ impl Notifier {
     pub async fn alert_403(&self, label: &str, healthy: usize, total: usize) {
         let payload = Self::embed(
             "🚨 Account 403 — suspension risk",
-            "Tidal forbade this account. It has been parked; check whether it needs fresh credentials.",
+            "Tidal forbade this account. Check whether it needs fresh credentials.",
             0xF85149,
             vec![
                 json!({"name": "Account", "value": label, "inline": true}),
@@ -94,7 +94,7 @@ impl Notifier {
     pub async fn alert_all_down(&self, total: usize) {
         let payload = Self::embed(
             "🛑 All accounts down",
-            "No active, non-rate-limited account available. Playback is returning 503.",
+            "No active account available. Playback is returning 503.",
             0xF85149,
             vec![json!({"name": "Total accounts", "value": total.to_string(), "inline": true})],
         );
@@ -134,13 +134,11 @@ impl Notifier {
     pub fn status_report(
         healthy: usize,
         total: usize,
-        rate_limited: usize,
         total_requests: u64,
         total_errors: u64,
         cache_hits: u64,
         cache_misses: u64,
         proxy_summary: String,
-        limits_summary: String,
     ) -> Value {
         let ok = healthy > 0;
         Self::embed(
@@ -152,11 +150,10 @@ impl Notifier {
             "On-demand snapshot from the admin panel.",
             if ok { 0x1F6FEB } else { 0xF85149 },
             vec![
-                json!({"name": "Accounts", "value": format!("{}/{} healthy · {} cooling down", healthy, total, rate_limited), "inline": true}),
+                json!({"name": "Accounts", "value": format!("{}/{} healthy", healthy, total), "inline": true}),
                 json!({"name": "Traffic", "value": format!("{} requests · {} errors", total_requests, total_errors), "inline": true}),
                 json!({"name": "Cache", "value": format!("{} hits · {} misses", cache_hits, cache_misses), "inline": true}),
                 json!({"name": "Proxies", "value": proxy_summary, "inline": true}),
-                json!({"name": "Limits", "value": limits_summary, "inline": false}),
             ],
         )
     }
@@ -178,41 +175,6 @@ impl Notifier {
             0x1F6FEB,
             fields,
         )
-    }
-
-    /// Fired on conservation-mode transitions.
-    pub async fn alert_conservation(&self, entered: bool, healthy: usize, total: usize) {
-        let payload = if entered {
-            Self::embed(
-                "🐢 Conservation mode ON",
-                "Healthy pool at/below reserve. Shedding load with trickle + fail-fast to protect the remaining accounts.",
-                0xD29922,
-                vec![json!({"name": "Healthy", "value": format!("{}/{}", healthy, total), "inline": true})],
-            )
-        } else {
-            Self::embed(
-                "✅ Conservation mode OFF",
-                "Pool recovered above reserve. Normal limits restored.",
-                0x3FB950,
-                vec![json!({"name": "Healthy", "value": format!("{}/{}", healthy, total), "inline": true})],
-            )
-        };
-        let kind = if entered { "conserve-enter" } else { "conserve-exit" };
-        self.send_throttled(kind, payload).await;
-    }
-
-    /// Fired once per account per day when it crosses the budget alert threshold.
-    pub async fn alert_budget(&self, code: &str, used: u64, budget: u64) {
-        let payload = Self::embed(
-            "📊 Daily budget warning",
-            "An account crossed its daily budget alert threshold.",
-            0xD29922,
-            vec![
-                json!({"name": "Account", "value": code, "inline": true}),
-                json!({"name": "Used", "value": format!("{}/{}", used, budget), "inline": true}),
-            ],
-        );
-        self.send_throttled(&format!("budget-{}", code), payload).await;
     }
 
     /// Manual test from the admin panel (bypasses throttle).
