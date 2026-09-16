@@ -35,6 +35,8 @@ pub async fn get_video(
 }
 
 /// Core /video/ fetch (shared by immediate and queued execution).
+/// Fails over across playback accounts like the other playback routes so
+/// one bad/banned account neither pins the load nor fails the request.
 pub(crate) async fn fetch_video_playback(
     state: &AppState,
     id: i64,
@@ -42,29 +44,109 @@ pub(crate) async fn fetch_video_playback(
     mode: &str,
     presentation: &str,
 ) -> Result<Value, AppError> {
-    let account = state.account_manager.select_account().await?;
-    let hc = state.tidal_client.working_client().await?;
-    let token = state
-        .token_manager
-        .get_token(&account, &hc)
-        .await?;
-
     let url = format!("https://api.tidal.com/v1/videos/{}/playbackinfo", id);
-    let data = state
-        .tidal_client
-        .make_authed_request(
-            &url,
-            Some(vec![
+    let pool = state.account_manager.playback_count().await.max(1);
+    let mut failed_ids: Vec<String> = Vec::new();
+    let mut last_err: Option<AppError> = None;
+
+    for _ in 0..pool {
+        let account = match state
+            .account_manager
+            .select_account_excluding(&failed_ids)
+            .await
+        {
+            Ok(a) => a,
+            Err(e) => return Err(last_err.unwrap_or(e)),
+        };
+        let hc = state.tidal_client.working_client().await?;
+        let token = match state.token_manager.get_token(&account, &hc).await {
+            Ok(t) => t,
+            Err(e) => {
+                state
+                    .account_manager
+                    .mark_account_error(&account.id, &format!("token failure: {:?}", e))
+                    .await;
+                failed_ids.push(account.id.clone());
+                last_err = Some(e);
+                continue;
+            }
+        };
+        let params = || {
+            vec![
                 ("videoquality", quality),
                 ("playbackmode", mode),
                 ("assetpresentation", presentation),
-            ]),
-            &token,
-        )
-        .await?;
+            ]
+        };
+        match state
+            .tidal_client
+            .make_authed_request(&url, Some(params()), &token)
+            .await
+        {
+            Ok(data) => {
+                return Ok(json!({
+                    "version": state.config.api_version,
+                    "video": data
+                }));
+            }
+            Err(AppError::UpstreamError(status, _)) if status.as_u16() == 401 => {
+                // Refresh once and retry the same account before failing over.
+                match state.token_manager.refresh_token(&account, &hc).await {
+                    Ok(fresh) => {
+                        match state
+                            .tidal_client
+                            .make_authed_request(&url, Some(params()), &fresh)
+                            .await
+                        {
+                            Ok(data) => {
+                                return Ok(json!({
+                                    "version": state.config.api_version,
+                                    "video": data
+                                }));
+                            }
+                            Err(e2) => {
+                                state
+                                    .account_manager
+                                    .mark_account_error(
+                                        &account.id,
+                                        &format!("video retry failed: {:?}", e2),
+                                    )
+                                    .await;
+                                failed_ids.push(account.id.clone());
+                                last_err = Some(e2);
+                                continue;
+                            }
+                        }
+                    }
+                    Err(e2) => {
+                        state
+                            .account_manager
+                            .mark_account_error(&account.id, &format!("token refresh failure: {:?}", e2))
+                            .await;
+                        failed_ids.push(account.id.clone());
+                        last_err = Some(e2);
+                        continue;
+                    }
+                }
+            }
+            Err(e @ AppError::UpstreamError(status, _))
+                if status.as_u16() == 429
+                    || status.as_u16() == 403
+                    || status.as_u16() >= 500 =>
+            {
+                state
+                    .account_manager
+                    .mark_account_error(&account.id, &format!("Tidal HTTP {}", status.as_u16()))
+                    .await;
+                failed_ids.push(account.id.clone());
+                last_err = Some(e);
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
 
-    Ok(json!({
-        "version": state.config.api_version,
-        "video": data
-    }))
+    Err(last_err.unwrap_or(AppError::ServiceUnavailable(
+        "All accounts failed".into(),
+    )))
 }

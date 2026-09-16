@@ -94,7 +94,12 @@ impl TidalClient {
         for _account_try in 0..max_account_attempts {
             let account = if _account_try == 0 && failed_ids.is_empty() {
                 match preferred_account.clone() {
-                    Some(a) => a,
+                    Some(a) => {
+                        // Account the preferred pick like any selection so
+                        // the balancer sees its true load.
+                        AccountManager::note_selection(&a);
+                        a
+                    }
                     None => match self.account_manager.select_account_excluding(&failed_ids).await {
                         Ok(a) => a,
                         Err(e) => {
@@ -422,13 +427,11 @@ impl TidalClient {
                 }
             }
         }
-        if let Some(acc) = self.account_manager.find_catalog_account().await {
-            if acc.is_active.load(std::sync::atomic::Ordering::Relaxed) {
-                match self.catalog_account_get(&acc, url, params.clone()).await {
-                    Ok(data) => return Ok(data),
-                    Err(e) => {
-                        tracing::debug!("Catalog account failed, falling back to pool: {}", e);
-                    }
+        if let Some(acc) = self.account_manager.next_active_catalog().await {
+            match self.catalog_account_get(&acc, url, params.clone()).await {
+                Ok(data) => return Ok(data),
+                Err(e) => {
+                    tracing::debug!("Catalog account failed, falling back to pool: {}", e);
                 }
             }
         }

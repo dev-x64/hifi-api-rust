@@ -5,7 +5,7 @@ use chrono::Utc;
 use serde::Deserialize;
 use sqlx::FromRow;
 use sqlx::SqlitePool;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
 use crate::error::AppError;
@@ -142,6 +142,16 @@ pub struct AccountManager {
     accounts: RwLock<Vec<Arc<AccountState>>>,
     weights: SwitchingWeights,
     db: Option<SqlitePool>,
+    /// Serializes select+account so concurrent requests can't snapshot the
+    /// same counters and all pile onto one account. The critical section is
+    /// in-memory only (no DB/Redis I/O under the lock).
+    select_lock: Mutex<()>,
+    /// Monotonic pick counter. Breaks exact score ties in round-robin order
+    /// so identical accounts (e.g. fresh ones) spread evenly instead of all
+    /// landing on index 0.
+    rr_seq: AtomicU64,
+    /// Round-robin cursor across catalog accounts (metadata load spreading).
+    catalog_rr: AtomicU64,
     /// Shared cross-instance state (None = single-host mode, skip sync).
     upstash: OnceLock<Arc<UpstashStore>>,
 }
@@ -152,6 +162,9 @@ impl AccountManager {
             accounts: RwLock::new(Vec::new()),
             weights,
             db,
+            select_lock: Mutex::new(()),
+            rr_seq: AtomicU64::new(0),
+            catalog_rr: AtomicU64::new(0),
             upstash: OnceLock::new(),
         }
     }
@@ -317,7 +330,49 @@ impl AccountManager {
         accounts.iter().find(|a| a.id == id).cloned()
     }
 
+    /// Record one use of an account (selection accounting). Shared by the
+    /// pool selector, the catalog selector, and the preferred-account path
+    /// so every served request is visible to the balancer.
+    pub fn note_selection(account: &AccountState) {
+        let now = Utc::now().timestamp();
+        account.last_used.store(now, Ordering::Relaxed);
+        account.request_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Pure weighted score for one candidate. Unit tested.
+    ///
+    /// - `usage` / `max_usage`: request counts; the balance term is
+    ///   normalized against the current max so it stays meaningful at any
+    ///   absolute volume (a plain `1/usage` decays to zero and stops
+    ///   balancing after a few hundred requests).
+    /// - `recency_secs`: seconds since last use (capped at 1h upstream).
+    /// - `errors` / `total`: raw counters; zero requests means zero error
+    ///   rate (never synthesize a phantom error for fresh accounts).
+    pub(crate) fn score_candidate(
+        weights: &SwitchingWeights,
+        usage: u64,
+        max_usage: u64,
+        recency_secs: f64,
+        errors: u64,
+        total: u64,
+    ) -> f64 {
+        let error_rate = if total > 0 {
+            (errors as f64 / total as f64).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let usage_score =
+            weights.balance * (1.0 - usage as f64 / (max_usage as f64 + 1.0));
+        let recency_score = weights.recency * (recency_secs / 3600.0).clamp(0.0, 1.0);
+        let error_score = weights.error * (1.0 - error_rate);
+        usage_score + recency_score + error_score
+    }
+
     pub async fn select_account_excluding(&self, exclude_ids: &[String]) -> Result<Arc<AccountState>, AppError> {
+        // Serialize select+account: without this, N concurrent requests read
+        // the same counters and all pick the same (currently-best) account,
+        // leaving the rest idle under load.
+        let _guard = self.select_lock.lock().await;
         let accounts = self.accounts.read().await;
         if accounts.is_empty() {
             return Err(AppError::Internal(
@@ -326,8 +381,7 @@ impl AccountManager {
         }
 
         let now = Utc::now().timestamp();
-        let mut scored: Vec<(f64, usize)> = Vec::new();
-
+        let mut eligible: Vec<usize> = Vec::new();
         for (i, account) in accounts.iter().enumerate() {
             if exclude_ids.contains(&account.id) {
                 continue;
@@ -339,37 +393,57 @@ impl AccountManager {
             if account.is_catalog.load(Ordering::Relaxed) {
                 continue;
             }
-
-            let usage = account.request_count.load(Ordering::Relaxed).max(1) as f64;
-            let last_used = account.last_used.load(Ordering::Relaxed);
-            let recency = if last_used > 0 {
-                (now - last_used) as f64
-            } else {
-                3600.0
-            };
-            let errors = account.error_count.load(Ordering::Relaxed).max(1) as f64;
-            let total = account.request_count.load(Ordering::Relaxed).max(1) as f64;
-            let error_rate = errors / total;
-
-            let usage_score = self.weights.balance / usage;
-            let recency_score = self.weights.recency * (recency / 3600.0).min(1.0).max(0.0);
-            let error_score = self.weights.error * (1.0 - error_rate);
-
-            let score = usage_score + recency_score + error_score;
-
-            scored.push((score, i));
+            eligible.push(i);
         }
 
-        if scored.is_empty() {
+        if eligible.is_empty() {
             return Err(AppError::ServiceUnavailable(
                 "All accounts are inactive or have expired tokens".into(),
             ));
         }
 
+        let max_usage = eligible
+            .iter()
+            .map(|&i| accounts[i].request_count.load(Ordering::Relaxed))
+            .max()
+            .unwrap_or(0);
+
+        let mut scored: Vec<(f64, usize)> = eligible
+            .into_iter()
+            .map(|i| {
+                let account = &accounts[i];
+                let usage = account.request_count.load(Ordering::Relaxed);
+                let last_used = account.last_used.load(Ordering::Relaxed);
+                let recency = if last_used > 0 {
+                    (now - last_used).max(0) as f64
+                } else {
+                    3600.0
+                };
+                let errors = account.error_count.load(Ordering::Relaxed);
+                let total = account.request_count.load(Ordering::Relaxed);
+                let score = Self::score_candidate(
+                    &self.weights,
+                    usage,
+                    max_usage,
+                    recency,
+                    errors,
+                    total,
+                );
+                (score, i)
+            })
+            .collect();
+
+        // Stable sort keeps the pre-sort order among exact ties; rotate that
+        // order round-robin so tied accounts spread evenly instead of always
+        // starting at creation index 0.
+        let seq = self.rr_seq.fetch_add(1, Ordering::Relaxed);
+        if !scored.is_empty() {
+            let rot = (seq as usize) % scored.len();
+            scored.rotate_left(rot);
+        }
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         let best = &accounts[scored[0].1];
-        best.last_used.store(now, Ordering::Relaxed);
-        best.request_count.fetch_add(1, Ordering::Relaxed);
+        Self::note_selection(best);
         Ok(best.clone())
     }
 
@@ -378,25 +452,30 @@ impl AccountManager {
     }
 
     /// Playback pool size (upstream: PlaybackCredentialPool.size).
-    /// Catalog-only credentials are excluded. Minimum 1 so callers
-    /// without playback accounts still run once and surface the real error.
+    /// Only accounts that can actually be selected count: active,
+    /// non-catalog. Minimum 1 so callers without playback accounts still
+    /// run once and surface the real error.
     pub async fn playback_slots(&self) -> usize {
         self.accounts
             .read()
             .await
             .iter()
-            .filter(|a| !a.is_catalog.load(Ordering::Relaxed))
+            .filter(|a| {
+                !a.is_catalog.load(Ordering::Relaxed) && a.is_active.load(Ordering::Relaxed)
+            })
             .count()
             .max(1)
     }
 
-    /// Number of playback (non-catalog) accounts.
+    /// Number of selectable playback (active, non-catalog) accounts.
     pub async fn playback_count(&self) -> usize {
         self.accounts
             .read()
             .await
             .iter()
-            .filter(|a| !a.is_catalog.load(Ordering::Relaxed))
+            .filter(|a| {
+                !a.is_catalog.load(Ordering::Relaxed) && a.is_active.load(Ordering::Relaxed)
+            })
             .count()
     }
 
@@ -418,13 +497,33 @@ impl AccountManager {
             })
     }
 
-    /// Metadata account selection (upstream catalog=True): the catalog
-    /// credential when one is active, otherwise the normal playback pool.
+    /// Next active catalog account in round-robin order (`None` when no
+    /// active catalog credential exists). Records the selection so catalog
+    /// load shows up in stats like any other use.
+    pub async fn next_active_catalog(&self) -> Option<Arc<AccountState>> {
+        let accounts = self.accounts.read().await;
+        let catalog: Vec<Arc<AccountState>> = accounts
+            .iter()
+            .filter(|a| {
+                a.is_catalog.load(Ordering::Relaxed) && a.is_active.load(Ordering::Relaxed)
+            })
+            .cloned()
+            .collect();
+        if catalog.is_empty() {
+            return None;
+        }
+        let seq = self.catalog_rr.fetch_add(1, Ordering::Relaxed);
+        let acc = catalog[(seq as usize) % catalog.len()].clone();
+        Self::note_selection(&acc);
+        Some(acc)
+    }
+
+    /// Metadata account selection (upstream catalog=True): round-robin
+    /// across active catalog credentials so metadata load spreads instead
+    /// of pinning to the first catalog account, otherwise the normal pool.
     pub async fn select_catalog_account(&self) -> Result<Arc<AccountState>, AppError> {
-        if let Some(acc) = self.find_catalog_account().await {
-            if acc.is_active.load(Ordering::Relaxed) {
-                return Ok(acc);
-            }
+        if let Some(acc) = self.next_active_catalog().await {
+            return Ok(acc);
         }
         self.select_account_excluding(&[]).await
     }
@@ -942,5 +1041,158 @@ mod tests {
         assert!(am.find_catalog_account().await.is_none());
         let picked = am.select_catalog_account().await.unwrap();
         assert_eq!(picked.id, playback.id);
+    }
+
+    #[test]
+    fn score_candidate_math() {
+        use super::{AccountManager, SwitchingWeights};
+        let w = SwitchingWeights::default();
+        // Fresh accounts carry no error penalty (zero requests ⇒ zero rate).
+        let fresh = AccountManager::score_candidate(&w, 0, 0, 3600.0, 0, 0);
+        let faulty = AccountManager::score_candidate(&w, 10, 10, 3600.0, 10, 10);
+        let clean = AccountManager::score_candidate(&w, 10, 10, 3600.0, 0, 10);
+        assert!(clean > faulty, "errors must lower the score");
+        assert!(
+            fresh >= clean,
+            "a fresh account must not look faulty: fresh={} clean={}",
+            fresh,
+            clean
+        );
+        // The balance term stays meaningful at volume: the behind account
+        // wins when recency/errors tie, even at 6-digit counts.
+        let ahead = AccountManager::score_candidate(&w, 100_001, 100_001, 0.0, 0, 100_001);
+        let behind = AccountManager::score_candidate(&w, 100_000, 100_001, 0.0, 0, 100_000);
+        assert!(behind > ahead, "usage lead must not become invisible at scale");
+    }
+
+    #[tokio::test]
+    async fn requests_spread_evenly_sequential() {
+        use super::{AccountManager, SwitchingWeights};
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        let am = Arc::new(AccountManager::new(None, SwitchingWeights::default()));
+        for i in 0..3 {
+            am.add_account(
+                format!("a{}", i),
+                "c".into(),
+                "s".into(),
+                format!("rt-{}", i),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let mut hits: HashMap<String, usize> = HashMap::new();
+        for _ in 0..90 {
+            let picked = am.select_account_excluding(&[]).await.unwrap();
+            *hits.entry(picked.id.clone()).or_default() += 1;
+        }
+        assert_eq!(hits.len(), 3, "every account must serve traffic");
+        let (mut lo, mut hi) = (usize::MAX, 0usize);
+        for &n in hits.values() {
+            lo = lo.min(n);
+            hi = hi.max(n);
+        }
+        assert!(
+            hi - lo <= 1,
+            "sequential picks must spread evenly, got {:?}",
+            hits
+        );
+    }
+
+    #[tokio::test]
+    async fn requests_spread_evenly_concurrent() {
+        use super::{AccountManager, SwitchingWeights};
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use std::sync::Mutex as StdMutex;
+        let am = Arc::new(AccountManager::new(None, SwitchingWeights::default()));
+        for i in 0..4 {
+            am.add_account(
+                format!("a{}", i),
+                "c".into(),
+                "s".into(),
+                format!("rt-c{}", i),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let hits = Arc::new(StdMutex::new(HashMap::<String, usize>::new()));
+        let mut tasks = Vec::new();
+        for _ in 0..40 {
+            let amc = am.clone();
+            let hitsc = hits.clone();
+            tasks.push(tokio::spawn(async move {
+                let picked = amc.select_account_excluding(&[]).await.unwrap();
+                *hitsc.lock().unwrap().entry(picked.id.clone()).or_default() += 1;
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+        let hits = hits.lock().unwrap();
+        assert_eq!(hits.len(), 4, "concurrent load must reach every account: {:?}", hits);
+        for (id, n) in hits.iter() {
+            assert!(
+                *n >= 5,
+                "account {} starved under concurrent load: {:?}",
+                id,
+                hits
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pool_size_ignores_inactive_and_catalog() {
+        use super::{AccountManager, SwitchingWeights};
+        use std::sync::Arc;
+        let am = Arc::new(AccountManager::new(None, SwitchingWeights::default()));
+        let a = am
+            .add_account("a".into(), "c".into(), "s".into(), "rt-a".into(), None)
+            .await
+            .unwrap();
+        let b = am
+            .add_account("b".into(), "c".into(), "s".into(), "rt-b".into(), None)
+            .await
+            .unwrap();
+        let c = am
+            .add_account("c".into(), "c".into(), "s".into(), "rt-c".into(), None)
+            .await
+            .unwrap();
+        am.set_account_catalog(&c.id, true).await.unwrap();
+        assert_eq!(am.playback_count().await, 2);
+        assert_eq!(am.playback_slots().await, 2);
+        am.set_account_active(&b.id, false).await.unwrap();
+        assert_eq!(am.playback_count().await, 1);
+        assert_eq!(am.playback_slots().await, 1);
+        // Only the remaining active playback account is selectable.
+        for _ in 0..3 {
+            let picked = am.select_account_excluding(&[]).await.unwrap();
+            assert_eq!(picked.id, a.id);
+        }
+    }
+
+    #[tokio::test]
+    async fn catalog_picks_round_robin() {
+        use super::{AccountManager, SwitchingWeights};
+        use std::sync::Arc;
+        let am = Arc::new(AccountManager::new(None, SwitchingWeights::default()));
+        let c1 = am
+            .add_account("c1".into(), "c".into(), "s".into(), "rt-c1".into(), None)
+            .await
+            .unwrap();
+        let c2 = am
+            .add_account("c2".into(), "c".into(), "s".into(), "rt-c2".into(), None)
+            .await
+            .unwrap();
+        am.set_account_catalog(&c1.id, true).await.unwrap();
+        am.set_account_catalog(&c2.id, true).await.unwrap();
+        let mut order = Vec::new();
+        for _ in 0..4 {
+            order.push(am.select_catalog_account().await.unwrap().id.clone());
+        }
+        assert_eq!(order, vec![c1.id.clone(), c2.id.clone(), c1.id.clone(), c2.id.clone()]);
+        assert!(am.next_active_catalog().await.is_some());
     }
 }
