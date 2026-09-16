@@ -12,6 +12,7 @@ use tokio::sync::Mutex;
 
 use crate::account_manager::{AccountManager, AccountState};
 use crate::error::AppError;
+use crate::proxy_manager::ProxyManager;
 use crate::upstash::UpstashStore;
 
 pub struct TokenManager {
@@ -20,6 +21,7 @@ pub struct TokenManager {
     token_cache: Cache<String, (String, i64)>,
     refresh_lock: Mutex<String>,
     account_manager: OnceLock<Arc<AccountManager>>,
+    proxy_manager: OnceLock<Arc<ProxyManager>>,
     /// Shared cross-instance state (None = single-host mode, skip sync).
     upstash: OnceLock<Arc<UpstashStore>>,
 }
@@ -34,12 +36,19 @@ impl TokenManager {
                 .build(),
             refresh_lock: Mutex::new(String::new()),
             account_manager: OnceLock::new(),
+            proxy_manager: OnceLock::new(),
             upstash: OnceLock::new(),
         }
     }
 
     pub fn set_account_manager(&self, am: Arc<AccountManager>) {
         let _ = self.account_manager.set(am);
+    }
+
+    /// Attach the proxy manager so refreshes can rotate first when
+    /// ROTATE_PROXIES_ON_REFRESH=true (upstream parity).
+    pub fn set_proxy_manager(&self, pm: Arc<ProxyManager>) {
+        let _ = self.proxy_manager.set(pm);
     }
 
     /// Attach shared state once at startup (before serving).
@@ -121,6 +130,28 @@ impl TokenManager {
         if let Some(token) = self.shared_token(account).await {
             return Ok(token);
         }
+
+        // Upstream parity: rotate the proxy before refreshing when enabled.
+        // Re-resolve afterwards so this refresh uses the new egress.
+        let rotated_client;
+        let http_client = if self
+            .proxy_manager
+            .get()
+            .map(|pm| pm.should_rotate_on_refresh())
+            .unwrap_or(false)
+        {
+            let pm = self.proxy_manager.get().unwrap().clone();
+            pm.rotate_now();
+            match pm.working_client().await {
+                Ok(c) => {
+                    rotated_client = c;
+                    &rotated_client
+                }
+                Err(_) => http_client,
+            }
+        } else {
+            http_client
+        };
 
         let res = http_client
             .post("https://auth.tidal.com/v1/oauth2/token")

@@ -30,13 +30,6 @@ pub async fn get_similar_artists(
         params.id
     );
 
-    let account = state.account_manager.select_account().await?;
-    let hc = state.tidal_client.working_client().await?;
-    let token = state
-        .token_manager
-        .get_token(&account, &hc)
-        .await?;
-
     let query_params = vec![
         ("page[cursor]", params.cursor.as_deref().unwrap_or("")),
         ("countryCode", &state.config.country_code),
@@ -45,7 +38,7 @@ pub async fn get_similar_artists(
 
     let payload = state
         .tidal_client
-        .make_authed_request(&url, Some(query_params), &token)
+        .make_catalog_authed_request(&url, Some(query_params))
         .await?;
 
     let included = payload.get("included").and_then(|v| v.as_array()).cloned().unwrap_or_default();

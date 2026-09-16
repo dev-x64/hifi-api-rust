@@ -24,33 +24,35 @@ pub async fn get_playlist(
     State(state): State<AppState>,
     Query(params): Query<PlaylistParams>,
 ) -> Result<Json<Value>, AppError> {
-    let account = state.account_manager.select_account().await?;
-    let hc = state.tidal_client.working_client().await?;
-    let token = state
-        .token_manager
-        .get_token(&account, &hc)
-        .await?;
-
-    let cc = &state.config.country_code;
+    let cc = state.config.country_code.clone();
     let offset_str = params.offset.to_string();
 
     let playlist_url = format!("https://api.tidal.com/v1/playlists/{}", params.id);
     let items_url = format!("https://api.tidal.com/v1/playlists/{}/items", params.id);
 
-    let playlist_fut = state.tidal_client.make_authed_request(
-        &playlist_url,
-        Some(vec![("countryCode", cc)]),
-        &token,
-    );
-    let items_fut = state.tidal_client.make_authed_request(
-        &items_url,
-        Some(vec![
-            ("countryCode", cc),
-            ("limit", "100"),
-            ("offset", &offset_str),
-        ]),
-        &token,
-    );
+    let tc1 = state.tidal_client.clone();
+    let tc2 = state.tidal_client.clone();
+    let cc1 = cc.clone();
+    let cc2 = cc.clone();
+    let offset2 = offset_str.clone();
+    let playlist_fut = async move {
+        tc1.make_catalog_authed_request(
+            &playlist_url,
+            Some(vec![("countryCode", &cc1)]),
+        )
+        .await
+    };
+    let items_fut = async move {
+        tc2.make_catalog_authed_request(
+            &items_url,
+            Some(vec![
+                ("countryCode", &cc2),
+                ("limit", "100"),
+                ("offset", &offset2),
+            ]),
+        )
+        .await
+    };
 
     let (playlist_result, items_result) = tokio::join!(playlist_fut, items_fut);
 

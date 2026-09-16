@@ -2,35 +2,31 @@
 //!
 //! When `UPSTASH_REDIS_REST_URL` + `UPSTASH_REDIS_REST_TOKEN` are set, every
 //! instance coordinates through one Redis database instead of drifting apart:
-//! rate-limit settings, per-account daily budgets, 429/403 cooldown parks,
-//! Tidal access tokens, API-key usage, and the global upstream throttle.
+//! app settings, Tidal access tokens, API-key usage, and credential backups.
 //!
 //! Design rules:
 //! - **Fail-open.** Redis is an accelerator, not a dependency: every call has
 //!   a short timeout and any error degrades to single-host behavior (today's
 //!   semantics). Nothing here may fail a request or panic.
 //! - **Local fast path stays.** Hot paths (account selection, token fast
-//!   path, governor buckets) never block on Redis; sync is write-through on
-//!   state changes plus periodic reconcile on the existing 30s/60s ticks.
+//!   path) never block on Redis; sync is write-through on
+//!   state changes plus periodic reconcile on the existing 60s ticks.
 //! - **No new crates.** Uses the existing `reqwest` client against the
 //!   Upstash REST API (`GET /CMD/args…`, `POST /pipeline`).
 //! - **Secrets stay in env.** The token lives only in memory; values are
 //!   never logged (only key names and counts, at debug level).
 //!
 //! Key layout (prefix `hifi`):
-//! - `hifi:settings:<name>` — rate-limit settings (plain strings)
-//! - `hifi:usage:<utc_day>:<account_id>` — daily Tidal-call counters (int)
-//! - `hifi:cooldown:<account_id>` — unix `rate_limited_until` (int)
+//! - `hifi:settings:<name>` — app settings (plain strings)
 //! - `hifi:token:<account_id>` — `{"t": access_token, "e": expires_at}`
 //! - `hifi:apikey:<key_id>` — consumed quota units (int)
-//! - `hifi:throttle:<epoch_sec>` — global fixed-window upstream counter
 //! - `hifi:account:<account_id>` — account record JSON (credential backup)
 //! - `hifi:accounts` — SET of known account ids (restore index)
 //! - `hifi:apikeydef:<key_id>` — API-key definition JSON (hash/flags/quota)
 //! - `hifi:apikeys` — SET of known API-key ids (restore index)
 //!
 //! Deliberately NOT synced: the metadata response cache (latency; per-host
-//! L1 is fine), IP reputation, request log, proxy pool state (per-host
+//! L1 is fine), request log, proxy pool state (per-host
 //! egress by nature). Everything else — including account credentials and
 //! API-key definitions — is backed up so wiped hosts restore themselves.
 
@@ -294,24 +290,12 @@ impl UpstashStore {
         format!("{PREFIX}:settings:{name}")
     }
 
-    pub fn k_usage(day: i64, account_id: &str) -> String {
-        format!("{PREFIX}:usage:{day}:{account_id}")
-    }
-
-    pub fn k_cooldown(account_id: &str) -> String {
-        format!("{PREFIX}:cooldown:{account_id}")
-    }
-
     pub fn k_token(account_id: &str) -> String {
         format!("{PREFIX}:token:{account_id}")
     }
 
     pub fn k_apikey(key_id: &str) -> String {
         format!("{PREFIX}:apikey:{key_id}")
-    }
-
-    pub fn k_throttle(epoch_sec: i64) -> String {
-        format!("{PREFIX}:throttle:{epoch_sec}")
     }
 
     pub fn k_account(account_id: &str) -> String {
@@ -359,12 +343,9 @@ mod tests {
 
     #[test]
     fn key_layout_stable() {
-        assert_eq!(UpstashStore::k_settings("tidal_rps"), "hifi:settings:tidal_rps");
-        assert_eq!(UpstashStore::k_usage(42, "id"), "hifi:usage:42:id");
-        assert_eq!(UpstashStore::k_cooldown("id"), "hifi:cooldown:id");
+        assert_eq!(UpstashStore::k_settings("atmos_mode"), "hifi:settings:atmos_mode");
         assert_eq!(UpstashStore::k_token("id"), "hifi:token:id");
         assert_eq!(UpstashStore::k_apikey("id"), "hifi:apikey:id");
-        assert_eq!(UpstashStore::k_throttle(99), "hifi:throttle:99");
         assert_eq!(UpstashStore::k_account("id"), "hifi:account:id");
         assert_eq!(UpstashStore::k_accounts_set(), "hifi:accounts");
         assert_eq!(UpstashStore::k_apikeydef("id"), "hifi:apikeydef:id");

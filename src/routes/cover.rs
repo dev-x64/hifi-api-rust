@@ -31,21 +31,13 @@ pub async fn get_cover(
         return Err(AppError::BadRequest("Provide id or q query param".into()));
     }
 
-    let account = state.account_manager.select_account().await?;
-    let hc = state.tidal_client.working_client().await?;
-    let token = state
-        .token_manager
-        .get_token(&account, &hc)
-        .await?;
-
     if let Some(id) = params.id {
         let url = format!("https://api.tidal.com/v1/tracks/{}/", id);
         let data = state
             .tidal_client
-            .make_authed_request(
+            .make_catalog_authed_request(
                 &url,
                 Some(vec![("countryCode", &state.config.country_code)]),
-                &token,
             )
             .await?;
 
@@ -81,14 +73,13 @@ pub async fn get_cover(
 
     let data = state
         .tidal_client
-        .make_authed_request(
+        .make_catalog_authed_request(
             "https://api.tidal.com/v1/search/tracks",
             Some(vec![
                 ("countryCode", &state.config.country_code),
                 ("query", q),
                 ("limit", "10"),
             ]),
-            &token,
         )
         .await?;
 

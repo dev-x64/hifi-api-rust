@@ -36,7 +36,7 @@ pub async fn search(
             let offset_str = params.offset.to_string();
             let result = state
                 .tidal_client
-                .make_request(
+                .make_catalog_request(
                     &url,
                     Some(vec![
                         ("isrc", &isrc),
@@ -117,7 +117,7 @@ pub async fn search(
                 .map(|(k, v)| (*k, *v))
                 .collect();
             let url_str = url.to_string();
-            let result = state.tidal_client.make_request(&url_str, Some(pairs)).await?;
+            let result = state.tidal_client.make_catalog_request(&url_str, Some(pairs)).await?;
             return Ok(Json(result));
         }
     }

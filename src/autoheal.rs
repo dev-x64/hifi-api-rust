@@ -7,7 +7,7 @@ use chrono::Utc;
 use crate::account_manager::AccountManager;
 use crate::notifier::Notifier;
 use crate::proxy_manager::ProxyManager;
-use crate::rate_limit::RateLimitSettings;
+use crate::settings::AppSettings;
 use crate::token_manager::TokenManager;
 
 const TICK_SECS: u64 = 300;
@@ -16,19 +16,18 @@ const MAX_BACKOFF_SECS: i64 = 3600;
 
 /// Background loop: retry refresh on system-disabled accounts only.
 /// Never touches owner-toggled OFF accounts (auto_disabled == false),
-/// never touches accounts still in Tidal cooldown, and backs off
-/// exponentially (5m → 1h cap) so dead accounts cost ~1 Tidal call/hour.
+/// and backs off exponentially (5m → 1h cap) so dead accounts cost ~1 Tidal call/hour.
 pub async fn start_autoheal_loop(
     account_manager: Arc<AccountManager>,
     token_manager: Arc<TokenManager>,
     proxy_manager: Arc<ProxyManager>,
-    rate_limits: Arc<RateLimitSettings>,
+    settings: Arc<AppSettings>,
     notifier: Arc<Notifier>,
 ) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(TICK_SECS)).await;
-            if !rate_limits.auto_heal.load(Ordering::Relaxed) {
+            if !settings.auto_heal.load(Ordering::Relaxed) {
                 continue;
             }
             let client = match proxy_manager.working_client().await {
@@ -48,9 +47,6 @@ pub async fn start_autoheal_loop(
                     let _ = account_manager
                         .set_auto_disabled(&account.id, false)
                         .await;
-                    continue;
-                }
-                if account.rate_limited_until.load(Ordering::Relaxed) > now {
                     continue;
                 }
                 if account.heal_next_retry.load(Ordering::Relaxed) > now {

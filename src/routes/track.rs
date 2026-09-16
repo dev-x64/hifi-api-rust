@@ -1,7 +1,6 @@
 use axum::extract::{Path, Query, RawQuery, State};
 use axum::http::HeaderMap;
-use axum::response::Redirect;
-use axum::Json;
+use axum::response::Response;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -24,17 +23,33 @@ fn default_quality() -> String {
 pub async fn get_track(
     State(state): State<AppState>,
     Query(params): Query<TrackParams>,
-) -> Result<Json<Value>, AppError> {
-    let url = format!("https://api.tidal.com/v1/tracks/{}/playbackinfo", params.id);
+) -> Result<Response, AppError> {
+    let op = crate::playback::PlaybackOp::Track {
+        id: params.id,
+        quality: params.quality,
+        immersive: params.immersiveaudio,
+    };
+    state.playback.dispatch(&state, op).await
+}
+
+/// Core /track/ fetch (shared by immediate and queued execution).
+pub(crate) async fn fetch_track_playback(
+    state: &AppState,
+    id: i64,
+    quality: &str,
+    immersive: bool,
+) -> Result<Value, AppError> {
+    let url = format!("https://api.tidal.com/v1/tracks/{}/playbackinfo", id);
+    let immersive_str = if immersive { "true" } else { "false" };
     let result = state
         .tidal_client
         .make_request(
             &url,
             Some(vec![
-                ("audioquality", &params.quality),
+                ("audioquality", quality),
                 ("playbackmode", "STREAM"),
                 ("assetpresentation", "FULL"),
-                ("immersiveaudio", if params.immersiveaudio { "true" } else { "false" }),
+                ("immersiveaudio", immersive_str),
             ]),
         )
         .await?;
@@ -49,13 +64,13 @@ pub async fn get_track(
             .unwrap_or("FULL_REQUIRES_SUBSCRIPTION");
         return Err(AppError::ServiceUnavailable(format!(
             "Preview only ({}): track {} requires subscription or is not available as FULL in this region",
-            reason, params.id
+            reason, id
         )));
     }
-    Ok(Json(result))
+    Ok(result)
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 #[allow(non_snake_case)]
 pub struct TrackManifestsParams {
     #[serde(default = "default_adaptive")]
@@ -101,7 +116,7 @@ pub struct DashParams {
 /// Resolve the effective format list: explicit `formats=` (comma or
 /// repeated) wins, then Atmos preference moves EAC3_JOC first (`prefer`),
 /// keeps only it (`only`), or strips it (`off`).
-fn resolve_formats(raw_query: Option<&str>, atmos: Option<&str>, default_prefer: bool) -> Vec<String> {
+pub(crate) fn resolve_formats(raw_query: Option<&str>, atmos: Option<&str>, default_prefer: bool) -> Vec<String> {
     let mut explicit: Option<Vec<String>> = None;
     if let Some(q) = raw_query {
         let mut out = Vec::new();
@@ -151,9 +166,9 @@ fn resolve_formats(raw_query: Option<&str>, atmos: Option<&str>, default_prefer:
     }
 }
 
-fn atmos_default_on(state: &AppState) -> bool {
+pub(crate) fn atmos_default_on(state: &AppState) -> bool {
     state
-        .rate_limits
+        .settings
         .atmos_mode
         .read()
         .map(|m| m.as_str() == "prefer")
@@ -198,14 +213,13 @@ fn default_usage() -> String {
     "PLAYBACK".into()
 }
 
-async fn fetch_manifest_inner(
+pub(crate) async fn fetch_manifest_inner(
     state: &AppState,
     track_id: &str,
     params: &TrackManifestsParams,
     host: &str,
     raw_query: Option<&str>,
-) -> Result<Value, AppError> {
-    let formats = resolve_formats(raw_query, params.atmos.as_deref(), atmos_default_on(state));
+) -> Result<Value, AppError> {    let formats = resolve_formats(raw_query, params.atmos.as_deref(), atmos_default_on(state));
     let url = format!("https://openapi.tidal.com/v2/trackManifests/{}", track_id);
 
     let country_code = params
@@ -285,13 +299,19 @@ pub async fn get_track_manifests(
     Query(params): Query<TrackManifestsParams>,
     headers: HeaderMap,
     RawQuery(query): RawQuery,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Response, AppError> {
     let host = headers
         .get("host")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("localhost");
-    let result = fetch_manifest_inner(&state, &track_id, &params, host, query.as_deref()).await?;
-    Ok(Json(result))
+        .unwrap_or("localhost")
+        .to_string();
+    let op = crate::playback::PlaybackOp::Manifest {
+        track_id,
+        params,
+        raw_query: query,
+        host,
+    };
+    state.playback.dispatch(&state, op).await
 }
 
 // Query-based: GET /trackManifests/?id=...&formats=...  (binimum hifi-api style)
@@ -300,7 +320,7 @@ pub async fn get_track_manifests_query(
     Query(params): Query<TrackManifestsQueryParams>,
     headers: HeaderMap,
     RawQuery(query): RawQuery,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Response, AppError> {
     let inner = TrackManifestsParams {
         adaptive: params.adaptive.clone(),
         manifestType: params.manifestType.clone(),
@@ -312,9 +332,15 @@ pub async fn get_track_manifests_query(
     let host = headers
         .get("host")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("localhost");
-    let result = fetch_manifest_inner(&state, &params.id, &inner, host, query.as_deref()).await?;
-    Ok(Json(result))
+        .unwrap_or("localhost")
+        .to_string();
+    let op = crate::playback::PlaybackOp::Manifest {
+        track_id: params.id,
+        params: inner,
+        raw_query: query,
+        host,
+    };
+    state.playback.dispatch(&state, op).await
 }
 
 #[cfg(test)]
@@ -378,20 +404,31 @@ pub async fn get_dash_stream(
     State(state): State<AppState>,
     Path(track_id): Path<String>,
     Query(params): Query<DashParams>,
-) -> Result<Redirect, AppError> {
+) -> Result<Response, AppError> {
+    let op = crate::playback::PlaybackOp::Dash {
+        track_id,
+        atmos: params.atmos,
+    };
+    state.playback.dispatch(&state, op).await
+}
+
+/// Core /dash/ fetch returning the manifest URI (shared by queued execution).
+pub(crate) async fn fetch_dash_uri(
+    state: &AppState,
+    track_id: &str,
+    atmos: Option<&str>,
+) -> Result<String, AppError> {
     let url = format!("https://openapi.tidal.com/v2/trackManifests/{}", track_id);
 
     // Same Atmos semantics as /trackManifests, over the fixed /dash chain.
-    let mode = params
-        .atmos
-        .as_deref()
+    let mode = atmos
         .map(|s| s.trim().to_lowercase())
         .filter(|s| !s.is_empty());
     let formats = match mode.as_deref() {
         Some("only") => "EAC3_JOC",
         Some("true") | Some("1") | Some("prefer") => "EAC3_JOC,FLAC_HIRES,FLAC,AACLC",
         Some("false") | Some("0") | Some("off") => "FLAC_HIRES,FLAC,AACLC",
-        _ if atmos_default_on(&state) => "EAC3_JOC,FLAC_HIRES,FLAC,AACLC",
+        _ if atmos_default_on(state) => "EAC3_JOC,FLAC_HIRES,FLAC,AACLC",
         _ => "FLAC_HIRES,FLAC,EAC3_JOC,AACLC",
     };
 
@@ -429,5 +466,5 @@ pub async fn get_dash_stream(
         .and_then(|v| v.as_str())
         .ok_or_else(|| AppError::Internal("No manifest URI in response".into()))?;
 
-    Ok(Redirect::temporary(uri))
+    Ok(uri.to_string())
 }

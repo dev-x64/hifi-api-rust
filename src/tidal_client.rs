@@ -1,4 +1,3 @@
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -7,32 +6,25 @@ use reqwest::Client;
 use serde_json::{json, Value};
 
 use crate::account_manager::{AccountManager, AccountState};
-use crate::anti_ban::AntiBan;
 use crate::config::Config;
 use crate::error::AppError;
 use crate::notifier::Notifier;
 use crate::proxy_manager::ProxyManager;
-use crate::rate_limit::RateLimitSettings;
 use crate::token_manager::TokenManager;
 
 pub struct TidalClient {
     proxy_manager: Arc<ProxyManager>,
     token_manager: Arc<TokenManager>,
     account_manager: Arc<AccountManager>,
-    anti_ban: Arc<AntiBan>,
-    rate_limits: Arc<RateLimitSettings>,
     notifier: Arc<Notifier>,
     config: Arc<Config>,
 }
 
 impl TidalClient {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         proxy_manager: Arc<ProxyManager>,
         token_manager: Arc<TokenManager>,
         account_manager: Arc<AccountManager>,
-        anti_ban: Arc<AntiBan>,
-        rate_limits: Arc<RateLimitSettings>,
         notifier: Arc<Notifier>,
         config: Arc<Config>,
     ) -> Self {
@@ -40,8 +32,6 @@ impl TidalClient {
             proxy_manager,
             token_manager,
             account_manager,
-            anti_ban,
-            rate_limits,
             notifier,
             config,
         }
@@ -94,25 +84,10 @@ impl TidalClient {
             1
         };
 
-        // Conservation shed: when the healthy pool is at/under reserve,
-        // fail fast with 429 instead of spending the last accounts.
-        if self.anti_ban.in_conservation() {
-            if let Err(wait) = self.anti_ban.check_conserve() {
-                let secs = wait.as_secs().max(1);
-                return Err(AppError::TooManyRequests(
-                    format!(
-                        "Conservation mode: pool nearly exhausted, retry in {}s.",
-                        secs
-                    ),
-                    secs,
-                ));
-            }
-        }
-
         let http = self.working_client().await?;
 
         let mut failed_ids: Vec<String> = Vec::new();
-        let account_count = self.account_manager.account_count().await;
+        let account_count = self.account_manager.playback_count().await;
         let max_account_attempts = std::cmp::max(1, account_count);
         let mut last_account_error: Option<AppError> = None;
 
@@ -138,11 +113,7 @@ impl TidalClient {
                 }
             };
 
-            self.maybe_alert_budget(&account).await;
-
             for attempt in 0..max_retries {
-                self.anti_ban.throttle_tidal().await;
-                self.anti_ban.throttle_account(&account.id).await;
 
                 let token = match self
                     .token_manager
@@ -168,9 +139,10 @@ impl TidalClient {
                 let mut req = http
                     .get(url)
                     .header("authorization", format!("Bearer {}", token))
-                    .header("User-Agent", "okhttp/5.3.2")
+                    .header("User-Agent", self.config.user_agent.as_str())
                     .header("Accept", "*/*")
                     .header("Accept-Encoding", "gzip")
+                    .header("Accept-Language", "en-US,en;q=0.9")
                     .header("X-Platform", "android")
                     .header("X-Tidal-Platform", "android");
 
@@ -215,9 +187,10 @@ impl TidalClient {
                                 let mut req2 = http
                                     .get(url)
                                     .header("authorization", format!("Bearer {}", fresh_token))
-                                    .header("User-Agent", "okhttp/5.3.2")
+                                    .header("User-Agent", self.config.user_agent.as_str())
                                     .header("Accept", "*/*")
                                     .header("Accept-Encoding", "gzip")
+                                    .header("Accept-Language", "en-US,en;q=0.9")
                                     .header("X-Platform", "android")
                                     .header("X-Tidal-Platform", "android");
                                 if let Some(ref p) = params {
@@ -252,23 +225,12 @@ impl TidalClient {
                         return Err(AppError::NotFound("Resource not found".into()));
                     }
                     429 => {
-                        self.account_manager
-                            .mark_account_rate_limited(
-                                &account.id,
-                                self.rate_limits.cooldown_429_secs.load(Ordering::Relaxed),
-                            )
-                            .await;
+                        // No cooldown parking: fail over to the next account immediately.
                         failed_ids.push(account.id.clone());
                         last_account_error = Some(AppError::Timeout);
                         break;
                     }
                     403 => {
-                        self.account_manager
-                            .mark_account_rate_limited(
-                                &account.id,
-                                self.rate_limits.cooldown_403_secs.load(Ordering::Relaxed),
-                            )
-                            .await;
                         if attempt < max_retries - 1 {
                             continue;
                         }
@@ -306,6 +268,7 @@ impl TidalClient {
                 }
 
                 let body = resp.text().await?;
+                self.dev_log("GET", url, status.as_u16(), &body);
                 let data: Value = serde_json::from_str(&body)
                     .map_err(|e| AppError::UpstreamError(
                         status,
@@ -344,40 +307,6 @@ impl TidalClient {
         )))
     }
 
-    /// Warn once per account per day when its daily budget crosses the alert pct.
-    async fn maybe_alert_budget(&self, account: &AccountState) {
-        use std::sync::atomic::Ordering;
-        let budget = self.rate_limits.daily_budget_per_account.load(Ordering::Relaxed);
-        if budget == 0 {
-            return;
-        }
-        let pct = self.rate_limits.daily_budget_alert_pct.load(Ordering::Relaxed).min(100);
-        let used = account.day_requests.load(Ordering::Relaxed);
-        if used * 100 < budget * pct {
-            return;
-        }
-        let today = crate::account_manager::utc_day(chrono::Utc::now().timestamp());
-        if account.day_alerted.load(Ordering::Relaxed) == today {
-            return;
-        }
-        account.day_alerted.store(today, Ordering::Relaxed);
-        // Stable codename (matches accounts roster reports).
-        let mut ids: Vec<String> = self
-            .account_manager
-            .list_accounts()
-            .await
-            .iter()
-            .map(|a| a.id.clone())
-            .collect();
-        ids.sort();
-        let code = ids
-            .iter()
-            .position(|id| *id == account.id)
-            .map(|i| format!("TIDAL-{}", i + 1))
-            .unwrap_or_else(|| "TIDAL-?".to_string());
-        self.notifier.alert_budget(&code, used, budget).await;
-    }
-
     async fn alert_if_all_down(&self, e: &AppError) {
         if let AppError::ServiceUnavailable(msg) = e {
             if msg.contains("All accounts") {
@@ -397,9 +326,10 @@ impl TidalClient {
         let mut req = http
             .get(url)
             .header("authorization", format!("Bearer {}", token))
-            .header("User-Agent", "okhttp/5.3.2")
+            .header("User-Agent", self.config.user_agent.as_str())
             .header("Accept", "*/*")
             .header("Accept-Encoding", "gzip")
+            .header("Accept-Language", "en-US,en;q=0.9")
             .header("X-Platform", "android")
             .header("X-Tidal-Platform", "android");
 
@@ -415,6 +345,7 @@ impl TidalClient {
         }
 
         let body = resp.text().await?;
+        self.dev_log("GET", url, status.as_u16(), &body);
         let data: Value = serde_json::from_str(&body)
             .map_err(|e| AppError::UpstreamError(
                 status,
@@ -422,5 +353,162 @@ impl TidalClient {
                     e, body.chars().take(200).collect::<String>()),
             ))?;
         Ok(data)
+    }
+
+    /// Verbose upstream logging (upstream DEV_MODE). No-op unless enabled.
+    fn dev_log(&self, method: &str, url: &str, status: u16, body: &str) {
+        if !self.config.dev_mode {
+            return;
+        }
+        tracing::info!(
+            "[DEV] {} {} → {}\n  body: {}",
+            method,
+            url,
+            status,
+            body.chars().take(1000).collect::<String>(),
+        );
+    }
+
+    /// Metadata request (upstream catalog=True): static CATALOG_TOKEN first,
+    /// then the dedicated catalog account, then the playback pool.
+    /// Returns the wrapped {version, data} envelope like make_request.
+    pub async fn make_catalog_request(
+        &self,
+        url: &str,
+        params: Option<Vec<(&str, &str)>>,
+    ) -> Result<Value, AppError> {
+        let owned: Vec<(String, String)> = params
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let borrowed: Vec<(&str, &str)> =
+            owned.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let data = self.catalog_get(url, borrowed).await?;
+        Ok(json!({"version": self.config.api_version, "data": data}))
+    }
+
+    /// Raw metadata GET (unwrapped payload) with the same catalog preference.
+    pub async fn make_catalog_authed_request(
+        &self,
+        url: &str,
+        params: Option<Vec<(&str, &str)>>,
+    ) -> Result<Value, AppError> {
+        let owned: Vec<(String, String)> = params
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let borrowed: Vec<(&str, &str)> =
+            owned.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        self.catalog_get(url, borrowed).await
+    }
+
+    /// Shared catalog resolution: static token → catalog account → pool.
+    /// Catalog failures fall through to the pool so metadata stays up.
+    async fn catalog_get(
+        &self,
+        url: &str,
+        params: Vec<(&str, &str)>,
+    ) -> Result<Value, AppError> {
+        if !self.config.catalog_token.is_empty() {
+            match self
+                .catalog_static_get(url, params.clone())
+                .await
+            {
+                Ok(data) => return Ok(data),
+                Err(e) => {
+                    tracing::debug!("Catalog static token failed, trying catalog account: {}", e);
+                }
+            }
+        }
+        if let Some(acc) = self.account_manager.find_catalog_account().await {
+            if acc.is_active.load(std::sync::atomic::Ordering::Relaxed) {
+                match self.catalog_account_get(&acc, url, params.clone()).await {
+                    Ok(data) => return Ok(data),
+                    Err(e) => {
+                        tracing::debug!("Catalog account failed, falling back to pool: {}", e);
+                    }
+                }
+            }
+        }
+        // No catalog configured (or it failed): normal pool request.
+        self.make_request(url, Some(params)).await
+            .map(|wrapped| wrapped.get("data").cloned().unwrap_or(Value::Null))
+    }
+
+    async fn catalog_static_get(
+        &self,
+        url: &str,
+        params: Vec<(&str, &str)>,
+    ) -> Result<Value, AppError> {
+        let http = self.working_client().await?;
+        let mut req = http
+            .get(url)
+            .header("authorization", format!("Bearer {}", self.config.catalog_token))
+            .header("User-Agent", self.config.user_agent.as_str())
+            .header("Accept", "*/*")
+            .header("Accept-Encoding", "gzip")
+            .header("Accept-Language", "en-US,en;q=0.9")
+            .header("X-Platform", "android")
+            .header("X-Tidal-Platform", "android");
+        if !params.is_empty() {
+            req = req.query(&params);
+        }
+        let resp = req.send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(AppError::UpstreamError(status, "Catalog token request failed".into()));
+        }
+        let body = resp.text().await?;
+        self.dev_log("GET", url, status.as_u16(), &body);
+        serde_json::from_str(&body).map_err(|e| {
+            AppError::UpstreamError(
+                status,
+                format!("Failed to parse Tidal response: {}", e),
+            )
+        })
+    }
+
+    async fn catalog_account_get(
+        &self,
+        account: &Arc<AccountState>,
+        url: &str,
+        params: Vec<(&str, &str)>,
+    ) -> Result<Value, AppError> {
+        let http = self.working_client().await?;
+        let mut token = self.token_manager.get_token(account, &http).await?;
+        for attempt in 0..2 {
+            let mut req = http
+                .get(url)
+                .header("authorization", format!("Bearer {}", token))
+                .header("User-Agent", self.config.user_agent.as_str())
+                .header("Accept", "*/*")
+                .header("Accept-Encoding", "gzip")
+                .header("Accept-Language", "en-US,en;q=0.9")
+                .header("X-Platform", "android")
+                .header("X-Tidal-Platform", "android");
+            if !params.is_empty() {
+                req = req.query(&params);
+            }
+            let resp = req.send().await?;
+            let status = resp.status();
+            if status.as_u16() == 401 && attempt == 0 {
+                token = self.token_manager.refresh_token(account, &http).await?;
+                continue;
+            }
+            if !status.is_success() {
+                return Err(AppError::UpstreamError(status, "Catalog account request failed".into()));
+            }
+            let body = resp.text().await?;
+            self.dev_log("GET", url, status.as_u16(), &body);
+            return serde_json::from_str(&body).map_err(|e| {
+                AppError::UpstreamError(
+                    status,
+                    format!("Failed to parse Tidal response: {}", e),
+                )
+            });
+        }
+        Err(AppError::Unauthorized("Catalog account unauthorized".into()))
     }
 }

@@ -30,24 +30,16 @@ pub async fn get_top_videos(
     State(state): State<AppState>,
     Query(params): Query<TopVideosParams>,
 ) -> Result<Json<Value>, AppError> {
-    let account = state.account_manager.select_account().await?;
-    let hc = state.tidal_client.working_client().await?;
-    let token = state
-        .token_manager
-        .get_token(&account, &hc)
-        .await?;
-
     let url = "https://api.tidal.com/v1/pages/mymusic_recommended_videos";
     let data = state
         .tidal_client
-        .make_authed_request(
+        .make_catalog_authed_request(
             url,
             Some(vec![
                 ("countryCode", &params.countryCode),
                 ("locale", &params.locale),
                 ("deviceType", &params.deviceType),
             ]),
-            &token,
         )
         .await?;
 

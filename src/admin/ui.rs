@@ -187,7 +187,6 @@ body { font-family:'SF Mono','Fira Code','Cascadia Code','JetBrains Mono',Menlo,
 <h1>HiFi API Admin</h1>
 <div style="display:flex;gap:8px;align-items:center">
 <button class="btn btn-primary" onclick="testAll()" id="testAllBtn">Test All</button>
-<button class="btn btn-danger" onclick="clearRateLimits()" id="clearLimitsBtn" title="Emergency: clear all rate-limit cooldowns">Clear Limits</button>
 <span class="badge" id="version">v2.10</span>
 </div>
 </div>
@@ -222,6 +221,7 @@ body { font-family:'SF Mono','Fira Code','Cascadia Code','JetBrains Mono',Menlo,
 </div>
 <button class="btn btn-primary" onclick="addAccount()">Add Account</button>
 <button class="btn" onclick="startOAuth()" id="oauthBtn" style="margin-left:8px">Add via OAuth</button>
+<label style="display:inline-flex;align-items:center;gap:6px;margin-left:12px;font-size:12px;color:#8b949e"><input type="checkbox" id="new-catalog" style="width:auto"> Catalog-only (metadata, never playback)</label>
 </div>
 
 <div class="form-section">
@@ -236,51 +236,13 @@ body { font-family:'SF Mono','Fira Code','Cascadia Code','JetBrains Mono',Menlo,
 </div>
 
 <div class="form-section">
-<h3>Rate Limits</h3>
+<h3>Settings</h3>
 <div class="form-row">
-<div class="form-group"><label>Per-IP RPS</label><input type="number" id="rl-rps" min="1" placeholder="20"></div>
-<div class="form-group"><label>Per-IP Burst</label><input type="number" id="rl-burst" min="1" placeholder="40"></div>
-</div>
-<div class="form-row">
-<div class="form-group"><label>Tidal RPS (global)</label><input type="number" id="rl-tidal-rps" min="1" placeholder="12"></div>
-<div class="form-group"><label>Tidal Burst (global)</label><input type="number" id="rl-tidal-burst" min="1" placeholder="24"></div>
-</div>
-<div class="form-row">
-<div class="form-group"><label>429 Cooldown (sec)</label><input type="number" id="rl-429" min="0" placeholder="90"></div>
-<div class="form-group"><label>403 Cooldown (sec)</label><input type="number" id="rl-403" min="0" placeholder="180"></div>
-</div>
-<div class="form-row">
-<div class="form-group"><label>Per-account RPS</label><input type="number" id="rl-account-rps" min="1" placeholder="2"></div>
-<div class="form-group"><label>Per-account Burst</label><input type="number" id="rl-account-burst" min="1" placeholder="4"></div>
-</div>
-<div class="form-row">
-<div class="form-group"><label>Reserve accounts</label><input type="number" id="rl-reserve" min="1" placeholder="2"></div>
-<div class="form-group"><label>Conserve trickle RPS</label><input type="number" id="rl-trickle" min="1" placeholder="1"></div>
-</div>
-<div class="form-row">
-<div class="form-group"><label>Daily budget / account (0 = ∞)</label><input type="number" id="rl-budget" min="0" placeholder="12000"></div>
-<div class="form-group"><label>Budget alert %</label><input type="number" id="rl-budget-pct" min="1" max="100" placeholder="80"></div>
-</div>
-<div class="form-row">
-<div class="form-group"><label>Costly-route IP RPS</label><input type="number" id="rl-costly-rps" min="1" placeholder="5"></div>
-<div class="form-group"><label>Costly-route IP Burst</label><input type="number" id="rl-costly-burst" min="1" placeholder="10"></div>
-</div>
-<div class="form-row">
-<div class="form-group"><label>Soft-delay cap (ms)</label><input type="number" id="rl-delay-cap" min="0" placeholder="2000"></div>
 <div class="form-group"><label>Atmos default</label><select id="rl-atmos" style="width:100%;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:10px 12px;border-radius:6px;font-size:13px"><option value="off">Off (FLAC first)</option><option value="prefer">Prefer (Atmos first)</option></select></div>
-</div>
-<div class="form-row full">
-<div class="form-group"><label>IP allowlist (comma-separated, bypass all limits)</label><input type="text" id="rl-allow" placeholder="1.2.3.4, 5.6.7.8"></div>
-</div>
-<div class="form-row full">
-<div class="form-group"><label>IP denylist (comma-separated, instant 403)</label><input type="text" id="rl-deny" placeholder="9.9.9.9"></div>
-</div>
-<p style="font-size:11px;color:#8b949e;margin-bottom:16px">Per-IP limits apply independently to each client IP. Costly routes (anything hitting Tidal) get a stricter bucket with graduated slowdown instead of instant 429s; reputation auto-squeezes abusers. Global Tidal cap scales as per-account RPS × healthy accounts. At/under reserve, the pool conserves (trickle + fail-fast 429s). Daily budgets drop spent accounts from rotation at UTC midnight rollover.</p>
-<div class="form-row" style="margin-bottom:16px">
 <div class="form-group"><label style="display:flex;align-items:center;gap:8px;text-transform:none;font-size:13px;color:#c9d1d9"><input type="checkbox" id="rl-autoheal" style="width:auto"> Auto-heal system-disabled accounts</label></div>
-<div class="form-group"><label style="display:flex;align-items:center;gap:8px;text-transform:none;font-size:13px;color:#c9d1d9"><input type="checkbox" id="rl-reputation" style="width:auto"> IP reputation auto-tune</label></div>
 </div>
-<button class="btn btn-primary" onclick="saveRateLimits()">Save Rate Limits</button>
+<p style="font-size:11px;color:#8b949e;margin-bottom:16px">No request throttling is applied — all requests go straight to Tidal with account failover.</p>
+<button class="btn btn-primary" onclick="saveSettings()">Save Settings</button>
 </div>
 
 <div class="form-section">
@@ -414,8 +376,23 @@ function timeStr(ts) {
     return Math.floor(mins / 60) + 'h ' + (mins % 60) + 'm';
 }
 
-function redisCard(redis) {
-    redis = redis || {};
+function playbackCard(pb) {
+    pb = pb || {};
+    var active = pb.active != null ? pb.active : '—';
+    var pending = pb.pending != null ? pb.pending : '—';
+    var pool = pb.pool_size != null ? pb.pool_size : '—';
+    return '<div class="stat-card"><div class="label">Playback ' + active + '/' + pool + '</div><div class="value">' + pending + ' queued</div></div>';
+}
+
+function catalogCard(cat) {
+    cat = cat || {};
+    var mode = cat.mode || 'pool';
+    var label = mode === 'static_token' ? 'Static token' : (mode === 'account' ? esc(cat.label || 'Catalog') : 'Pool');
+    var color = mode === 'pool' ? '#8b949e' : '#d2a8ff';
+    return '<div class="stat-card"><div class="label">Catalog</div><div class="value" style="font-size:18px;color:' + color + '">' + label + '</div></div>';
+}
+
+function redisCard(redis) {    redis = redis || {};
     if (!redis.configured) {
         return '<div class="stat-card"><div class="label">Redis Sync</div><div class="value" style="font-size:18px;color:#8b949e">Single-host</div></div>';
     }
@@ -449,28 +426,6 @@ async function testAll() {
         document.getElementById('error').textContent = 'Test error: ' + e.message;
     } finally {
         btn.textContent = 'Test All';
-        btn.disabled = false;
-    }
-}
-
-async function clearRateLimits() {
-    if (!confirm('Emergency reset: clear ALL rate-limit cooldowns? Accounts may get banned again immediately.')) return;
-    var btn = document.getElementById('clearLimitsBtn');
-    btn.textContent = 'Clearing...';
-    btn.disabled = true;
-    try {
-        var res = await fetch('/admin/accounts/clear-rate-limits', { method: 'POST', headers: headers() });
-        var data = await res.json();
-        if (res.ok) {
-            document.getElementById('success').textContent = data.message || 'Rate limits cleared!';
-            fetchData();
-        } else {
-            document.getElementById('error').textContent = data.detail || 'Error';
-        }
-    } catch(e) {
-        document.getElementById('error').textContent = e.message;
-    } finally {
-        btn.textContent = 'Clear Limits';
         btn.disabled = false;
     }
 }
@@ -676,10 +631,9 @@ async function fetchData() {
             '<div class="stat-card"><div class="label">Total Requests</div><div class="value">' + (stats.total_requests || 0) + '</div></div>' +
             '<div class="stat-card"><div class="label">Error Rate</div><div class="value">' + (stats.error_rate || '0.00%') + '</div></div>' +
             '<div class="stat-card"><div class="label">Active</div><div class="value">' + (stats.healthy_accounts || 0) + '/' + (stats.total_accounts || 0) + '</div></div>' +
-            '<div class="stat-card"><div class="label">Rate Limited</div><div class="value">' + (stats.rate_limited_accounts || 0) + '</div></div>' +
-            '<div class="stat-card"><div class="label">Today (all accounts)</div><div class="value">' + (stats.day_requests || 0) + '</div></div>' +
-            redisCard(stats.redis) +
-            (stats.conservation ? '<div class="stat-card" style="border-color:#d29922"><div class="label">Mode</div><div class="value" style="color:#d29922;font-size:18px">🐢 CONSERVING</div></div>' : '');
+            playbackCard(stats.playback) +
+            catalogCard(stats.catalog) +
+            redisCard(stats.redis);
 
         var html = '';
         if (accounts.accounts.length === 0) {
@@ -688,28 +642,24 @@ async function fetchData() {
             for (var i = 0; i < accounts.accounts.length; i++) {
                 var a = accounts.accounts[i];
                 var label = a.label || a.id.slice(0, 8);
-                var statusClass = 'status-dot ' + (a.is_active ? 'status-ok' : (a.rate_limited_until > Math.floor(Date.now()/1000) ? 'status-warn' : 'status-err'));
+                var statusClass = 'status-dot ' + (a.is_active ? 'status-ok' : 'status-err');
                 var statusText = a.is_active ? 'Active' : 'Inactive';
                 var activeCls = a.is_active ? ' btn-active' : '';
                 var toggleText = a.is_active ? 'ON' : 'OFF';
-                var rateStr = a.rate_limited_until ? timeStr(a.rate_limited_until) : 'No';
                 var tokenStr = timeStr(a.token_expires_at);
                 var uid = a.user_id || '-';
-                var budget = (window._dailyBudget && window._dailyBudget > 0) ? window._dailyBudget : 0;
-                var dayUsed = a.day_requests || 0;
-                var dayPct = budget > 0 ? Math.min(100, Math.round(dayUsed / budget * 100)) : 0;
-                var dayBar = budget > 0
-                    ? '<div style="margin-top:8px"><div style="display:flex;justify-content:space-between;font-size:11px;color:#8b949e;margin-bottom:4px"><span>Today</span><span>' + dayUsed + ' / ' + budget + '</span></div>' +
-                      '<div style="height:6px;border-radius:3px;background:#21262d;overflow:hidden"><div style="height:100%;width:' + dayPct + '%;border-radius:3px;background:' + (dayPct >= 90 ? '#f85149' : (dayPct >= 70 ? '#d29922' : '#3fb950')) + '"></div></div></div>'
-                    : '';
-
+                var catalogBadge = a.is_catalog ? '<span class="status-label" style="color:#d2a8ff;background:rgba(210,168,255,0.1)">CATALOG</span>' : '';
+                var catalogBtn = a.is_catalog
+                    ? '<button class="btn" onclick="setCatalog(\'' + a.id + '\',false)" title="Return to playback pool">Uncatalog</button>'
+                    : '<button class="btn" onclick="setCatalog(\'' + a.id + '\',true)" title="Metadata only, never playback">Catalog</button>';
                 html += '<div class="account-card">' +
                     '<div class="card-header">' +
-                        '<div class="left"><span class="acc-num">' + (i + 1) + '</span><span class="' + statusClass + '"></span><span class="label">' + esc(label) + '</span><span class="status-label ' + (a.is_active ? 'status-ok' : 'status-err') + '">' + statusText + '</span></div>' +
+                        '<div class="left"><span class="acc-num">' + (i + 1) + '</span><span class="' + statusClass + '"></span><span class="label">' + esc(label) + '</span><span class="status-label ' + (a.is_active ? 'status-ok' : 'status-err') + '">' + statusText + '</span>' + catalogBadge + '</div>' +
                         '<div class="card-actions">' +
                             '<button class="btn" onclick="refreshAccount(\'' + a.id + '\')">Refresh Token</button>' +
                             '<button class="btn" onclick="openEdit(\'' + a.id + '\')">Edit</button>' +
                             '<button class="btn" onclick="duplicateAccount(\'' + a.id + '\')">Duplicate</button>' +
+                            catalogBtn +
                             '<button class="btn' + activeCls + '" onclick="toggleAccount(\'' + a.id + '\',' + (!a.is_active) + ')">' + toggleText + '</button>' +
                             '<button class="btn btn-danger" onclick="removeAccount(\'' + a.id + '\')">Delete</button>' +
                         '</div>' +
@@ -719,13 +669,11 @@ async function fetchData() {
                         '<div class="cred-row"><span class="cred-key">CLIENT_SECRET</span><span class="cred-value masked">' + esc(a.client_secret.slice(0, 20)) + '***</span></div>' +
                         '<div class="cred-row"><span class="cred-key">USER_ID</span><span class="cred-value">' + esc(uid) + '</span></div>' +
                         '<div class="cred-row"><span class="cred-key">REFRESH_TOKEN</span><span class="cred-value token">' + esc(trunc(a.refresh_token, 50)) + '</span></div>' +
-                        dayBar +
                     '</div>' +
                     '<div class="card-footer">' +
                         '<div class="card-stats">' +
                             '<span class="card-stat">Requests <strong>' + a.request_count + '</strong></span>' +
                             '<span class="card-stat">Errors <strong>' + a.error_count + '</strong></span>' +
-                            '<span class="card-stat">Rate Limited <strong>' + rateStr + '</strong></span>' +
                             (a.auto_disabled ? '<span class="card-stat">Auto-heal <strong>retrying</strong></span>' : '') +
                             '<span class="card-stat">Token <strong>' + tokenStr + '</strong></span>' +
                             '<span class="card-stat test-badge" id="test-' + a.id + '" onclick="showTestDetails(\'' + a.id + '\')">Test <strong>-</strong></span>' +
@@ -794,6 +742,18 @@ async function removeAccount(id) {
     }
 }
 
+async function setCatalog(id, catalog) {
+    try {
+        var res = await fetch('/admin/accounts/' + id + '/catalog', {
+            method: 'PUT', headers: headers(), body: JSON.stringify({ catalog: catalog })
+        });
+        if (res.ok) fetchData();
+        else { var d = await res.json(); document.getElementById('error').textContent = d.detail || 'Error'; }
+    } catch(e) {
+        document.getElementById('error').textContent = e.message;
+    }
+}
+
 function duplicateAccount(id) {
     var a = window._accounts.find(function(x) { return x.id === id; });
     if (!a) { document.getElementById('error').textContent = 'Account not found'; return; }
@@ -823,7 +783,7 @@ async function addAccount() {
     try {
         var res = await fetch('/admin/accounts', {
             method: 'POST', headers: headers(),
-            body: JSON.stringify({ label: label, user_id: userId, client_id: client_id, client_secret: client_secret, refresh_token: refresh_token })
+            body: JSON.stringify({ label: label, user_id: userId, client_id: client_id, client_secret: client_secret, refresh_token: refresh_token, catalog: document.getElementById('new-catalog').checked })
         });
         if (res.ok) {
             document.getElementById('success').textContent = 'Account added!';
@@ -833,6 +793,7 @@ async function addAccount() {
             document.getElementById('new-client-id').value = '';
             document.getElementById('new-client-secret').value = '';
             document.getElementById('new-refresh-token').value = '';
+            document.getElementById('new-catalog').checked = false;
         } else {
             var d = await res.json();
             document.getElementById('error').textContent = d.detail || 'Error';
@@ -926,7 +887,7 @@ function openOAuthUrl() {
 
 fetchData();
 setInterval(fetchData, 15000);
-loadRateLimits();
+loadSettings();
 loadProxyStatus();
 setInterval(loadProxyStatus, 15000);
 loadAlertStatus();
@@ -1164,33 +1125,14 @@ async function loadProxyStatus() {
     } catch(e) {}
 }
 
-async function loadRateLimits() {
+async function loadSettings() {
     try {
         var res = await fetch('/admin/settings', { headers: headers() });
         if (!res.ok) return;
         var d = await res.json();
-        var r = d.rate_limits || {};
-        document.getElementById('rl-rps').value = r.ip_rps != null ? r.ip_rps : (r.global_rps || 20);
-        document.getElementById('rl-burst').value = r.ip_burst != null ? r.ip_burst : (r.global_burst || 40);
-        document.getElementById('rl-tidal-rps').value = r.tidal_rps || 20;
-        document.getElementById('rl-tidal-burst').value = r.tidal_burst || 40;
-        document.getElementById('rl-429').value = r.cooldown_429_secs || 90;
-        document.getElementById('rl-403').value = r.cooldown_403_secs || 180;
+        var r = d.settings || d.rate_limits || {};
         document.getElementById('rl-autoheal').checked = r.auto_heal !== false;
-        document.getElementById('rl-account-rps').value = r.account_rps || 3;
-        document.getElementById('rl-account-burst').value = r.account_burst || 6;
-        document.getElementById('rl-reserve').value = r.reserve_accounts || 2;
-        document.getElementById('rl-trickle').value = r.conserve_trickle_rps || 1;
-        document.getElementById('rl-budget').value = r.daily_budget_per_account != null ? r.daily_budget_per_account : 12000;
-        document.getElementById('rl-budget-pct').value = r.daily_budget_alert_pct || 80;
-        document.getElementById('rl-costly-rps').value = r.ip_costly_rps || 20;
-        document.getElementById('rl-costly-burst').value = r.ip_costly_burst || 40;
-        document.getElementById('rl-delay-cap').value = r.ip_delay_cap_ms != null ? r.ip_delay_cap_ms : 2000;
-        document.getElementById('rl-reputation').checked = r.reputation_enabled !== false;
-        document.getElementById('rl-allow').value = r.ip_allowlist || '';
-        document.getElementById('rl-deny').value = r.ip_denylist || '';
         document.getElementById('rl-atmos').value = r.atmos_mode || 'off';
-        window._dailyBudget = r.daily_budget_per_account || 0;
     } catch(e) {}
 }
 
@@ -1225,28 +1167,10 @@ async function importCredentials(e) {
     e.target.value = '';
 }
 
-async function saveRateLimits() {
+async function saveSettings() {
     var body = {
-        rate_limits: {
-            ip_rps: parseInt(document.getElementById('rl-rps').value) || 20,
-            ip_burst: parseInt(document.getElementById('rl-burst').value) || 40,
-            tidal_rps: parseInt(document.getElementById('rl-tidal-rps').value) || 20,
-            tidal_burst: parseInt(document.getElementById('rl-tidal-burst').value) || 40,
-            cooldown_429_secs: parseInt(document.getElementById('rl-429').value) || 90,
-            cooldown_403_secs: parseInt(document.getElementById('rl-403').value) || 180,
+        settings: {
             auto_heal: document.getElementById('rl-autoheal').checked,
-            account_rps: parseInt(document.getElementById('rl-account-rps').value) || 3,
-            account_burst: parseInt(document.getElementById('rl-account-burst').value) || 6,
-            reserve_accounts: parseInt(document.getElementById('rl-reserve').value) || 2,
-            conserve_trickle_rps: parseInt(document.getElementById('rl-trickle').value) || 1,
-            daily_budget_per_account: parseInt(document.getElementById('rl-budget').value),
-            daily_budget_alert_pct: parseInt(document.getElementById('rl-budget-pct').value) || 80,
-            ip_costly_rps: parseInt(document.getElementById('rl-costly-rps').value) || 20,
-            ip_costly_burst: parseInt(document.getElementById('rl-costly-burst').value) || 40,
-            ip_delay_cap_ms: parseInt(document.getElementById('rl-delay-cap').value),
-            reputation_enabled: document.getElementById('rl-reputation').checked,
-            ip_allowlist: document.getElementById('rl-allow').value,
-            ip_denylist: document.getElementById('rl-deny').value,
             atmos_mode: document.getElementById('rl-atmos').value
         }
     };
@@ -1255,32 +1179,14 @@ async function saveRateLimits() {
             method: 'PUT', headers: headers(), body: JSON.stringify(body)
         });
         if (res.ok) {
-            document.getElementById('success').textContent = 'Rate limits saved!';
+            document.getElementById('success').textContent = 'Settings saved!';
             var d = await res.json();
-            var r = d.rate_limits || {};
-            document.getElementById('rl-rps').value = r.ip_rps != null ? r.ip_rps : (r.global_rps || 20);
-            document.getElementById('rl-burst').value = r.ip_burst != null ? r.ip_burst : (r.global_burst || 40);
-            document.getElementById('rl-tidal-rps').value = r.tidal_rps || 12;
-            document.getElementById('rl-tidal-burst').value = r.tidal_burst || 24;
-            document.getElementById('rl-429').value = r.cooldown_429_secs;
-            document.getElementById('rl-403').value = r.cooldown_403_secs;
-            document.getElementById('rl-account-rps').value = r.account_rps;
-            document.getElementById('rl-account-burst').value = r.account_burst;
-            document.getElementById('rl-reserve').value = r.reserve_accounts;
-            document.getElementById('rl-trickle').value = r.conserve_trickle_rps;
-            document.getElementById('rl-budget').value = r.daily_budget_per_account;
-            document.getElementById('rl-budget-pct').value = r.daily_budget_alert_pct;
-            document.getElementById('rl-costly-rps').value = r.ip_costly_rps;
-            document.getElementById('rl-costly-burst').value = r.ip_costly_burst;
-            document.getElementById('rl-delay-cap').value = r.ip_delay_cap_ms;
-            document.getElementById('rl-reputation').checked = r.reputation_enabled !== false;
-            document.getElementById('rl-allow').value = r.ip_allowlist || '';
-            document.getElementById('rl-deny').value = r.ip_denylist || '';
+            var r = d.settings || d.rate_limits || {};
+            document.getElementById('rl-autoheal').checked = r.auto_heal !== false;
             document.getElementById('rl-atmos').value = r.atmos_mode || 'off';
-            window._dailyBudget = r.daily_budget_per_account || 0;
         } else {
             var d = await res.json();
-            document.getElementById('error').textContent = d.detail || 'Error saving rate limits';
+            document.getElementById('error').textContent = d.detail || 'Error saving settings';
         }
     } catch(e) {
         document.getElementById('error').textContent = e.message;

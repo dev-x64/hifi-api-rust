@@ -1,5 +1,5 @@
 use axum::extract::{Query, State};
-use axum::Json;
+use axum::response::Response;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -24,7 +24,24 @@ fn default_presentation() -> String { "FULL".into() }
 pub async fn get_video(
     State(state): State<AppState>,
     Query(params): Query<VideoParams>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Response, AppError> {
+    let op = crate::playback::PlaybackOp::Video {
+        id: params.id,
+        quality: params.quality,
+        mode: params.mode,
+        presentation: params.presentation,
+    };
+    state.playback.dispatch(&state, op).await
+}
+
+/// Core /video/ fetch (shared by immediate and queued execution).
+pub(crate) async fn fetch_video_playback(
+    state: &AppState,
+    id: i64,
+    quality: &str,
+    mode: &str,
+    presentation: &str,
+) -> Result<Value, AppError> {
     let account = state.account_manager.select_account().await?;
     let hc = state.tidal_client.working_client().await?;
     let token = state
@@ -32,22 +49,22 @@ pub async fn get_video(
         .get_token(&account, &hc)
         .await?;
 
-    let url = format!("https://api.tidal.com/v1/videos/{}/playbackinfo", params.id);
+    let url = format!("https://api.tidal.com/v1/videos/{}/playbackinfo", id);
     let data = state
         .tidal_client
         .make_authed_request(
             &url,
             Some(vec![
-                ("videoquality", &params.quality),
-                ("playbackmode", &params.mode),
-                ("assetpresentation", &params.presentation),
+                ("videoquality", quality),
+                ("playbackmode", mode),
+                ("assetpresentation", presentation),
             ]),
             &token,
         )
         .await?;
 
-    Ok(Json(json!({
+    Ok(json!({
         "version": state.config.api_version,
         "video": data
-    })))
+    }))
 }
