@@ -83,6 +83,21 @@ fn result_i64(v: &Value) -> Option<i64> {
     }
 }
 
+/// Host part of an http(s) URL without scheme, path, or credentials.
+fn host_of_url(url: &str) -> &str {
+    let s = url.split("://").nth(1).unwrap_or(url);
+    s.split('/').next().unwrap_or(s)
+}
+
+/// Host (never credentials) of a native client for display.
+fn native_host(client: &redis::Client) -> String {
+    match &client.get_connection_info().addr {
+        redis::ConnectionAddr::Tcp(host, port) => format!("{}:{}", host, port),
+        redis::ConnectionAddr::TcpTls { host, port, .. } => format!("{}:{}", host, port),
+        _ => "unix-socket".to_string(),
+    }
+}
+
 enum Backend {
     Rest {
         client: reqwest::Client,
@@ -174,6 +189,20 @@ impl UpstashStore {
         match self.backend.as_ref() {
             Backend::Rest { .. } => "upstash-rest",
             Backend::Native { .. } => "native-redis",
+        }
+    }
+
+    /// Safe endpoint label for the admin panel: backend kind + host only.
+    /// Never includes credentials — the native URL embeds its password and
+    /// the REST bearer token is secret too.
+    pub fn describe(&self) -> String {
+        match self.backend.as_ref() {
+            Backend::Rest { base, .. } => {
+                format!("upstash-rest @ {}", host_of_url(base))
+            }
+            Backend::Native { client, .. } => {
+                format!("native-redis @ {}", native_host(client))
+            }
         }
     }
 
@@ -666,14 +695,40 @@ mod tests {
     }
 
     #[test]
-    fn key_layout_stable() {
-        assert_eq!(UpstashStore::k_settings("atmos_mode"), "hifi:settings:atmos_mode");
+    fn key_layout_stable() {        assert_eq!(UpstashStore::k_settings("atmos_mode"), "hifi:settings:atmos_mode");
         assert_eq!(UpstashStore::k_token("id"), "hifi:token:id");
         assert_eq!(UpstashStore::k_apikey("id"), "hifi:apikey:id");
         assert_eq!(UpstashStore::k_account("id"), "hifi:account:id");
         assert_eq!(UpstashStore::k_accounts_set(), "hifi:accounts");
         assert_eq!(UpstashStore::k_apikeydef("id"), "hifi:apikeydef:id");
         assert_eq!(UpstashStore::k_apikeys_set(), "hifi:apikeys");
+    }
+
+    #[test]
+    fn describe_exposes_host_but_never_secrets() {
+        // REST backend: host shown, bearer token never.
+        let rest = UpstashStore::new(super::Backend::Rest {
+            client: reqwest::Client::new(),
+            base: "https://glad-kitten-177729.upstash.io".into(),
+            token: "super-secret-token".into(),
+        });
+        let label = rest.describe();
+        assert!(label.contains("upstash-rest"), "{}", label);
+        assert!(label.contains("glad-kitten-177729.upstash.io"), "{}", label);
+        assert!(!label.contains("super-secret-token"), "{}", label);
+        // Native backend: host shown, URL-embedded password never.
+        // Client::open only parses (no I/O), so this is offline-safe.
+        let client =
+            redis::Client::open("rediss://default:hunter2@db.example.dev:6379").unwrap();
+        let native = UpstashStore::new(super::Backend::Native {
+            client,
+            mgr: tokio::sync::OnceCell::new(),
+        });
+        let label = native.describe();
+        assert!(label.contains("native-redis"), "{}", label);
+        assert!(label.contains("db.example.dev"), "{}", label);
+        assert!(!label.contains("hunter2"), "{}", label);
+        assert!(!label.contains("default"), "{}", label);
     }
 
     #[test]

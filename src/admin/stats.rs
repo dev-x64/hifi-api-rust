@@ -39,10 +39,13 @@ pub async fn get_stats(
     let redis = match &state.upstash {
         None => json!({"configured": false, "status": "disabled"}),
         Some(store) => {
+            // Which instance we're synced to (backend + host only — the
+            // native URL embeds its password, so it is never exposed).
+            let endpoint = store.describe();
             if store.is_alive(15).await {
-                json!({"configured": true, "status": "ok"})
+                json!({"configured": true, "status": "ok", "endpoint": endpoint})
             } else {
-                json!({"configured": true, "status": "unreachable"})
+                json!({"configured": true, "status": "unreachable", "endpoint": endpoint})
             }
         }
     };
