@@ -1,5 +1,5 @@
 use axum::extract::{Path, Query, RawQuery, State};
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -67,7 +67,80 @@ pub(crate) async fn fetch_track_playback(
             reason, id
         )));
     }
+    // Tidal silently substitutes the stereo sibling's audio when a stereo
+    // tier is asked for an Atmos-only id (e.g. 527739156 → 479222720,
+    // signalled by `trackId` naming the sibling). Never serve track Y for
+    // track X — fail so callers try the next tier/account instead of
+    // mislabeling another recording's bytes.
+    for ptr in ["/data/trackId", "/data/data/trackId"] {
+        if let Some(seen) = result.pointer(ptr).and_then(json_track_id) {
+            if seen != id.to_string() {
+                return Err(AppError::UpstreamError(
+                    StatusCode::CONFLICT,
+                    format!(
+                        "Tidal returned audio for track {} for requested {}: refusing to serve a different track",
+                        seen, id
+                    ),
+                ));
+            }
+            break;
+        }
+    }
     Ok(result)
+}
+
+/// A track id from Tidal JSON: number or string.
+fn json_track_id(v: &Value) -> Option<String> {
+    if let Some(n) = v.as_i64() {
+        return Some(n.to_string());
+    }
+    if let Some(n) = v.as_u64() {
+        return Some(n.to_string());
+    }
+    v.as_str().map(|s| s.trim().to_string())
+}
+
+/// Extract the track id embedded in a Tidal DASH manifest URL:
+/// `…/1/manifests/<base64>.mpd?…` decodes (protobuf) to `\x12\t<trackId>…`.
+/// Returns `None` when the URL carries no verifiable id (accept).
+pub(crate) fn manifest_track_id(mpd_url: &str) -> Option<String> {
+    let marker = "/manifests/";
+    let start = mpd_url.find(marker)? + marker.len();
+    let rest = &mpd_url[start..];
+    let end = rest
+        .find(|c| c == '.' || c == '?' || c == '/' || c == '&')
+        .unwrap_or(rest.len());
+    let mut b64 = rest[..end].replace('-', "+").replace('_', "/");
+    while b64.len() % 4 != 0 {
+        b64.push('=');
+    }
+    use base64::Engine as _;
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(&b64)
+        .ok()?;
+    let s = String::from_utf8_lossy(&raw);
+    let mut run = String::new();
+    for ch in s.chars() {
+        if ch.is_ascii_digit() {
+            run.push(ch);
+        } else if run.len() >= 5 {
+            return Some(run);
+        } else {
+            run.clear();
+        }
+    }
+    if run.len() >= 5 {
+        Some(run)
+    } else {
+        None
+    }
+}
+
+fn manifest_matches_track(uri: &str, track_id: &str) -> bool {
+    match manifest_track_id(uri) {
+        None => true,
+        Some(mid) => mid == track_id.trim(),
+    }
 }
 
 #[derive(Deserialize, Clone)]
@@ -258,6 +331,26 @@ pub(crate) async fn fetch_manifest_inner(
         )));
     }
 
+    // Same sibling-substitution guard as /track/: Tidal answers stereo
+    // formats for an Atmos-only id with the sibling's manifest (no error).
+    // Refuse to proxy track Y's bytes for track X.
+    if let Some(uri) = result
+        .pointer("/data/data/attributes/uri")
+        .and_then(|v| v.as_str())
+    {
+        if !manifest_matches_track(uri, track_id) {
+            let seen =
+                manifest_track_id(uri).unwrap_or_else(|| "unknown".to_string());
+            return Err(AppError::UpstreamError(
+                StatusCode::CONFLICT,
+                format!(
+                    "Tidal returned manifest for track {} for requested {}: refusing to serve a different track",
+                    seen, track_id
+                ),
+            ));
+        }
+    }
+
     let mut result = result;
     let atmos_available = manifest_has_atmos(&result);
     if let Some(obj) = result.as_object_mut() {
@@ -345,7 +438,7 @@ pub async fn get_track_manifests_query(
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_formats;
+    use super::{manifest_matches_track, manifest_track_id, resolve_formats};
 
     #[test]
     fn atmos_only_forces_single_format() {
@@ -397,6 +490,41 @@ mod tests {
     fn garbage_atmos_falls_back_to_defaults() {
         let out = resolve_formats(None, Some("banana"), false);
         assert!(out.contains(&"FLAC_HIRES".to_string()));
+    }
+
+    #[test]
+    fn manifest_id_decodes_known_vectors() {
+        // im-cf manifests observed live: sibling substitution is detectable
+        // only via this embedded id (no trackId field in the JSON).
+        assert_eq!(
+            manifest_track_id("https://im-cf.manifest.tidal.com/1/manifests/Egk1Mjc3MzkxNTYYAigBWO6T5GNgtGZqCFBMQVlCQUNLcgEFeAOAAQKIAQA.mpd?Expires=1"),
+            Some("527739156".to_string())
+        );
+        assert_eq!(
+            manifest_track_id("https://im-cf.manifest.tidal.com/1/manifests/Egk0NzkyMjI3MjAYAigBWL7L52NgtGZqCFBMQVlCQUNLcgQCAwQBeAOAAQKIAQE.mpd?Expires=1"),
+            Some("479222720".to_string())
+        );
+        assert_eq!(
+            manifest_track_id("https://im-cf.manifest.tidal.com/1/manifests/EgkyMzA5MDkzOTAYAigBWPWa52NgtGZqCFBMQVlCQUNLcgEEeAOAAQKIAQA.mpd?Expires=1"),
+            Some("230909390".to_string())
+        );
+        assert_eq!(
+            manifest_track_id("https://im-cf.manifest.tidal.com/1/manifests/EgkyMzA4ODk4NjgYAigBWNDj4mNgtGZqCFBMQVlCQUNLcgEFeAOAAQKIAQA.mpd?Expires=1"),
+            Some("230889868".to_string())
+        );
+    }
+
+    #[test]
+    fn manifest_match_accepts_unverifiable_but_rejects_sibling() {
+        assert!(manifest_matches_track("https://cdn.example.com/file.mpd", "123"));
+        assert!(manifest_matches_track(
+            "https://im-cf.manifest.tidal.com/1/manifests/EgkyMzA5MDkzOTAYAigBWPWa52NgtGZqCFBMQVlCQUNLcgEEeAOAAQKIAQA.mpd",
+            "230909390"
+        ));
+        assert!(!manifest_matches_track(
+            "https://im-cf.manifest.tidal.com/1/manifests/EgkyMzA5MDkzOTAYAigBWPWa52NgtGZqCFBMQVlCQUNLcgEEeAOAAQKIAQA.mpd",
+            "230889868"
+        ));
     }
 }
 
@@ -465,6 +593,17 @@ pub(crate) async fn fetch_dash_uri(
         .pointer("/data/data/attributes/uri")
         .and_then(|v| v.as_str())
         .ok_or_else(|| AppError::Internal("No manifest URI in response".into()))?;
+
+    if !manifest_matches_track(uri, track_id) {
+        let seen = manifest_track_id(uri).unwrap_or_else(|| "unknown".to_string());
+        return Err(AppError::UpstreamError(
+            StatusCode::CONFLICT,
+            format!(
+                "Tidal returned manifest for track {} for requested {}: refusing to serve a different track",
+                seen, track_id
+            ),
+        ));
+    }
 
     Ok(uri.to_string())
 }
