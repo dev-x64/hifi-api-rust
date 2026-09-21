@@ -86,7 +86,7 @@ The `CLIENT_ID` and `CLIENT_SECRET` above are Tidal's public OAuth credentials. 
 | `TRUST_PROXY_HEADERS` | `true` | Use `X-Forwarded-For`/`X-Real-IP` for client IP (set to `false` for direct connections) |
 | `DISCORD_WEBHOOK_URL` | (none) | Discord webhook for 403/all-down alerts (empty = disabled, test in panel) |
 | `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN` | (none) | Shared cross-instance state via Upstash Redis (empty = single-host mode). See [Multi-instance sync](#multi-instance-sync) |
-| `PUBLIC_POOL_REDIS_URL` | (none) | Alternative backend: native Redis/Valkey for the public pool (`rediss://user:pass@host:port/db`). Wins over the Upstash pair when set — one backend per fleet. |
+| `REDIS_POOL` | (none) | Alternative backend: native Redis/Valkey for this host's pool (`rediss://user:pass@host:port/db`). Wins over the Upstash pair when set — one backend per fleet. (`PUBLIC_POOL_REDIS_URL` still works as a deprecated fallback.) |
 | `RUST_LOG` | `info` | Log level |
 
 ## Deployment
@@ -162,8 +162,8 @@ Identical concurrent metadata requests (e.g. ten users hitting the same search) 
 
 Running more than one instance (e.g. several Render hosts sharing the load)? Point them at one shared Redis database and they coordinate through it instead of drifting apart. Two backends, same key layout and behavior — a host belongs to exactly one pool, so set only one per fleet:
 
-- **Private fleet (default):** `UPSTASH_REDIS_REST_URL` + `UPSTASH_REDIS_REST_TOKEN` (Upstash Redis REST credentials, as host secrets — never commit them).
-- **Public fleet:** `PUBLIC_POOL_REDIS_URL=rediss://user:pass@host:port/db` (native Redis/Valkey over TLS). Wins over the Upstash pair when set; when present-but-unusable the instance stays local rather than syncing to the wrong pool.
+- **Upstash backend:** `UPSTASH_REDIS_REST_URL` + `UPSTASH_REDIS_REST_TOKEN` (Upstash Redis REST credentials, as host secrets — never commit them).
+- **Native backend:** `REDIS_POOL=rediss://user:pass@host:port/db` (native Redis/Valkey over TLS — e.g. Layerbase). Wins over the Upstash pair when set; when present-but-unusable the instance stays local rather than syncing to the wrong pool. (`PUBLIC_POOL_REDIS_URL` still works as a deprecated fallback.)
 
 What gets shared:
 

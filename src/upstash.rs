@@ -4,9 +4,11 @@
 //! - **Upstash REST** (`UPSTASH_REDIS_REST_URL` + `UPSTASH_REDIS_REST_TOKEN`):
 //!   the private fleet's database, spoken over HTTPS (`GET /CMD/args…`,
 //!   `POST /pipeline`).
-//! - **Native** (`PUBLIC_POOL_REDIS_URL=rediss://…`): the public fleet's
-//!   Redis/Valkey, spoken as raw RESP2 over TLS. Selected when set — it wins
+//! - **Native** (`REDIS_POOL=rediss://…`): this host's pool Redis/Valkey,
+//!   spoken as raw RESP2 over TLS. Selected when set — it wins
 //!   over the Upstash pair, because a host belongs to exactly one pool.
+//!   (The previous name `PUBLIC_POOL_REDIS_URL` is still honored as a
+//!   deprecated fallback.)
 //!
 //! When every instance of a fleet points at the same database they coordinate
 //! through it instead of drifting apart: app settings, Tidal access tokens,
@@ -47,9 +49,14 @@ const REST_TIMEOUT: Duration = Duration::from_secs(3);
 const NATIVE_TIMEOUT: Duration = Duration::from_secs(3);
 const PREFIX: &str = "hifi";
 
-/// Env var selecting the native backend (public pool). Wins over the Upstash
-/// pair when set; a host belongs to exactly one pool.
-const NATIVE_URL_ENV: &str = "PUBLIC_POOL_REDIS_URL";
+/// Env var selecting the native backend (this host's pool Redis).
+/// Wins over the Upstash pair when set; a host belongs to exactly one pool.
+const NATIVE_URL_ENV: &str = "REDIS_POOL";
+
+/// Previous name of [`NATIVE_URL_ENV`], still honored as a fallback with a
+/// deprecation warning so un-updated hosts keep syncing. Remove once every
+/// host has moved (then this becomes a hard rename).
+const NATIVE_URL_ENV_LEGACY: &str = "PUBLIC_POOL_REDIS_URL";
 
 /// Percent-encode a single REST path segment (RFC3986 unreserved set passes
 /// through; everything else — including `/`, spaces, `+`, `=` in tokens —
@@ -130,13 +137,30 @@ impl UpstashStore {
     /// Build from env. `None` unless exactly one backend is configured —
     /// callers treat `None` as "single-host mode, skip all sync".
     ///
-    /// When `PUBLIC_POOL_REDIS_URL` is present but unusable the store stays
+    /// When `REDIS_POOL` is present but unusable the store stays
     /// disabled rather than silently syncing to the other pool.
     pub fn from_env() -> Option<Arc<Self>> {
         let native_url = std::env::var(NATIVE_URL_ENV)
             .unwrap_or_default()
             .trim()
             .to_string();
+        let native_url = if native_url.is_empty() {
+            // Transitional fallback for hosts still carrying the old name.
+            let legacy = std::env::var(NATIVE_URL_ENV_LEGACY)
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if !legacy.is_empty() {
+                tracing::warn!(
+                    "{} is deprecated, rename it to {}",
+                    NATIVE_URL_ENV_LEGACY,
+                    NATIVE_URL_ENV
+                );
+            }
+            legacy
+        } else {
+            native_url
+        };
         if !native_url.is_empty() {
             if !(native_url.starts_with("redis://") || native_url.starts_with("rediss://")) {
                 tracing::warn!(
@@ -671,6 +695,7 @@ mod tests {
     const STORE_KEYS: &[&str] = &[
         "UPSTASH_REDIS_REST_URL",
         "UPSTASH_REDIS_REST_TOKEN",
+        "REDIS_POOL",
         "PUBLIC_POOL_REDIS_URL",
     ];
 
@@ -695,7 +720,8 @@ mod tests {
     }
 
     #[test]
-    fn key_layout_stable() {        assert_eq!(UpstashStore::k_settings("atmos_mode"), "hifi:settings:atmos_mode");
+    fn key_layout_stable() {
+        assert_eq!(UpstashStore::k_settings("atmos_mode"), "hifi:settings:atmos_mode");
         assert_eq!(UpstashStore::k_token("id"), "hifi:token:id");
         assert_eq!(UpstashStore::k_apikey("id"), "hifi:apikey:id");
         assert_eq!(UpstashStore::k_account("id"), "hifi:account:id");
@@ -738,6 +764,7 @@ mod tests {
         unsafe {
             std::env::remove_var("UPSTASH_REDIS_REST_URL");
             std::env::remove_var("UPSTASH_REDIS_REST_TOKEN");
+            std::env::remove_var("REDIS_POOL");
             std::env::remove_var("PUBLIC_POOL_REDIS_URL");
         }
         assert!(UpstashStore::from_env().is_none());
@@ -758,7 +785,7 @@ mod tests {
             std::env::set_var("UPSTASH_REDIS_REST_URL", "https://example.upstash.io");
             std::env::set_var("UPSTASH_REDIS_REST_TOKEN", "dummy");
             std::env::set_var(
-                "PUBLIC_POOL_REDIS_URL",
+                "REDIS_POOL",
                 "rediss://default:pw@public.example.dev:6379",
             );
         }
@@ -768,14 +795,53 @@ mod tests {
     }
 
     #[test]
+    fn legacy_var_still_selects_native() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::take(STORE_KEYS);
+        unsafe {
+            std::env::remove_var("UPSTASH_REDIS_REST_URL");
+            std::env::remove_var("UPSTASH_REDIS_REST_TOKEN");
+            std::env::remove_var("REDIS_POOL");
+            // Hosts not yet renamed keep syncing via the deprecated name.
+            std::env::set_var(
+                "PUBLIC_POOL_REDIS_URL",
+                "rediss://default:pw@legacy.example.dev:6379",
+            );
+        }
+        let store = UpstashStore::from_env().expect("legacy var should still work");
+        assert_eq!(store.backend_kind(), "native-redis");
+        assert!(store.describe().contains("legacy.example.dev"));
+    }
+
+    #[test]
+    fn new_var_wins_over_legacy() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::take(STORE_KEYS);
+        unsafe {
+            std::env::remove_var("UPSTASH_REDIS_REST_URL");
+            std::env::remove_var("UPSTASH_REDIS_REST_TOKEN");
+            std::env::set_var("REDIS_POOL", "rediss://default:pw@new.example.dev:6379");
+            std::env::set_var(
+                "PUBLIC_POOL_REDIS_URL",
+                "rediss://default:pw@legacy.example.dev:6379",
+            );
+        }
+        let store = UpstashStore::from_env().expect("native backend should build");
+        assert_eq!(store.backend_kind(), "native-redis");
+        assert!(store.describe().contains("new.example.dev"));
+    }
+
+    #[test]
     fn invalid_native_url_disables() {
         let _lock = ENV_LOCK.lock().unwrap();
         let _guard = EnvGuard::take(STORE_KEYS);
         unsafe {
             std::env::remove_var("UPSTASH_REDIS_REST_URL");
             std::env::remove_var("UPSTASH_REDIS_REST_TOKEN");
+            std::env::remove_var("REDIS_POOL");
+            std::env::remove_var("PUBLIC_POOL_REDIS_URL");
             // Present but unusable: stay disabled rather than syncing nowhere.
-            std::env::set_var("PUBLIC_POOL_REDIS_URL", "not-a-redis-url");
+            std::env::set_var("REDIS_POOL", "not-a-redis-url");
         }
         assert!(UpstashStore::from_env().is_none());
     }
@@ -787,8 +853,10 @@ mod tests {
         unsafe {
             std::env::remove_var("UPSTASH_REDIS_REST_URL");
             std::env::remove_var("UPSTASH_REDIS_REST_TOKEN");
+            std::env::remove_var("REDIS_POOL");
+            std::env::remove_var("PUBLIC_POOL_REDIS_URL");
             // An Upstash REST URL pasted into the wrong var must not sync.
-            std::env::set_var("PUBLIC_POOL_REDIS_URL", "https://example.upstash.io");
+            std::env::set_var("REDIS_POOL", "https://example.upstash.io");
         }
         assert!(UpstashStore::from_env().is_none());
     }
