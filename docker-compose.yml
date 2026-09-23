@@ -1,14 +1,21 @@
 services:
   web:
-    build: .
+    build:
+      context: .
     env_file:
-      - .env
+      - path: .env
+        required: false
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8000
+      DATABASE_URL: /data/hifi.db
+      ADMIN_KEY: ${ADMIN_KEY:-}
     ports:
-      - "0.0.0.0:8000:8000"
+      - "${HIFI_BIND:-127.0.0.1}:${HIFI_PORT:-8000}:8000"
     volumes:
-      - ./token.json:/app/token.json:ro
+      - hifi_data:/data
+    init: true
     restart: unless-stopped
 
-networks:
-  default:
-    driver: bridge
+volumes:
+  hifi_data:

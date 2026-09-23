@@ -7,7 +7,7 @@ use chrono::Utc;
 use rand::Rng;
 use reqwest::Client;
 use serde_json::{json, Value};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::config::Config;
 use crate::error::AppError;
@@ -30,7 +30,9 @@ fn build_client(proxy_url: Option<&str>, user_agent: &str) -> Result<Client, Str
 
 pub struct ProxyManager {
     config: Arc<Config>,
+    enabled: AtomicBool,
     proxies: RwLock<Vec<String>>,
+    direct_client: Client,
     client: ArcSwap<Client>,
     /// Proxy URL currently in use (None = direct connection).
     current: RwLock<Option<String>>,
@@ -42,11 +44,13 @@ pub struct ProxyManager {
     last_try: AtomicI64,
     /// Set while a background rotation is in flight.
     rotating: AtomicBool,
+    generation: AtomicU64,
+    switch_lock: Mutex<()>,
 }
 
 impl ProxyManager {
     pub fn new(config: Arc<Config>) -> Self {
-        let proxies = if config.use_proxies {
+        let proxies = if config.proxies_file.exists() {
             Self::load_proxies_from_file(&config.proxies_file)
         } else {
             Vec::new()
@@ -54,8 +58,10 @@ impl ProxyManager {
 
         let direct = build_client(None, &config.user_agent).expect("Failed to build HTTP client");
         Self {
+            enabled: AtomicBool::new(config.use_proxies),
             config,
             proxies: RwLock::new(proxies),
+            direct_client: direct.clone(),
             client: ArcSwap::from_pointee(direct),
             current: RwLock::new(None),
             // Direct mode is always ready; proxy mode resolves in the background.
@@ -63,11 +69,48 @@ impl ProxyManager {
             fails: AtomicU64::new(0),
             last_try: AtomicI64::new(0),
             rotating: AtomicBool::new(false),
+            generation: AtomicU64::new(0),
+            switch_lock: Mutex::new(()),
         }
     }
 
     pub fn proxies_enabled(&self) -> bool {
-        self.config.use_proxies
+        self.enabled.load(Ordering::Acquire)
+    }
+
+    pub async fn entries(&self) -> Vec<String> {
+        self.proxies.read().await.clone()
+    }
+
+    pub fn normalize_proxies(proxies: Vec<String>, enabled: bool) -> Result<Vec<String>, AppError> {
+        let mut normalized = Vec::new();
+        for raw in proxies {
+            let url = raw.trim();
+            if url.is_empty() { continue; }
+            reqwest::Proxy::all(url).map_err(|e| AppError::BadRequest(format!("Invalid proxy URL: {e}")))?;
+            if !normalized.iter().any(|existing| existing == url) {
+                normalized.push(url.to_string());
+            }
+        }
+        if enabled && normalized.is_empty() {
+            return Err(AppError::BadRequest("Добавьте хотя бы один адрес прокси перед включением".into()));
+        }
+        Ok(normalized)
+    }
+
+    pub async fn configure(&self, enabled: bool, proxies: Vec<String>) -> Result<(), AppError> {
+        let proxies = Self::normalize_proxies(proxies, enabled)?;
+        let _guard = self.switch_lock.lock().await;
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        *self.proxies.write().await = proxies;
+        *self.current.write().await = None;
+        self.client.store(Arc::new(self.direct_client.clone()));
+        self.enabled.store(enabled, Ordering::Release);
+        self.ready.store(!enabled, Ordering::Release);
+        self.fails.store(0, Ordering::Relaxed);
+        self.last_try.store(0, Ordering::Relaxed);
+        tracing::info!("Proxy mode {}", if enabled { "enabled" } else { "disabled" });
+        Ok(())
     }
 
     fn load_proxies_from_file(path: &std::path::Path) -> Vec<String> {
@@ -96,7 +139,7 @@ impl ProxyManager {
 
     /// Current client, no questions asked. Prefer `working_client` for Tidal traffic.
     pub fn client(&self) -> Client {
-        (**self.client.load()).clone()
+        if self.proxies_enabled() { (**self.client.load()).clone() } else { self.direct_client.clone() }
     }
 
     /// Resolve a usable client for Tidal traffic.
@@ -105,8 +148,8 @@ impl ProxyManager {
     /// - Proxies enabled + not ready → quick resolve (throttled); direct only if
     ///   FALLBACK_TO_DIRECT_CONNECTION=true, else 503 so the home IP never leaks.
     pub async fn working_client(&self) -> Result<Client, AppError> {
-        if !self.config.use_proxies {
-            return Ok(self.client());
+        if !self.proxies_enabled() {
+            return Ok(self.direct_client.clone());
         }
         if self.ready.load(Ordering::Relaxed) {
             return Ok(self.client());
@@ -116,7 +159,7 @@ impl ProxyManager {
         }
         if self.config.fallback_to_direct {
             tracing::warn!("No working proxy — falling back to direct connection (HOST IP MAY BE EXPOSED)");
-            return Ok(self.client());
+            return Ok(self.direct_client.clone());
         }
         Err(AppError::ServiceUnavailable(
             "No working proxy available and direct fallback is disabled".into(),
@@ -128,6 +171,7 @@ impl ProxyManager {
         if self.ready.load(Ordering::Relaxed) {
             return true;
         }
+        let generation = self.generation.load(Ordering::Acquire);
         let now = Utc::now().timestamp();
         if now - self.last_try.load(Ordering::Relaxed) < 30 {
             return false;
@@ -135,14 +179,17 @@ impl ProxyManager {
         self.last_try.store(now, Ordering::Relaxed);
         match self.get_working_proxy(None).await {
             Some(proxy) => {
-                self.swap_to(Some(proxy)).await;
-                true
+                self.swap_to(Some(proxy), generation).await
             }
             None => false,
         }
     }
 
-    async fn swap_to(&self, proxy: Option<String>) {
+    async fn swap_to(&self, proxy: Option<String>, generation: u64) -> bool {
+        let _guard = self.switch_lock.lock().await;
+        if !self.proxies_enabled() || self.generation.load(Ordering::Acquire) != generation {
+            return false;
+        }
         match build_client(proxy.as_deref(), &self.config.user_agent) {
             Ok(client) => {
                 self.client.store(Arc::new(client));
@@ -153,17 +200,19 @@ impl ProxyManager {
                     Some(p) => tracing::info!("Proxy active: {}", mask_proxy(&p)),
                     None => tracing::info!("Proxy active: direct connection"),
                 }
+                true
             }
             Err(e) => {
                 tracing::error!("{}", e);
                 self.ready.store(false, Ordering::Relaxed);
+                false
             }
         }
     }
 
     /// Kick off the initial resolve in the background (never blocks startup).
     pub fn spawn_initial_resolve(self: &Arc<Self>) {
-        if !self.config.use_proxies {
+        if !self.proxies_enabled() {
             self.ready.store(true, Ordering::Relaxed);
             return;
         }
@@ -191,7 +240,7 @@ impl ProxyManager {
 
     /// Record a failed Tidal round-trip; rotate after 3 consecutive failures.
     pub fn note_failure(self: &Arc<Self>) {
-        if !self.config.use_proxies {
+        if !self.proxies_enabled() {
             return;
         }
         let fails = self.fails.fetch_add(1, Ordering::Relaxed) + 1;
@@ -211,7 +260,7 @@ impl ProxyManager {
 
     /// True when token refreshes should rotate the proxy first.
     pub fn should_rotate_on_refresh(&self) -> bool {
-        self.config.use_proxies && self.config.rotate_proxies_on_refresh
+        self.proxies_enabled() && self.config.rotate_proxies_on_refresh
     }
 
     fn rotate(self: &Arc<Self>) {
@@ -224,6 +273,7 @@ impl ProxyManager {
         }
         let this = self.clone();
         tokio::spawn(async move {
+            let generation = this.generation.load(Ordering::Acquire);
             let next = {
                 let proxies = this.proxies.read().await;
                 if proxies.is_empty() {
@@ -241,12 +291,15 @@ impl ProxyManager {
             match next {
                 Some(proxy) => {
                     tracing::warn!("Rotating proxy after failures → {}", mask_proxy(&proxy));
-                    this.swap_to(Some(proxy)).await;
+                    if !this.swap_to(Some(proxy), generation).await {
+                        this.rotating.store(false, Ordering::Relaxed);
+                        return;
+                    }
                     // Verify in the background; if bad, mark not-ready so the
                     // next request resolves a tested one.
                     let check = this.current.read().await.clone();
                     if let Some(url) = check {
-                        if !this.test_proxy(&url).await {
+                        if !this.test_proxy(&url).await && this.generation.load(Ordering::Acquire) == generation {
                             tracing::warn!("Rotated proxy failed health check: {}", mask_proxy(&url));
                             this.ready.store(false, Ordering::Relaxed);
                         }
@@ -254,7 +307,9 @@ impl ProxyManager {
                 }
                 None => {
                     tracing::warn!("Proxy rotation requested but pool is empty");
-                    this.ready.store(false, Ordering::Relaxed);
+                    if this.generation.load(Ordering::Acquire) == generation {
+                        this.ready.store(false, Ordering::Relaxed);
+                    }
                 }
             }
             this.rotating.store(false, Ordering::Relaxed);
@@ -262,8 +317,9 @@ impl ProxyManager {
     }
 
     pub async fn test_proxy(&self, proxy_url: &str) -> bool {
+        let Ok(proxy) = reqwest::Proxy::all(proxy_url) else { return false; };
         let client = match Client::builder()
-            .proxy(reqwest::Proxy::all(proxy_url).unwrap())
+            .proxy(proxy)
             .timeout(Duration::from_secs(5))
             .build()
         {
@@ -315,12 +371,14 @@ impl ProxyManager {
         let proxies = self.proxies.read().await;
         let current = self.current.read().await;
         json!({
-            "enabled": self.config.use_proxies,
+            "enabled": self.proxies_enabled(),
             "ready": self.ready.load(Ordering::Relaxed),
             "current": current.as_ref().map(|p| mask_proxy(p)),
             "pool_size": proxies.len(),
             "consecutive_fails": self.fails.load(Ordering::Relaxed),
+            "last_try": self.last_try.load(Ordering::Relaxed),
             "fallback_to_direct": self.config.fallback_to_direct,
+            "entries": proxies.clone(),
         })
     }
 }

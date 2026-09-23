@@ -1,17 +1,29 @@
-FROM rust:slim-bookworm AS builder
+FROM rust:bookworm AS builder
+
 WORKDIR /app
-RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends pkg-config libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir src && echo "fn main() {}" > src/main.rs
-RUN cargo build --release 2>/dev/null || true
-COPY . .
-RUN touch src/main.rs
-RUN cargo build --release
+COPY src ./src
+COPY migrations ./migrations
+RUN cargo build --release --locked
 
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y ca-certificates libsqlite3-0 && rm -rf /var/lib/apt/lists/*
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates libsqlite3-0 curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /data
+
 WORKDIR /app
-COPY --from=builder /app/target/release/hifi-api .
+COPY --from=builder /app/target/release/hifi-api /usr/local/bin/hifi-api
+
+ENV HOST=0.0.0.0 PORT=8000 DATABASE_URL=/data/hifi.db
 EXPOSE 8000
 VOLUME ["/data"]
-CMD ["./hifi-api"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+    CMD curl --fail --silent --show-error "http://127.0.0.1:${PORT:-8000}/health" > /dev/null || exit 1
+
+CMD ["hifi-api"]

@@ -78,7 +78,7 @@ impl TidalClient {
         params: Option<Vec<(&str, &str)>>,
         preferred_account: Option<Arc<AccountState>>,
     ) -> Result<Value, AppError> {
-        let max_retries = if self.config.use_proxies {
+        let max_retries = if self.proxy_manager.proxies_enabled() {
             self.config.max_retries
         } else {
             1

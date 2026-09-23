@@ -120,27 +120,35 @@ Docker-based deployment is supported via `vercel.json` / `netlify.toml`. Note th
 ### Docker (any host)
 
 ```bash
-docker build -t hifi-api .
-docker run -d -p 8000:8000 \
-  -v hifi-data:/data \
-  -e DATABASE_URL=/data/hifi.db \
-  -e ADMIN_KEY=changeme \
-  -e AUTO_SETUP=true \
-  hifi-api
+cp .env.example .env
+# Set a strong ADMIN_KEY in .env before starting.
+docker compose up -d --build
+docker compose ps
 ```
+
+Open `http://127.0.0.1:8000/admin`. The base Compose file binds only to localhost and keeps SQLite data in the `hifi_data` volume. `token.json` is no longer mounted automatically; use the admin OAuth flow or the credential import screen to add accounts.
+
+For a production reverse proxy, create a shared Docker network named `proxy` on that host and explicitly add the override:
+
+```bash
+docker network create proxy
+docker compose -f docker-compose.yml -f docker-compose.proxy.yml up -d --build
+```
+
+The proxy override is not loaded by the normal `docker compose up` command. The reverse proxy can reach the app at `web:8000` on the shared network. Keep `ADMIN_KEY` set and terminate TLS at the reverse proxy.
 
 ### Admin Panel
 
-Access at `/admin`. If `ADMIN_KEY` is set, include the header `X-Admin-Key: <your_key>`. When empty, the panel is open.
+Access at `/admin`. The sign-in screen verifies `ADMIN_KEY` on the server and creates a 30-day HttpOnly cookie session. Signing out clears the cookie. When `ADMIN_KEY` is empty, the panel is open.
 
 | Section | What it does |
 |---|---|
 | Live request log | Terminal-style tail of recent requests (method, path, song ID, status, latency, client IP) with totals, error count, p50/p95, per-endpoint hits and top tracks |
-| Accounts | Numbered cards with credentials, user ID, stats, `CATALOG` badge for metadata-only accounts, Test/Refresh/Edit/Duplicate/Catalog/ON-OFF/Delete; **Add via OAuth** asks for an optional label in the modal |
+| Accounts | Searchable account cards with status and usage, plus Test/Refresh/Edit/Duplicate/Catalog/ON-OFF/Delete actions; **Add via OAuth** asks for an optional label in the modal |
 | Import / Export | Download all credentials as `credentials.json` (catalog accounts carry `role: "catalog"`), or restore from one (duplicates skipped by refresh token; upstream `token.json` shape accepted) |
 | API Keys | Per-client keys (`X-API-Key`) with quotas. While none exists the API stays open; creating the first key locks public routes behind a key (owner `X-Admin-Key` bypasses) |
 | Settings | Atmos default + auto-heal toggle — applied live, persisted to DB |
-| Proxies | Status of the proxy pool (active proxy, pool size, failures). Configure via `USE_PROXIES`/`PROXIES_FILE` + restart |
+| Proxies | Edit the proxy list and switch outbound proxy routing on or off without a restart. With SQLite enabled, the choice persists across restarts; `USE_PROXIES`/`PROXIES_FILE` provide initial defaults. |
 | Alerts | Discord webhook status + test button (fires on account 403 and all-accounts-down); on-demand Status and Accounts-roster reports (accounts shown as `TIDAL-1…N`, never real names) |
 | Cache | Metadata cache hits/misses + clear button |
 | Backup / Restore | Download a `hifi.db` snapshot, or restore from one (validated, applied live, no restart) |

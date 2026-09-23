@@ -1,0 +1,13 @@
+# Production-only override. Apply explicitly with:
+# docker compose -f docker-compose.yml -f docker-compose.proxy.yml up -d
+# The external "proxy" network must already exist on the production host.
+services:
+  web:
+    networks:
+      - default
+      - proxy
+
+networks:
+  proxy:
+    external: true
+    name: proxy

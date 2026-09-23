@@ -89,8 +89,22 @@ async fn main() {
     // when USE_PROXIES=true). The initial proxy resolve runs in the background
     // so startup is never blocked on proxy tests.
     let proxy_manager = Arc::new(proxy_manager::ProxyManager::new(config.clone()));
+    if let Some(pool) = &db {
+        let saved_enabled = sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = 'proxy_enabled'")
+            .fetch_optional(pool).await.ok().flatten();
+        let saved_entries = sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = 'proxy_urls'")
+            .fetch_optional(pool).await.ok().flatten();
+        if saved_enabled.is_some() || saved_entries.is_some() {
+            let enabled = saved_enabled.as_deref().map(|v| v == "true").unwrap_or(config.use_proxies);
+            let entries = saved_entries
+                .and_then(|v| serde_json::from_str::<Vec<String>>(&v).ok())
+                .unwrap_or(proxy_manager.entries().await);
+            if let Err(e) = proxy_manager.configure(enabled, entries).await {
+                tracing::warn!("Saved proxy configuration ignored: {e}");
+            }
+        }
+    }
     proxy_manager.spawn_initial_resolve();
-    let http_client = Arc::new(proxy_manager.client());
 
     let switching_weights = SwitchingWeights::default();
     let settings = Arc::new(settings::AppSettings::from_env());
@@ -189,9 +203,13 @@ async fn main() {
         if std::env::var("AUTO_SETUP").unwrap_or_default() == "true" {
             tracing::info!("AUTO_SETUP=true: Starting OAuth setup in background...");
             let am = account_manager.clone();
-            let hc = http_client.clone();
+            let pm = proxy_manager.clone();
             tokio::spawn(async move {
-                if let Err(e) = setup::run_setup(&am, hc.as_ref()).await {
+                let result = match pm.working_client().await {
+                    Ok(client) => setup::run_setup(&am, &client).await,
+                    Err(e) => Err(e),
+                };
+                if let Err(e) = result {
                     tracing::warn!("Auto-setup failed: {}. Add accounts via admin panel or env vars.", e);
                 }
             });
@@ -315,8 +333,10 @@ async fn main() {
             "/playback/requests/{request_id}",
             get(playback::get_playback_request).delete(playback::cancel_playback_request),
         )
-        // Admin SPA (no auth — the SPA handles auth in-browser)
+        // Admin page and session endpoints (data routes below require authentication).
         .route("/admin", get(crate::admin::ui::admin_index))
+        .route("/admin/login", post(crate::admin::login))
+        .route("/admin/logout", post(crate::admin::logout))
         // Admin API routes (auth-protected)
         .nest("/admin", admin_api(state.clone()))
         // Innermost: response cache.
@@ -459,7 +479,7 @@ fn admin_api(state: AppState) -> Router<AppState> {    Router::new()
         .route("/accounts/{id}/test", post(crate::admin::accounts::test_account))
         .route("/accounts/{id}/refresh", post(crate::admin::accounts::refresh_account_token))
         .route("/stats", get(crate::admin::stats::get_stats))
-        .route("/proxies", get(crate::admin::proxies::proxy_status))
+        .route("/proxies", get(crate::admin::proxies::proxy_status).put(crate::admin::proxies::update_proxies))
         .route("/alerts", get(crate::admin::alerts::alert_status))
         .route("/alerts/test", post(crate::admin::alerts::alert_test))
         .route("/alerts/report", post(crate::admin::alerts::alert_report))
