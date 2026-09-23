@@ -135,7 +135,7 @@ docker network create proxy
 docker compose -f docker-compose.yml -f docker-compose.proxy.yml up -d --build
 ```
 
-The proxy override is not loaded by the normal `docker compose up` command. The reverse proxy can reach the app at `web:8000` on the shared network. Keep `ADMIN_KEY` set and terminate TLS at the reverse proxy.
+The proxy override is not loaded by the normal `docker compose up` command. It removes the host port mapping, so port 8000 can be used by another service on the host. Connect Nginx Proxy Manager to the `proxy` network and set its upstream hostname to `hifi-api-rust` and port to `8000`. Keep `ADMIN_KEY` set and terminate TLS at the reverse proxy.
 
 ### Admin Panel
 

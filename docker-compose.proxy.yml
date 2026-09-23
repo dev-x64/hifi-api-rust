@@ -3,6 +3,7 @@
 # The external "proxy" network must already exist on the production host.
 services:
   web:
+    ports: !reset []
     networks:
       - default
       - proxy
