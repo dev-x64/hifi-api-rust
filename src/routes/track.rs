@@ -1,6 +1,7 @@
 use axum::extract::{Path, Query, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
+use axum::Json;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -16,20 +17,125 @@ pub struct TrackParams {
     pub immersiveaudio: bool,
 }
 
+#[derive(Deserialize)]
+pub struct TrackPathParams {
+    #[serde(default = "default_quality")]
+    pub quality: String,
+    #[serde(default)]
+    pub immersiveaudio: bool,
+}
+
+#[derive(Deserialize)]
+pub struct TrackQualityPathParams {
+    #[serde(default)]
+    pub immersiveaudio: bool,
+}
+
 fn default_quality() -> String {
-    "HI_RES_LOSSLESS".to_string()
+    "HIGH".to_string()
 }
 
 pub async fn get_track(
     State(state): State<AppState>,
     Query(params): Query<TrackParams>,
+    headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    let op = crate::playback::PlaybackOp::Track {
-        id: params.id,
-        quality: params.quality,
-        immersive: params.immersiveaudio,
+    dispatch_track(&state, params.id, &params.quality, params.immersiveaudio, &headers).await
+}
+
+pub async fn get_track_path(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Query(params): Query<TrackPathParams>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    dispatch_track(&state, id, &params.quality, params.immersiveaudio, &headers).await
+}
+
+pub async fn get_track_quality_path(
+    State(state): State<AppState>,
+    Path((id, quality)): Path<(i64, String)>,
+    Query(params): Query<TrackQualityPathParams>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    dispatch_track(&state, id, &quality, params.immersiveaudio, &headers).await
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum TrackFormat {
+    High,
+    V2(&'static str),
+}
+
+/// v1 serves HIGH; all other supported qualities use one exact v2 format.
+fn track_format(quality: &str) -> Option<TrackFormat> {
+    match quality.trim().to_ascii_uppercase().as_str() {
+        "HIGH" => Some(TrackFormat::High),
+        "LOW" | "HEAACV1" => Some(TrackFormat::V2("HEAACV1")),
+        "AACLC" => Some(TrackFormat::V2("AACLC")),
+        "LOSSLESS" | "FLAC" => Some(TrackFormat::V2("FLAC")),
+        "HI_RES_LOSSLESS" | "FLAC_HIRES" => Some(TrackFormat::V2("FLAC_HIRES")),
+        "DOLBY_ATMOS" | "ATMOS" | "EAC3_JOC" => Some(TrackFormat::V2("EAC3_JOC")),
+        _ => None,
+    }
+}
+
+fn unsupported_quality_info(id: i64, quality: &str) -> Value {
+    json!({
+        "status": "unsupported_quality",
+        "trackId": id,
+        "requestedQuality": quality,
+        "defaultQuality": "HIGH",
+        "supportedQualities": [
+            {"quality": "HIGH", "api": "v1", "format": "AAC", "bitrate": "up to 320 kbps"},
+            {"quality": "LOW", "aliases": ["HEAACV1"], "api": "v2", "format": "HEAACV1"},
+            {"quality": "AACLC", "api": "v2", "format": "AACLC"},
+            {"quality": "LOSSLESS", "aliases": ["FLAC"], "api": "v2", "format": "FLAC"},
+            {"quality": "HI_RES_LOSSLESS", "aliases": ["FLAC_HIRES"], "api": "v2", "format": "FLAC_HIRES"},
+            {"quality": "DOLBY_ATMOS", "aliases": ["ATMOS", "EAC3_JOC"], "api": "v2", "format": "EAC3_JOC"}
+        ]
+    })
+}
+
+fn unsupported_quality_response(id: i64, quality: &str) -> Response {
+    Json(unsupported_quality_info(id, quality)).into_response()
+}
+
+async fn dispatch_track(
+    state: &AppState,
+    id: i64,
+    quality: &str,
+    immersive: bool,
+    headers: &HeaderMap,
+) -> Result<Response, AppError> {
+    let Some(format) = track_format(quality) else {
+        return Ok(unsupported_quality_response(id, quality));
     };
-    state.playback.dispatch(&state, op).await
+    let op = match format {
+        TrackFormat::High => crate::playback::PlaybackOp::Track {
+            id,
+            quality: "HIGH".into(),
+            immersive,
+        },
+        TrackFormat::V2(format) => crate::playback::PlaybackOp::Manifest {
+            track_id: id.to_string(),
+            params: TrackManifestsParams {
+                adaptive: default_adaptive(),
+                manifestType: default_manifest_type(),
+                uriScheme: default_uri_scheme(),
+                usage: default_usage(),
+                countryCode: None,
+                atmos: None,
+            },
+            raw_query: Some(format!("formats={}", format)),
+            host: headers
+                .get("host")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("localhost")
+                .to_string(),
+        },
+    };
+    state.playback.dispatch(state, op).await
 }
 
 /// Core /track/ fetch (shared by immediate and queued execution).
@@ -248,6 +354,51 @@ pub(crate) fn atmos_default_on(state: &AppState) -> bool {
         .unwrap_or(false)
 }
 
+fn high_default_on(state: &AppState) -> bool {
+    state
+        .settings
+        .atmos_mode
+        .read()
+        .map(|m| m.as_str() == "high")
+        .unwrap_or(false)
+}
+
+fn use_high_for_dash(atmos: Option<&str>, high_default: bool) -> bool {
+    high_default
+        && !matches!(
+            atmos.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+            Some("true" | "1" | "prefer" | "only")
+        )
+}
+
+fn high_audio_uri(result: &Value) -> Result<String, AppError> {
+    if result.pointer("/data/audioQuality").and_then(Value::as_str) != Some("HIGH") {
+        return Err(AppError::ServiceUnavailable(
+            "Tidal did not return HIGH audio".into(),
+        ));
+    }
+    let manifest = result
+        .pointer("/data/manifest")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AppError::Internal("No v1 audio manifest in response".into()))?;
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(manifest)
+        .map_err(|_| AppError::Internal("Invalid v1 audio manifest encoding".into()))?;
+    let decoded: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| AppError::Internal("Invalid v1 audio manifest JSON".into()))?;
+    let uri = decoded
+        .pointer("/urls/0")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AppError::Internal("No URL in v1 audio manifest".into()))?;
+    let parsed = reqwest::Url::parse(uri)
+        .map_err(|_| AppError::Internal("Invalid URL in v1 audio manifest".into()))?;
+    if parsed.scheme() != "https" || parsed.host_str().is_none() {
+        return Err(AppError::Internal("Invalid URL in v1 audio manifest".into()));
+    }
+    Ok(uri.to_string())
+}
+
 /// True when the Tidal manifest actually carries a Dolby Atmos rendition.
 fn manifest_has_atmos(result: &Value) -> bool {
     let attrs = result.pointer("/data/data/attributes");
@@ -438,7 +589,71 @@ pub async fn get_track_manifests_query(
 
 #[cfg(test)]
 mod tests {
-    use super::{manifest_matches_track, manifest_track_id, resolve_formats};
+    use super::{
+        default_quality, high_audio_uri, manifest_matches_track, manifest_track_id,
+        resolve_formats, track_format, unsupported_quality_info,
+        unsupported_quality_response, use_high_for_dash, TrackFormat,
+    };
+    use axum::http::StatusCode;
+    use base64::Engine as _;
+    use serde_json::json;
+
+    #[test]
+    fn track_quality_selects_v1_or_exact_v2_format() {
+        assert_eq!(default_quality(), "HIGH");
+        assert_eq!(track_format(" high "), Some(TrackFormat::High));
+        assert_eq!(track_format("LOW"), Some(TrackFormat::V2("HEAACV1")));
+        assert_eq!(track_format("AACLC"), Some(TrackFormat::V2("AACLC")));
+        assert_eq!(track_format("LOSSLESS"), Some(TrackFormat::V2("FLAC")));
+        assert_eq!(track_format("HI_RES_LOSSLESS"), Some(TrackFormat::V2("FLAC_HIRES")));
+        assert_eq!(track_format("DOLBY_ATMOS"), Some(TrackFormat::V2("EAC3_JOC")));
+        assert_eq!(track_format("unknown"), None);
+    }
+
+    #[test]
+    fn unsupported_track_quality_returns_supported_formats() {
+        assert_eq!(
+            unsupported_quality_response(1781887, "WAV").status(),
+            StatusCode::OK
+        );
+        let info = unsupported_quality_info(1781887, "WAV");
+        assert_eq!(info["status"], "unsupported_quality");
+        assert_eq!(info["trackId"], 1781887);
+        assert_eq!(info["requestedQuality"], "WAV");
+        assert_eq!(info["defaultQuality"], "HIGH");
+        assert_eq!(info["supportedQualities"][0]["quality"], "HIGH");
+        assert_eq!(info["supportedQualities"][4]["format"], "FLAC_HIRES");
+    }
+
+    #[test]
+    fn requested_track_format_overrides_atmos_default() {
+        assert_eq!(
+            resolve_formats(Some("formats=FLAC_HIRES"), None, true),
+            vec!["FLAC_HIRES".to_string()]
+        );
+    }
+
+    #[test]
+    fn high_dash_uses_v1_unless_atmos_is_requested() {
+        assert!(use_high_for_dash(None, true));
+        assert!(use_high_for_dash(Some("off"), true));
+        assert!(!use_high_for_dash(Some("prefer"), true));
+        assert!(!use_high_for_dash(Some("only"), true));
+        assert!(!use_high_for_dash(None, false));
+    }
+
+    #[test]
+    fn high_manifest_requires_high_quality_and_direct_url() {
+        let manifest = base64::engine::general_purpose::STANDARD
+            .encode(r#"{"mimeType":"audio/mp4","urls":["https://example.com/audio.mp4"]}"#);
+        let result = json!({"data": {"audioQuality": "HIGH", "manifest": manifest}});
+        assert_eq!(
+            high_audio_uri(&result).unwrap(),
+            "https://example.com/audio.mp4"
+        );
+        let lower = json!({"data": {"audioQuality": "LOW", "manifest": manifest}});
+        assert!(high_audio_uri(&lower).is_err());
+    }
 
     #[test]
     fn atmos_only_forces_single_format() {
@@ -540,12 +755,21 @@ pub async fn get_dash_stream(
     state.playback.dispatch(&state, op).await
 }
 
-/// Core /dash/ fetch returning the manifest URI (shared by queued execution).
+/// Core /dash/ fetch returning a DASH manifest or direct AAC URI.
 pub(crate) async fn fetch_dash_uri(
     state: &AppState,
     track_id: &str,
     atmos: Option<&str>,
 ) -> Result<String, AppError> {
+    // HIGH is a direct AAC file from v1. No v2 request is needed when the
+    // server preference is HIGH and the caller did not request Atmos.
+    if use_high_for_dash(atmos, high_default_on(state)) {
+        let id = track_id
+            .parse::<i64>()
+            .map_err(|_| AppError::BadRequest("Invalid track id".into()))?;
+        let result = fetch_track_playback(state, id, "HIGH", false).await?;
+        return high_audio_uri(&result);
+    }
     let url = format!("https://openapi.tidal.com/v2/trackManifests/{}", track_id);
 
     // Same Atmos semantics as /trackManifests, over the fixed /dash chain.

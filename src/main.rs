@@ -311,6 +311,8 @@ async fn main() {
         .route("/", get(index))
         .route("/info/", get(routes::info::get_info))
         .route("/track/", get(routes::track::get_track))
+        .route("/track/{id}", get(routes::track::get_track_path))
+        .route("/track/{id}/{quality}", get(routes::track::get_track_quality_path))
         .route("/trackManifests/{id}", get(routes::track::get_track_manifests))
         .route("/trackManifests", get(routes::track::get_track_manifests_query))
         .route("/trackManifests/", get(routes::track::get_track_manifests_query))

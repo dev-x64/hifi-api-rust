@@ -7,11 +7,12 @@ use sqlx::SqlitePool;
 use crate::upstash::UpstashStore;
 
 /// Non-throttling server preferences (persisted, editable in admin panel).
-/// All request throttling has been removed — this keeps only Atmos default
-/// and the auto-heal toggle.
+/// All request throttling has been removed — this keeps only playback format
+/// preference and the auto-heal toggle.
 pub struct AppSettings {
     pub auto_heal: AtomicBool,
-    /// off | prefer — query param `atmos=` overrides per request.
+    /// off (FLAC) | prefer (Atmos) | high (AAC 320 kbps).
+    /// Query param `atmos=` overrides per request.
     pub atmos_mode: RwLock<String>,
     /// Shared cross-instance state (None = single-host mode, skip sync).
     upstash: OnceLock<std::sync::Arc<UpstashStore>>,
@@ -201,6 +202,7 @@ fn env_bool(key: &str, default: bool) -> bool {
 fn normalize_atmos_mode(s: &str) -> String {
     match s.trim().to_lowercase().as_str() {
         "prefer" => "prefer".to_string(),
+        "high" => "high".to_string(),
         _ => "off".to_string(),
     }
 }
@@ -253,6 +255,7 @@ mod tests {
     fn atmos_explicit_values_honored() {
         assert_eq!(normalize_atmos_mode("prefer"), "prefer");
         assert_eq!(normalize_atmos_mode("off"), "off");
+        assert_eq!(normalize_atmos_mode("HIGH"), "high");
         assert_eq!(normalize_atmos_mode("banana"), "off");
     }
 

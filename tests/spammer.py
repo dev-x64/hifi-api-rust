@@ -9,7 +9,7 @@ import httpx
 from collections import deque
 
 # Configuration
-URL = "http://localhost:8001/track/?id=194567102&quality=HI_RES_LOSSLESS"  # Default URL
+URL = "http://localhost:8001/track/?id=194567102&quality=HI_RES_LOSSLESS"  # Explicit hi-res v2 request
 
 async def make_request(client, url, stats):
     try:
