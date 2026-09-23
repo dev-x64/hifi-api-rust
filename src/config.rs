@@ -138,7 +138,7 @@ impl Config {
             fallback_to_direct,
             max_retries,
             discord_webhook_url,
-            api_version: "2.10".into(),
+            api_version: env!("CARGO_PKG_VERSION").into(),
             user_agent,
             dev_mode,
             rotate_proxies_on_refresh,

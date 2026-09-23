@@ -44,6 +44,16 @@ The server listens on `0.0.0.0:8000` by default; use `HOST` and `PORT` to change
 
 You may instead provide `CLIENT_ID`, `REFRESH_TOKEN`, and optionally `CLIENT_SECRET` and `USER_ID` in `.env`. When the database has no playback accounts, these values create a default account. Keep refresh tokens and `ADMIN_KEY` out of version control.
 
+### Changing the version
+
+Set the version in `Cargo.toml` under `[package]`. Cargo updates the generated `Cargo.lock` when you build or run `cargo check`:
+
+```bash
+cargo check
+```
+
+Commit `Cargo.toml` and the updated `Cargo.lock` together. The API response, startup log, and admin panel read the package version from `Cargo.toml` at compile time. Docker also updates the lockfile during its build, but that copy stays inside the build container.
+
 ## Configuration
 
 Copy [`.env.example`](.env.example) for the full list. Values saved in the admin panel can override initial environment defaults where noted.

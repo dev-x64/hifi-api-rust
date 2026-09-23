@@ -97,7 +97,7 @@ Response shape:
 
 ```json
 {
-  "version": "2.10",
+  "version": "<package version>",
   "data": {
     "data": {
       "id": "1781887",

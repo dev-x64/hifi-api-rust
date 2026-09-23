@@ -1,7 +1,9 @@
 use axum::response::Html;
+use std::sync::OnceLock;
 
 pub async fn admin_index() -> Html<&'static str> {
-    Html(ADMIN_HTML)
+    static HTML: OnceLock<String> = OnceLock::new();
+    Html(HTML.get_or_init(|| ADMIN_HTML.replace("__HIFI_VERSION__", env!("CARGO_PKG_VERSION"))))
 }
 
 const ADMIN_HTML: &str = r#"<!DOCTYPE html>
@@ -326,11 +328,11 @@ button:focus-visible,input:focus-visible,select:focus-visible { outline:2px soli
   <div class="sidebar-bottom"><div class="admin-user"><span class="admin-avatar">AD</span><span><strong style="display:block;font-size:12px">Администратор</strong><span style="color:var(--green);font-size:10px">● Сессия активна</span></span></div><button class="logout-btn" onclick="logout()">Выйти из панели</button></div>
 </aside>
 
-<div class="mobile-bar"><button class="btn icon-btn btn-quiet" onclick="toggleSidebar(true)" aria-label="Открыть меню">☰</button><strong>HiFi API</strong><span id="mobileVersion" style="font-size:11px;color:var(--muted)">v2.10</span></div>
+<div class="mobile-bar"><button class="btn icon-btn btn-quiet" onclick="toggleSidebar(true)" aria-label="Открыть меню">☰</button><strong>HiFi API</strong><span id="mobileVersion" style="font-size:11px;color:var(--muted)">v__HIFI_VERSION__</span></div>
 <main class="workspace"><div class="container">
   <header class="header">
     <div><div class="page-kicker" id="pageKicker">Состояние сервиса</div><h1 id="pageTitle">Обзор</h1><p class="page-subtitle" id="pageSubtitle">Главные показатели и последние запросы в одном месте.</p></div>
-    <div class="header-actions"><button class="btn" onclick="refreshCurrentView()">Обновить</button><button class="btn btn-primary mobile-keep" onclick="showView('accounts');openAddAccount()">+ Аккаунт</button><span class="badge" id="version">v2.10</span></div>
+    <div class="header-actions"><button class="btn" onclick="refreshCurrentView()">Обновить</button><button class="btn btn-primary mobile-keep" onclick="showView('accounts');openAddAccount()">+ Аккаунт</button><span class="badge" id="version">v__HIFI_VERSION__</span></div>
   </header>
   <div id="error" class="error"></div><div id="success" class="success"></div>
 
