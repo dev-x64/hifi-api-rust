@@ -354,7 +354,7 @@ button:focus-visible,input:focus-visible,select:focus-visible { outline:2px soli
   <section id="view-access" class="view">
     <div class="section-head"><div><h2>Ключи доступа</h2><p>Контролируйте клиентов API и их квоты.</p></div></div>
     <div class="form-section">
-      <h3>Новый API-ключ</h3><p class="form-copy">После создания ключ показывается только один раз. Квота 0 означает неограниченный доступ.</p>
+      <h3>Новый API-ключ</h3><p class="form-copy">Квота — общее число запросов с этим ключом ко всем маршрутам API (включая поиск и получение трека), без ежедневного сброса. 0 — без лимита. После создания ключ показывается только один раз.</p>
       <div class="form-row"><div class="form-group"><label>Название</label><input type="text" id="new-key-label" placeholder="Например, мобильное приложение"></div><div class="form-group"><label>Квота запросов</label><input type="number" id="new-key-quota" min="0" placeholder="0"></div></div>
       <button class="btn btn-primary" onclick="addApiKey()">Создать ключ</button><div id="keyResult" style="font-size:12px;margin-top:12px;color:var(--green);word-break:break-all"></div>
     </div>

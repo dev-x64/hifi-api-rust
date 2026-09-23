@@ -14,13 +14,20 @@ use crate::AppState;
 
 const MAX_ENTRIES: usize = 5000;
 
+fn should_log_path(path: &str) -> bool {
+    path != "/admin"
+        && !path.starts_with("/admin/")
+        && path != "/health"
+        && path != "/favicon.ico"
+}
+
 #[derive(Clone)]
 pub struct LogEntry {
     pub ts: i64,
     pub method: String,
     pub path: String,
     /// Track/resource identifier when the request names one
-    /// (path id for /trackManifests/{id} and /dash/{id},
+    /// (path id for /track/{id}, /trackManifests/{id}, and /dash/{id},
     /// `id=` or `s=` query value otherwise). Empty when none.
     pub detail: String,
     pub status: u16,
@@ -146,11 +153,13 @@ pub fn normalize_path(path: &str) -> String {
 
 /// Pull the song/resource identifier out of a request so the log shows
 /// *what* was requested, not just the endpoint shape:
-/// path id for /trackManifests/{id} and /dash/{id}, else the `id=` query
-/// value, else the search text (`s=`). Truncated to 64 chars.
+/// path id for /track/{id}, /trackManifests/{id}, and /dash/{id}; otherwise
+/// the `id=` query value or search text (`s=`). Truncated to 64 chars.
 fn extract_detail(path: &str, query: Option<&str>) -> String {
     let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    if segs.len() >= 2 && (segs[0] == "trackManifests" || segs[0] == "dash") {
+    if segs.len() >= 2
+        && (segs[0] == "track" || segs[0] == "trackManifests" || segs[0] == "dash")
+    {
         return segs[1].chars().take(64).collect();
     }
     if let Some(q) = query {
@@ -178,8 +187,13 @@ pub async fn log_requests(
     req: Request<Body>,
     next: Next,
 ) -> Response {
+    let raw_path = req.uri().path();
+    if !should_log_path(raw_path) {
+        return next.run(req).await;
+    }
+
     let method = req.method().to_string();
-    let raw_path = req.uri().path().to_string();
+    let raw_path = raw_path.to_string();
     let path = normalize_path(&raw_path);
     let detail = extract_detail(&raw_path, req.uri().query());
     let ip = client_ip(&state, &req, addr);
@@ -199,6 +213,30 @@ pub async fn log_requests(
     });
 
     resp
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_log_path;
+
+    #[test]
+    fn excludes_panel_and_service_requests() {
+        for path in [
+            "/admin",
+            "/admin/",
+            "/admin/stats",
+            "/admin/requests",
+            "/admin/accounts",
+            "/health",
+            "/favicon.ico",
+        ] {
+            assert!(!should_log_path(path), "{path}");
+        }
+
+        for path in ["/trackManifests/123", "/search/", "/administrator", "/healthcheck"] {
+            assert!(should_log_path(path), "{path}");
+        }
+    }
 }
 
 pub(crate) fn client_ip(state: &AppState, req: &Request<Body>, fallback: SocketAddr) -> IpAddr {
