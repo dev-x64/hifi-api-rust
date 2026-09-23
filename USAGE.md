@@ -1,8 +1,8 @@
-# USAGE — Getting High-Quality Tidal URLs
+# USAGE — Getting Tidal playback URLs
 
-> Draft — documents how to obtain playable, high-quality audio URLs from a running
-> `hifi-api` instance (default `http://localhost:8000`), including lossless FLAC,
-> 24-bit hi-res, and Dolby Atmos streams.
+These examples use a running `hifi-api` instance at `http://localhost:8000`.
+The format you receive depends on the selected playback mode, the track, and
+the configured Tidal account.
 
 ---
 
@@ -13,13 +13,12 @@ track's availability and your account/client entitlement:
 
 | Tier | Format | Typical specs | Notes |
 |---|---|---|---|
-| `HIGH` | AAC (`mp4a.40.2`) | 320 kbps | The fallback. The v1 API often caps even entitled accounts here. |
+| `HIGH` | AAC (`mp4a.40.2`) | Up to 320 kbps | Available through the v1 playback endpoint. |
 | `LOSSLESS` / `FLAC` | FLAC-in-fMP4 | 16-bit / 44.1 kHz | CD quality. |
 | `FLAC_HIRES` | FLAC-in-fMP4 | 24-bit / 96–192 kHz (e.g. 176.4 kHz) | Only on tracks tagged `HIRES_LOSSLESS`; client must be entitled. |
 | `EAC3_JOC` | E-AC-3 (Dolby Atmos) | 48 kHz, 5.1/7.1 bed + JOC objects | Only on tracks tagged `DOLBY_ATMOS`; client must be entitled. |
 
-Tidal silently drops formats you aren't entitled to when multiple are requested,
-and returns `403 CLIENT_NOT_ENTITLED` if you request only unentitled ones.
+Tidal decides which requested formats are available to a given account and track.
 
 ---
 
@@ -30,60 +29,51 @@ curl -s "http://localhost:8000/search/?s=Billie%20Jean" | \
   python3 -c "import json,sys; [print(i['id'], i['title'], '-', i['artist']['name']) for i in json.load(sys.stdin)['data']['items'][:5]]"
 ```
 
-```
-1781887 Billie Jean - Michael Jackson            (Thriller 1982 — HIRES)
-522737219 Billie Jean - Michael Jackson          (2022 Atmos release — DOLBY_ATMOS)
-```
-
-Search results also expose `mediaMetadata.tags`, which tell you the highest tier
-the track supports (`LOSSLESS`, `HIRES_LOSSLESS`, `DOLBY_ATMOS`).
+Use an ID returned by your own search in the playback examples below. Search
+results may also include `mediaMetadata.tags` such as `LOSSLESS`,
+`HIRES_LOSSLESS`, or `DOLBY_ATMOS`.
 
 ---
 
-## 3. Method A — `/dash/{id}` (recommended, highest quality)
+## 3. `/dash/{id}` — redirect to the selected format
 
-Returns a **302 redirect** to a fresh Tidal DASH manifest, requesting
-`FLAC_HIRES,FLAC,EAC3_JOC,AACLC` in that priority order:
+`/dash/{id}` returns a **307 redirect**. Its target depends on the playback
+setting in the admin panel:
 
-```bash
-curl -s -D - -o /dev/null "http://localhost:8000/dash/1781887"
-```
+| Setting | Upstream request | Redirect target |
+|---|---|---|
+| `HIGH · AAC 320 kbps` | v1 `playbackinfo` with `audioquality=HIGH` | Direct AAC/MP4 URL. v2 is not called. |
+| FLAC priority | v2 `trackManifests` | DASH `.mpd` URL, with FLAC formats first. |
+| Atmos priority | v2 `trackManifests` | DASH `.mpd` URL, with Atmos first. |
 
-```http
-HTTP/1.1 307 Temporary Redirect
-location: https://im-fa.manifest.tidal.com/1/manifests/EgcxNzgxODg3GAI...mpd?token=...
-```
-
-The MPD contains one `Representation` per entitled format. For Billie Jean:
-
-```
-Representation id="FLAC_HIRES,176400,24"  codecs="flac"  bandwidth="5962169"  24-bit / 176.4 kHz
-Representation id="FLAC,44100,16"         codecs="flac"  bandwidth="893519"   16-bit / 44.1 kHz
-```
-
-Paste the redirect target (or the `/dash/{id}` URL itself — players follow
-redirects) into any DASH-capable player:
+Inspect the redirect without downloading the target:
 
 ```bash
-mpv "http://localhost:8000/dash/1781887"        # picks FLAC_HIRES automatically
-ffplay "http://localhost:8000/dash/1781887"
+curl -sS -D - -o /dev/null "http://localhost:8000/dash/1781887"
 ```
 
-For the Atmos edition:
+In FLAC or Atmos mode, the target has an `.mpd` extension and the content type
+`application/dash+xml`. It is a text manifest, so opening `/dash/{id}` in a
+browser may download a text file. Play this URL with a DASH-capable player:
 
 ```bash
-mpv "http://localhost:8000/dash/522737219"      # E-AC-3 5.1 bed (JOC not rendered by mpv)
+mpv "http://localhost:8000/dash/1781887"
 ```
+
+Select `HIGH` in the admin panel to get a direct AAC/MP4 URL instead. With
+`HIGH` selected, `?atmos=prefer` or `?atmos=only` explicitly switches this
+request to v2; `?atmos=off` keeps the `HIGH` default. `/trackManifests/{id}`
+is always the raw v2 endpoint.
 
 ---
 
-## 4. Method B — `/trackManifests/{id}` (raw v2 API)
+## 4. `/trackManifests/{id}` — raw v2 JSON
 
 The underlying v2 endpoint, exposed directly. Useful when you need the full JSON
 (URI, hash, DRM data, normalization) rather than a redirect:
 
 ```bash
-curl -s "http://localhost:8000/trackManifests/1781887?formats=FLAC_HIRES,FLAC,AACLC" | \
+curl -s "http://localhost:8000/trackManifests/1781887?formats=FLAC_HIRES,FLAC,AACLC&atmos=off" | \
   python3 -m json.tool
 ```
 
@@ -91,11 +81,17 @@ Query parameters (all optional):
 
 | Param | Default | Notes |
 |---|---|---|
-| `formats` | `HEAACV1,AACLC,FLAC,FLAC_HIRES,EAC3_JOC` | Comma-separated. Unentitled ones are dropped. |
+| `formats` | `HEAACV1,AACLC,FLAC,FLAC_HIRES,EAC3_JOC` before Atmos preference | Comma-separated or repeated. |
+| `atmos` | Admin preference | `prefer` puts `EAC3_JOC` first; `only` requests only Atmos; `off` excludes Atmos from the default list. |
 | `adaptive` | `true` | Multi-format response. |
 | `manifestType` | `MPEG_DASH` | `MPEG_DASH` or `HLS`. |
 | `uriScheme` | `HTTPS` | `HTTPS` = manifest link, `DATA` = inline base64. |
 | `usage` | `PLAYBACK` | `PLAYBACK` or `DOWNLOAD`. |
+| `countryCode` | Server's configured country code | Overrides the server default for this request. |
+
+Explicit `formats` are kept as given unless `atmos=prefer` adds Atmos first or
+`atmos=only` replaces the list. `atmos=off` does not remove Atmos from an
+explicit format list.
 
 Response shape:
 
@@ -119,57 +115,98 @@ Response shape:
 
 ---
 
-## 5. Method C — `/track/{id}` (direct file, AAC only)
+## 5. `/track/{id}/{quality}` — quality selection
 
-The legacy v1 endpoint returns a **single direct MP4 file URL** (no DASH, no DRM):
+Put the quality in the path, for example `/track/1781887/HIGH` or
+`/track/1781887/LOSSLESS`. `/track/{id}` defaults to `HIGH`. The older
+`/track/{id}?quality=...` and `/track/?id=...&quality=...` forms still work.
+`HIGH` calls v1 `playbackinfo`; other supported qualities call v2
+`trackManifests` with only the corresponding format. These routes return JSON,
+with different v1 and v2 shapes, and do not redirect to audio.
+
+| `quality` | Upstream | Requested format |
+|---|---|---|
+| `HIGH` (default) | v1 | AAC, up to 320 kbps |
+| `LOW`, `HEAACV1` | v2 | `HEAACV1` |
+| `AACLC` | v2 | `AACLC` |
+| `LOSSLESS`, `FLAC` | v2 | `FLAC` |
+| `HI_RES_LOSSLESS`, `FLAC_HIRES` | v2 | `FLAC_HIRES` |
+| `DOLBY_ATMOS`, `ATMOS`, `EAC3_JOC` | v2 | `EAC3_JOC` |
+
+Unsupported quality values return `200 OK` with `status=unsupported_quality`,
+the requested value, and a `supportedQualities` list (names, aliases, formats,
+and v1/v2 source). This response does not call Tidal, so it does not claim
+which formats are available for that track. Quality names are case-insensitive.
+`immersiveaudio` applies only to the v1 `HIGH` request.
+If both path and query contain a quality, the path value is used.
 
 ```bash
-curl -s "http://localhost:8000/track/?id=1781887&quality=HI_RES_LOSSLESS" | \
+curl -s "http://localhost:8000/track/1781887/WAV" | python3 -m json.tool
+```
+
+For `HIGH`, decode the v1 base64 manifest to get its direct audio URL:
+
+```bash
+curl -s "http://localhost:8000/track/1781887/HIGH" | \
   python3 -c "
 import json, sys, base64
 d = json.load(sys.stdin)['data']
 m = json.loads(base64.b64decode(d['manifest']))
-print(d['audioQuality'])   # HIGH — see warning below
-print(m['urls'][0])        # direct .mp4 URL, token expires ~1h
+print(d['audioQuality'])   # quality actually returned by Tidal
+print(m['urls'][0])        # direct audio URL
 "
+
+# HIGH is also the default; legacy query form gives the same result
+curl -s "http://localhost:8000/track/1781887" | python3 -m json.tool
+curl -s "http://localhost:8000/track/?id=1781887" | python3 -m json.tool
 ```
 
-> ⚠️ **Warning:** Tidal currently caps v1 `playbackinfo` at `HIGH` (320 kbps AAC)
-> for most accounts/clients, regardless of the `quality` parameter. Use
-> Method A/B for lossless. The direct file is useful for players with no DASH
-> support (simple HTTP audio).
+For lossless, the v2 response instead contains a DASH manifest URI:
+
+```bash
+curl -s "http://localhost:8000/track/1781887/LOSSLESS" | \
+  python3 -c "import json,sys; print(json.load(sys.stdin)['data']['data']['attributes']['uri'])"
+```
+
+You can use `/track/1781887/HI_RES_LOSSLESS` or
+`/track/1781887/DOLBY_ATMOS` for their respective v2 formats. Tidal may reject
+a format that is unavailable for the track or account.
+
+If all playback slots are busy, these endpoints can return `202 Accepted` with
+a `Location: /playback/requests/{request_id}` header. Poll that URL until it
+returns the result before parsing the JSON or following a redirect.
 
 ---
 
 ## 6. Known limitations
 
-- **Entitlements are per client + track.** `403 CLIENT_NOT_ENTITLED` means the
-  configured Tidal client credentials can't access that tier for that track
-  (common for `FLAC_HIRES` on some tracks and for hi-res in general). Not fixable
-  in code.
-- **Tokens expire (~1 h).** Manifest and segment URLs embed expiring tokens.
-  Always re-request `/dash/{id}` or `/trackManifests/{id}` for a fresh URL —
-  don't cache the redirect target.
-- **Atmos rendering.** The `EAC3_JOC` stream's object metadata (JOC) is only
-  rendered by a Dolby Atmos renderer (e.g. Android TV via ExoPlayer). mpv/VLC
-  decode the E-AC-3 5.1/7.1 bed layer.
-- **High sample rates** (176.4/192 kHz) decode fine in ffmpeg-based players;
-  final output may be resampled by your sound server/DAC.
-- **DRM:** tracks whose manifest includes `drmData` (Widevine) require the
-  `/widevine` proxy + a DRM-capable player; the FLAC/hi-res/EAC3 streams in
-  Methods A–C are currently served unencrypted.
+- **Availability:** The track and account determine which formats Tidal returns.
+  A requested format may be unavailable or rejected.
+- **Expiring URLs:** Request a fresh `/dash/{id}`, `/trackManifests/{id}`, or
+  `/track/{id}` response before playback. Do not cache Tidal redirect targets
+  or direct audio URLs indefinitely.
+- **Atmos and DRM:** Atmos requires a compatible player. A manifest with
+  `drmData` requires a DRM-capable player and a license request through
+  `/widevine`.
 
 ---
 
 ## 7. Quick reference
 
 ```bash
-# Play highest quality of a track
+# Play using the format selected in the admin panel
 mpv "http://localhost:8000/dash/1781887"
 
-# Inspect available tiers of a track
-curl -s "http://localhost:8000/search/?s=Billie%20Jean" | grep -o '"tags":\[[^]]*\]'
+# HIGH via v1 (explicit path, default path, and legacy query forms)
+curl -s "http://localhost:8000/track/1781887/HIGH"
+curl -s "http://localhost:8000/track/1781887"
+curl -s "http://localhost:8000/track/?id=1781887"
+
+# FLAC via v2
+curl -s "http://localhost:8000/track/1781887/LOSSLESS"
 
 # Get the raw v2 manifest JSON
 curl -s "http://localhost:8000/trackManifests/1781887"
 ```
+
+If API keys are enabled, add `-H 'X-API-Key: YOUR_KEY'` to the `curl` commands.
