@@ -6,25 +6,27 @@ use chrono::Utc;
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
+use crate::settings::AppSettings;
+
 /// Discord-only ban/outage alerts. Empty webhook URL = disabled.
 /// Same-type alerts are throttled to at most one per 15 minutes.
 pub struct Notifier {
-    webhook_url: String,
+    settings: Arc<AppSettings>,
     client: reqwest::Client,
-    last_sent: Mutex<HashMap<String, i64>>,
+    last_sent: Mutex<HashMap<(String, String), i64>>,
 }
 
 const MIN_INTERVAL_SECS: i64 = 900;
 
 impl Notifier {
-    pub fn new(webhook_url: String) -> Arc<Self> {
-        if webhook_url.is_empty() {
-            tracing::info!("Discord alerts disabled (DISCORD_WEBHOOK_URL not set)");
+    pub fn new(settings: Arc<AppSettings>) -> Arc<Self> {
+        if settings.discord_webhook_url().is_empty() {
+            tracing::info!("Discord alerts disabled (webhook not configured)");
         } else {
             tracing::info!("Discord alerts enabled");
         }
         Arc::new(Self {
-            webhook_url,
+            settings,
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(10))
                 .build()
@@ -34,7 +36,62 @@ impl Notifier {
     }
 
     pub fn configured(&self) -> bool {
-        !self.webhook_url.is_empty()
+        !self.settings.discord_webhook_url().is_empty()
+    }
+
+    /// Only accept Discord webhook endpoints, never arbitrary outbound URLs.
+    pub fn validate_webhook_url(raw: &str) -> Result<String, String> {
+        let raw = raw.trim();
+        let url = reqwest::Url::parse(raw).map_err(|_| "Invalid Discord webhook URL".to_string())?;
+        let host = url.host_str().unwrap_or_default();
+        let host_allowed = matches!(
+            host,
+            "discord.com" | "discordapp.com" | "canary.discord.com" | "ptb.discord.com"
+        );
+        let path: Vec<_> = url
+            .path_segments()
+            .map(|segments| segments.collect())
+            .unwrap_or_default();
+        if url.scheme() != "https"
+            || !host_allowed
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.port().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+            || path.len() != 4
+            || path[0] != "api"
+            || path[1] != "webhooks"
+            || path[2].is_empty()
+            || path[3].is_empty()
+        {
+            return Err(
+                "Use a Discord HTTPS webhook URL (https://discord.com/api/webhooks/ID/TOKEN)"
+                    .into(),
+            );
+        }
+        Ok(url.to_string())
+    }
+
+    async fn send_to_discord(&self, url: &str, payload: Value) -> Result<(), String> {
+        let response = self
+            .client
+            .post(url)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| {
+                if e.is_timeout() {
+                    "Discord request timed out"
+                } else {
+                    "Could not reach Discord"
+                }
+                .to_string()
+            })?;
+        if !response.status().is_success() {
+            return Err(format!("Discord returned HTTP {}", response.status().as_u16()));
+        }
+        Ok(())
     }
 
     fn embed(title: &str, description: &str, color: u32, fields: Vec<Value>) -> Value {
@@ -51,27 +108,23 @@ impl Notifier {
     }
 
     async fn send_throttled(&self, kind: &str, payload: Value) {
-        if self.webhook_url.is_empty() {
+        let url = self.settings.discord_webhook_url();
+        if url.is_empty() {
             return;
         }
         {
             let mut last = self.last_sent.lock().await;
             let now = Utc::now().timestamp();
-            if let Some(&prev) = last.get(kind) {
+            let alert_key = (kind.to_string(), url.clone());
+            if let Some(&prev) = last.get(&alert_key) {
                 if now - prev < MIN_INTERVAL_SECS {
                     tracing::debug!("Discord alert '{}' throttled", kind);
                     return;
                 }
             }
-            last.insert(kind.to_string(), now);
+            last.insert(alert_key, now);
         }
-        if let Err(e) = self
-            .client
-            .post(&self.webhook_url)
-            .json(&payload)
-            .send()
-            .await
-        {
+        if let Err(e) = self.send_to_discord(&url, payload).await {
             tracing::warn!("Failed to send Discord alert: {}", e);
         }
     }
@@ -117,16 +170,11 @@ impl Notifier {
 
     /// Manual on-demand report from the admin panel (bypasses throttle).
     pub async fn send_report(&self, payload: Value) -> Result<(), String> {
-        if self.webhook_url.is_empty() {
-            return Err("DISCORD_WEBHOOK_URL is not set".into());
+        let url = self.settings.discord_webhook_url();
+        if url.is_empty() {
+            return Err("Discord webhook is not configured".into());
         }
-        self.client
-            .post(&self.webhook_url)
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|e| format!("Failed to send Discord report: {}", e))?;
-        Ok(())
+        self.send_to_discord(&url, payload).await
     }
 
     /// Overall health snapshot. All values pre-aggregated by the caller —
@@ -179,21 +227,35 @@ impl Notifier {
 
     /// Manual test from the admin panel (bypasses throttle).
     pub async fn send_test(&self) -> Result<(), String> {
-        if self.webhook_url.is_empty() {
-            return Err("DISCORD_WEBHOOK_URL is not set".into());
-        }
         let payload = Self::embed(
             "✅ Discord alerts working",
             "Test alert from the HiFi API admin panel. Ban and outage alerts will arrive as embeds like this one.",
             0x3FB950,
             vec![],
         );
-        self.client
-            .post(&self.webhook_url)
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|e| format!("Failed to send Discord alert: {}", e))?;
-        Ok(())
+        self.send_report(payload).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Notifier;
+
+    #[test]
+    fn accepts_only_discord_webhook_urls() {
+        assert!(
+            Notifier::validate_webhook_url("https://discord.com/api/webhooks/123/token").is_ok()
+        );
+        for url in [
+            "http://discord.com/api/webhooks/123/token",
+            "https://discord.com.evil.test/api/webhooks/123/token",
+            "https://user:pass@discord.com/api/webhooks/123/token",
+            "https://discord.com:444/api/webhooks/123/token",
+            "https://discord.com/api/webhooks/123",
+            "https://discord.com/api/webhooks/123/token?wait=true",
+            "https://127.0.0.1/api/webhooks/123/token",
+        ] {
+            assert!(Notifier::validate_webhook_url(url).is_err(), "{url}");
+        }
     }
 }

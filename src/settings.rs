@@ -6,14 +6,14 @@ use sqlx::SqlitePool;
 
 use crate::upstash::UpstashStore;
 
-/// Non-throttling server preferences (persisted, editable in admin panel).
-/// All request throttling has been removed — this keeps only playback format
-/// preference and the auto-heal toggle.
+/// Server preferences persisted in SQLite and optionally shared through Redis.
 pub struct AppSettings {
     pub auto_heal: AtomicBool,
     /// off (FLAC) | prefer (Atmos) | high (AAC 320 kbps).
     /// Query param `atmos=` overrides per request.
     pub atmos_mode: RwLock<String>,
+    /// Secret: never include this in API snapshots or logs.
+    discord_webhook_url: RwLock<String>,
     /// Shared cross-instance state (None = single-host mode, skip sync).
     upstash: OnceLock<std::sync::Arc<UpstashStore>>,
 }
@@ -23,6 +23,9 @@ impl AppSettings {
         Self {
             auto_heal: AtomicBool::new(env_bool("AUTO_HEAL", true)),
             atmos_mode: RwLock::new(default_atmos_mode()),
+            discord_webhook_url: RwLock::new(
+                std::env::var("DISCORD_WEBHOOK_URL").unwrap_or_default(),
+            ),
             upstash: OnceLock::new(),
         }
     }
@@ -43,6 +46,40 @@ impl AppSettings {
             "auto_heal": self.auto_heal.load(Ordering::Relaxed),
             "atmos_mode": self.atmos_mode.read().map(|v| v.clone()).unwrap_or_else(|_| "prefer".to_string()),
         })
+    }
+
+    pub fn discord_webhook_url(&self) -> String {
+        self.discord_webhook_url
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Persist first, then activate immediately. Empty string disables alerts.
+    pub async fn set_discord_webhook_url(
+        &self,
+        url: String,
+        db: Option<&SqlitePool>,
+    ) -> Result<(), sqlx::Error> {
+        if let Some(db) = db {
+            sqlx::query(
+                "INSERT INTO settings (key, value) VALUES ('discord_webhook_url', ?)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            )
+            .bind(&url)
+            .execute(db)
+            .await?;
+        }
+        *self
+            .discord_webhook_url
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = url.clone();
+        if let Some(store) = self.upstash() {
+            store
+                .set(&UpstashStore::k_settings("discord_webhook_url"), &url, None)
+                .await;
+        }
+        Ok(())
     }
 
     pub fn apply(&self, updates: &Value) -> Result<(), String> {
@@ -67,8 +104,16 @@ impl AppSettings {
                 return;
             }
         };
+        let mut found_webhook = false;
         for (key, value) in rows {
+            found_webhook |= key == "discord_webhook_url";
             self.apply_kv(&key, &value);
+        }
+        if !found_webhook {
+            self.apply_kv(
+                "discord_webhook_url",
+                &std::env::var("DISCORD_WEBHOOK_URL").unwrap_or_default(),
+            );
         }
     }
 
@@ -87,12 +132,19 @@ impl AppSettings {
                     *w = normalize_atmos_mode(value);
                 }
             }
+            "discord_webhook_url" => {
+                *self
+                    .discord_webhook_url
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner()) = value.to_string();
+            }
             _ => {}
         }
     }
 
     /// Setting names mirrored to Redis (same keys as the SQLite table).
-    const REDIS_SETTING_NAMES: &'static [&'static str] = &["auto_heal", "atmos_mode"];
+    const REDIS_SETTING_NAMES: &'static [&'static str] =
+        &["auto_heal", "atmos_mode", "discord_webhook_url"];
 
     /// Canonical (key, value) snapshot, shared by the SQLite and Redis writers.
     fn settings_entries(&self) -> Vec<(String, String)> {
@@ -108,6 +160,7 @@ impl AppSettings {
                     .map(|v| v.clone())
                     .unwrap_or_else(|_| "prefer".to_string()),
             ),
+            ("discord_webhook_url", self.discord_webhook_url()),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v))
@@ -170,12 +223,18 @@ impl AppSettings {
             Some(s) => s,
             None => return,
         };
-        if self.load_from_redis().await > 0 {
-            return;
-        }
+        let keys: Vec<String> = Self::REDIS_SETTING_NAMES
+            .iter()
+            .map(|n| UpstashStore::k_settings(n))
+            .collect();
+        let present = store.mget(&keys).await;
         let mut seeded = 0;
-        for (key, value) in self.settings_entries() {
-            if store.set_nx(&UpstashStore::k_settings(&key), &value, None).await {
+        for (index, (key, value)) in self.settings_entries().into_iter().enumerate() {
+            if present.get(index).and_then(|value| value.as_ref()).is_none()
+                && store
+                    .set_nx(&UpstashStore::k_settings(&key), &value, None)
+                    .await
+            {
                 seeded += 1;
             }
         }
@@ -249,7 +308,34 @@ fn first_opt_bool(obj: &Value, keys: &[&str]) -> Result<Option<bool>, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{default_atmos_mode, normalize_atmos_mode};
+    use super::{default_atmos_mode, normalize_atmos_mode, AppSettings};
+
+    #[tokio::test]
+    async fn discord_webhook_persists_without_entering_public_snapshot() {
+        let db = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::query("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            .execute(&db)
+            .await
+            .unwrap();
+        let url = "https://discord.com/api/webhooks/123/secret-token";
+        let settings = AppSettings::from_env();
+        settings
+            .set_discord_webhook_url(url.to_string(), Some(&db))
+            .await
+            .unwrap();
+        assert!(!settings.snapshot().to_string().contains("secret-token"));
+
+        let reloaded = AppSettings::from_env();
+        reloaded.load_from_db(&db).await;
+        assert_eq!(reloaded.discord_webhook_url(), url);
+
+        reloaded
+            .set_discord_webhook_url(String::new(), Some(&db))
+            .await
+            .unwrap();
+        settings.load_from_db(&db).await;
+        assert!(settings.discord_webhook_url().is_empty());
+    }
 
     #[test]
     fn atmos_explicit_values_honored() {

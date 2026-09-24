@@ -1,4 +1,5 @@
 pub mod accounts;
+pub mod auth_guard;
 pub mod alerts;
 pub mod backup;
 pub mod api_keys;
@@ -11,8 +12,8 @@ pub mod stats;
 pub mod ui;
 
 use axum::body::Body;
-use axum::extract::State;
-use axum::http::header::{CACHE_CONTROL, COOKIE, SET_COOKIE};
+use axum::extract::{ConnectInfo, State};
+use axum::http::header::{CACHE_CONTROL, COOKIE, RETRY_AFTER, SET_COOKIE};
 use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -22,11 +23,28 @@ use base64::Engine;
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use std::net::SocketAddr;
+use std::time::Instant;
 
+use crate::request_log::{client_ip, client_ip_from_headers};
 use crate::AppState;
 
 const SESSION_COOKIE: &str = "hifi_admin_session";
 const SESSION_SECONDS: i64 = 30 * 24 * 60 * 60;
+
+pub(crate) fn locked_response(retry_after: u64) -> Response {
+    let mut response = (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(json!({"detail": "Too many failed admin authentication attempts. Try again later."})),
+    )
+        .into_response();
+    response.headers_mut().insert(
+        RETRY_AFTER,
+        HeaderValue::from_str(&retry_after.to_string()).expect("valid retry interval"),
+    );
+    response.headers_mut().insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
 
 #[derive(Deserialize)]
 pub struct LoginRequest {
@@ -76,12 +94,22 @@ fn valid_session(headers: &HeaderMap, key: &str) -> bool {
 
 pub async fn login(
     State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(body): Json<LoginRequest>,
 ) -> Response {
+    let ip = client_ip_from_headers(&state, &headers, addr);
+    let now = Instant::now();
+    if let Some(retry_after) = state.admin_auth_guard.check(ip, now) {
+        return locked_response(retry_after);
+    }
     if !state.config.admin_key.is_empty() && body.key != state.config.admin_key {
+        if let Some(retry_after) = state.admin_auth_guard.failed(ip, now) {
+            return locked_response(retry_after);
+        }
         return (StatusCode::UNAUTHORIZED, Json(json!({"detail": "Invalid admin key"}))).into_response();
     }
+    state.admin_auth_guard.clear(ip);
 
     let mut response = Json(json!({"ok": true})).into_response();
     response.headers_mut().insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -110,9 +138,15 @@ pub async fn logout() -> Response {
 
 pub async fn admin_auth(
     State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     req: Request<Body>,
     next: Next,
 ) -> Result<Response, Response> {
+    let ip = client_ip(&state, &req, addr);
+    let now = Instant::now();
+    if let Some(retry_after) = state.admin_auth_guard.check(ip, now) {
+        return Err(locked_response(retry_after));
+    }
     let admin_key = req
         .headers()
         .get("X-Admin-Key")
@@ -123,9 +157,16 @@ pub async fn admin_auth(
         || admin_key == state.config.admin_key
         || valid_session(req.headers(), &state.config.admin_key)
     {
+        state.admin_auth_guard.clear(ip);
         let mut response = next.run(req).await;
         response.headers_mut().insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
         return Ok(response);
+    }
+
+    if !admin_key.is_empty() {
+        if let Some(retry_after) = state.admin_auth_guard.failed(ip, now) {
+            return Err(locked_response(retry_after));
+        }
     }
 
     Err((

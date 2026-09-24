@@ -4,9 +4,10 @@ use std::time::Instant;
 
 use axum::body::Body;
 use axum::extract::{ConnectInfo, State};
-use axum::http::Request;
+use axum::http::{header::RETRY_AFTER, HeaderMap, HeaderValue, Request, StatusCode};
 use axum::middleware::Next;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
+use axum::Json;
 use serde_json::{json, Value};
 use std::net::{IpAddr, SocketAddr};
 
@@ -188,10 +189,7 @@ pub async fn log_requests(
     next: Next,
 ) -> Response {
     let raw_path = req.uri().path();
-    if !should_log_path(raw_path) {
-        return next.run(req).await;
-    }
-
+    let log_path = should_log_path(raw_path);
     let method = req.method().to_string();
     let raw_path = raw_path.to_string();
     let path = normalize_path(&raw_path);
@@ -199,7 +197,23 @@ pub async fn log_requests(
     let ip = client_ip(&state, &req, addr);
     let start = Instant::now();
 
-    let resp = next.run(req).await;
+    let resp = if let Some(retry_after) = state.scanner_guard.check(ip, &raw_path, start) {
+        let mut response = (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "detail": "IP temporarily blocked after repeated scanner requests" })),
+        )
+            .into_response();
+        response.headers_mut().insert(
+            RETRY_AFTER,
+            HeaderValue::from_str(&retry_after.to_string()).expect("valid retry interval"),
+        );
+        response
+    } else {
+        next.run(req).await
+    };
+    if !log_path {
+        return resp;
+    }
     let status = resp.status().as_u16();
 
     state.request_log.record(LogEntry {
@@ -240,9 +254,16 @@ mod tests {
 }
 
 pub(crate) fn client_ip(state: &AppState, req: &Request<Body>, fallback: SocketAddr) -> IpAddr {
+    client_ip_from_headers(state, req.headers(), fallback)
+}
+
+pub(crate) fn client_ip_from_headers(
+    state: &AppState,
+    headers: &HeaderMap,
+    fallback: SocketAddr,
+) -> IpAddr {
     if state.config.trust_proxy {
-        if let Some(xff) = req
-            .headers()
+        if let Some(xff) = headers
             .get("x-forwarded-for")
             .and_then(|v| v.to_str().ok())
         {
@@ -252,8 +273,7 @@ pub(crate) fn client_ip(state: &AppState, req: &Request<Body>, fallback: SocketA
                 }
             }
         }
-        if let Some(real) = req
-            .headers()
+        if let Some(real) = headers
             .get("x-real-ip")
             .and_then(|v| v.to_str().ok())
         {

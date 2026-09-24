@@ -11,6 +11,7 @@ mod playback;
 mod proxy_manager;
 mod settings;
 mod request_log;
+mod scanner_guard;
 mod routes;
 mod setup;
 mod tidal_client;
@@ -49,6 +50,8 @@ pub struct AppState {
     pub cache: Arc<cache::ResponseCache>,
     pub settings: Arc<settings::AppSettings>,
     pub request_log: Arc<request_log::RequestLog>,
+    pub scanner_guard: Arc<scanner_guard::ScannerGuard>,
+    pub admin_auth_guard: Arc<admin::auth_guard::AdminAuthGuard>,
     pub db: Option<sqlx::SqlitePool>,
     pub setup_sessions: admin::setup::Sessions,
     /// Shared cross-instance state (None = single-host mode, skip sync).
@@ -59,12 +62,10 @@ pub struct AppState {
 async fn main() {
     dotenvy::dotenv().ok();
 
-    if std::env::var("RUST_LOG").is_err() {
-        std::env::set_var("RUST_LOG", "info");
-    }
-
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .init();
 
     let config = Arc::new(Config::from_env());
@@ -258,7 +259,7 @@ async fn main() {
         });
     }
 
-    let notifier = notifier::Notifier::new(config.discord_webhook_url.clone());
+    let notifier = notifier::Notifier::new(settings.clone());
 
     let tidal_client = Arc::new(tidal_client::TidalClient::new(
         proxy_manager.clone(),
@@ -280,6 +281,8 @@ async fn main() {
         cache: Arc::new(cache::ResponseCache::new()),
         settings: settings.clone(),
         request_log: Arc::new(request_log::RequestLog::new()),
+        scanner_guard: Arc::new(scanner_guard::ScannerGuard::new()),
+        admin_auth_guard: Arc::new(admin::auth_guard::AdminAuthGuard::new()),
         db,
         setup_sessions: admin::setup::new_session_store(),
         upstash: upstash.clone(),
@@ -483,6 +486,11 @@ fn admin_api(state: AppState) -> Router<AppState> {    Router::new()
         .route("/stats", get(crate::admin::stats::get_stats))
         .route("/proxies", get(crate::admin::proxies::proxy_status).put(crate::admin::proxies::update_proxies))
         .route("/alerts", get(crate::admin::alerts::alert_status))
+        .route(
+            "/alerts/webhook",
+            put(crate::admin::alerts::update_webhook)
+                .delete(crate::admin::alerts::delete_webhook),
+        )
         .route("/alerts/test", post(crate::admin::alerts::alert_test))
         .route("/alerts/report", post(crate::admin::alerts::alert_report))
         .route("/cache", get(crate::admin::cache::cache_stats))

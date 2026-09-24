@@ -15,6 +15,31 @@ pub async fn alert_status(
     Ok(Json(json!({ "alerts": { "discord_configured": state.notifier.configured() } })))
 }
 
+#[derive(Deserialize)]
+pub struct WebhookRequest {
+    pub url: String,
+}
+
+pub async fn update_webhook(
+    State(state): State<AppState>,
+    Json(body): Json<WebhookRequest>,
+) -> Result<Json<Value>, AppError> {
+    let url = Notifier::validate_webhook_url(&body.url).map_err(AppError::BadRequest)?;
+    state
+        .settings
+        .set_discord_webhook_url(url, state.db.as_ref())
+        .await?;
+    Ok(Json(json!({"alerts": {"discord_configured": true}})))
+}
+
+pub async fn delete_webhook(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    state
+        .settings
+        .set_discord_webhook_url(String::new(), state.db.as_ref())
+        .await?;
+    Ok(Json(json!({"alerts": {"discord_configured": false}})))
+}
+
 pub async fn alert_test(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, AppError> {

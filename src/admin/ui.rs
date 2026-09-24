@@ -3,11 +3,15 @@ use std::sync::OnceLock;
 
 pub async fn admin_index() -> Html<&'static str> {
     static HTML: OnceLock<String> = OnceLock::new();
-    Html(HTML.get_or_init(|| ADMIN_HTML.replace("__HIFI_VERSION__", env!("CARGO_PKG_VERSION"))))
+    Html(HTML.get_or_init(|| {
+        ADMIN_HTML
+            .replace("__HIFI_VERSION__", env!("CARGO_PKG_VERSION"))
+            .replace("__HIFI_I18N__", include_str!("i18n.js"))
+    }))
 }
 
 const ADMIN_HTML: &str = r#"<!DOCTYPE html>
-<html lang="ru">
+<html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -366,9 +370,10 @@ button:focus-visible,input:focus-visible,select:focus-visible { outline:2px soli
   <section id="view-system" class="view">
     <div class="section-head"><div><h2>Системные настройки</h2><p>Интеграции, резервные копии и обслуживание.</p></div></div>
     <div class="system-grid">
+      <div class="form-section"><h3>Настройки панели</h3><p class="form-copy">Язык интерфейса сохраняется в этом браузере.</p><div class="form-group"><label for="panel-language">Язык интерфейса</label><select id="panel-language" class="select" style="width:100%;padding:10px 12px" onchange="setLanguage(this.value)"><option value="en">English</option><option value="ru">Русский</option></select></div></div>
       <div class="form-section"><h3>Воспроизведение</h3><p class="form-copy">Настройки выбора формата и автоматического восстановления.</p><div class="form-group" style="margin-bottom:16px"><label>Формат по умолчанию</label><select id="rl-atmos" class="select" style="width:100%;padding:10px 12px"><option value="high">HIGH · AAC 320 kbps (v1)</option><option value="off">FLAC в приоритете</option><option value="prefer">Atmos в приоритете</option></select></div><label style="display:flex;align-items:center;gap:9px;font-size:12px;color:#c9d1d9;margin-bottom:18px"><input type="checkbox" id="rl-autoheal"> Автовосстановление отключённых системой аккаунтов</label><button class="btn btn-primary" onclick="saveSettings()">Сохранить</button></div>
       <div class="form-section"><h3>Прокси</h3><p class="form-copy">Маршрутизация исходящих запросов. Изменения применяются сразу.</p><div class="card-stats" style="margin-bottom:16px"><span class="card-stat">Статус <strong id="px-status">—</strong></span><span class="card-stat">Текущий <strong id="px-current">—</strong></span><span class="card-stat">В пуле <strong id="px-pool">—</strong></span><span class="card-stat">Сбоев <strong id="px-fails">—</strong></span></div><div class="form-group"><label for="px-list">Адреса прокси · по одному в строке</label><textarea id="px-list" spellcheck="false" placeholder="http://user:password@host:port" oninput="proxyListDirty=true"></textarea></div><div class="section-actions" style="margin-top:12px"><button class="btn btn-primary" id="pxToggleBtn" onclick="toggleProxies()">Включить прокси</button><button class="btn" id="pxSaveBtn" onclick="saveProxyList()">Сохранить список</button></div><p class="helper" id="px-persist" style="margin-top:11px"></p></div>
-      <div class="form-section"><h3>Уведомления</h3><p class="form-copy">Discord-оповещения о риске блокировки и недоступности аккаунтов.</p><div class="card-stats" style="margin-bottom:15px"><span class="card-stat">Discord <strong id="al-discord">—</strong></span></div><div class="section-actions"><button class="btn" onclick="testAlert()" id="alertTestBtn">Тест</button><button class="btn" onclick="sendReport('status')" id="reportStatusBtn">Статус</button><button class="btn" onclick="sendReport('accounts')" id="reportAccountsBtn">Аккаунты</button></div></div>
+      <div class="form-section"><h3>Уведомления</h3><p class="form-copy">Discord-оповещения о риске блокировки и недоступности аккаунтов.</p><div class="card-stats" style="margin-bottom:15px"><span class="card-stat">Discord <strong id="al-discord">—</strong></span></div><div class="form-group"><label for="al-webhook">URL вебхука Discord</label><input type="password" id="al-webhook" placeholder="https://discord.com/api/webhooks/…" autocomplete="new-password" spellcheck="false"></div><p class="helper" style="margin:8px 0 14px">Сохранённый URL скрыт. Введите новый, чтобы заменить его.</p><div class="section-actions" style="margin-bottom:15px"><button class="btn btn-primary" onclick="saveDiscordWebhook()" id="saveWebhookBtn">Сохранить вебхук</button><button class="btn btn-danger" onclick="disableDiscordWebhook()" id="disableWebhookBtn">Отключить вебхук</button></div><div class="section-actions"><button class="btn" onclick="testAlert()" id="alertTestBtn">Тест</button><button class="btn" onclick="sendReport('status')" id="reportStatusBtn">Статус</button><button class="btn" onclick="sendReport('accounts')" id="reportAccountsBtn">Аккаунты</button></div></div>
       <div class="form-section"><h3>Кэш</h3><p class="form-copy">Очистка безопасна, но первые ответы после неё могут быть медленнее.</p><div class="card-stats" style="margin-bottom:15px"><span class="card-stat">Попадания <strong id="cc-hits">—</strong></span><span class="card-stat">Промахи <strong id="cc-misses">—</strong></span></div><button class="btn" onclick="clearCache()" id="clearCacheBtn">Очистить кэш</button></div>
       <div class="form-section"><h3>Учётные данные</h3><p class="form-copy">Экспортируйте или импортируйте Tidal-аккаунты в JSON. Дубликаты токенов будут пропущены.</p><div class="section-actions"><button class="btn" onclick="exportCredentials()">Экспорт JSON</button><button class="btn" onclick="document.getElementById('importFile').click()">Импорт JSON</button><input type="file" id="importFile" accept=".json,application/json" style="display:none" onchange="importCredentials(event)"></div><div id="importResult" class="helper" style="margin-top:10px"></div></div>
       <div class="form-section"><h3>База данных</h3><p class="form-copy">Скачайте полный снимок или восстановите состояние без перезапуска.</p><div class="section-actions"><button class="btn" onclick="downloadBackup()">Скачать копию</button><button class="btn btn-danger" onclick="document.getElementById('restoreFile').click()">Восстановить</button><input type="file" id="restoreFile" accept=".db,.sqlite,.sqlite3,application/x-sqlite3" style="display:none" onchange="restoreBackup(event)"></div><div id="restoreResult" class="helper" style="margin-top:10px"></div></div>
@@ -419,6 +424,7 @@ button:focus-visible,input:focus-visible,select:focus-visible { outline:2px soli
 </div>
 
 <script>
+__HIFI_I18N__
 var API = window.location.origin;
 var legacyAdminKey = sessionStorage.getItem('admin_key') || localStorage.getItem('admin_key') || '';
 sessionStorage.removeItem('admin_key');
@@ -466,6 +472,7 @@ async function login(event) {
     try {
         var res = await fetch('/admin/login', { method:'POST', headers:headers(), body:JSON.stringify({ key:candidate }) });
         if (res.status === 401) throw new Error('Ключ не подходит. Проверьте значение и попробуйте ещё раз.');
+        if (res.status === 429) throw new Error('Слишком много неверных попыток. Повторите через ' + Math.ceil(Number(res.headers.get('Retry-After') || 900) / 60) + ' мин.');
         if (!res.ok) throw new Error('Сервис временно недоступен: HTTP ' + res.status);
         document.getElementById('admin-key-input').value = '';
         showApp();
@@ -537,6 +544,7 @@ async function bootstrap() {
         }
         var res = await fetch('/admin/stats', { headers: headers() });
         if (res.status === 401) { showLogin(''); return; }
+        if (res.status === 429) { showLogin('Слишком много неверных попыток. Повторите позже.'); return; }
         if (!res.ok) { showLogin('Не удалось подключиться к сервису: HTTP ' + res.status); return; }
         showApp();
         refreshAll();
@@ -940,7 +948,7 @@ async function toggleAccount(id, active) {
 }
 
 async function removeAccount(id) {
-    if (!confirm('Удалить этот аккаунт? Он сразу перестанет обслуживать запросы.')) return;
+    if (!confirm(tr('Удалить этот аккаунт? Он сразу перестанет обслуживать запросы.'))) return;
     try {
         var res = await fetch('/admin/accounts/' + id, {
             method: 'DELETE', headers: headers()
@@ -966,7 +974,7 @@ async function setCatalog(id, catalog) {
 function duplicateAccount(id) {
     var a = window._accounts.find(function(x) { return x.id === id; });
     if (!a) { document.getElementById('error').textContent = 'Account not found'; return; }
-    document.getElementById('new-label').value = 'Копия ' + (a.label || a.id.slice(0, 8));
+    document.getElementById('new-label').value = tr('Копия ') + (a.label || a.id.slice(0, 8));
     document.getElementById('new-user-id').value = a.user_id || '';
     document.getElementById('new-client-id').value = a.client_id || '';
     document.getElementById('new-client-secret').value = a.client_secret || '';
@@ -1080,7 +1088,7 @@ function closeOAuth() {
 
 function copyOAuthUrl() {
     var url = document.getElementById('oauthUrl').textContent;
-    if (!url || url === '—' || url === 'Starting...') return;
+    if (!url || url === '—' || url === 'Starting...' || url === tr('Starting...')) return;
     navigator.clipboard.writeText(url).then(function() {
         var btn = document.getElementById('copyOAuthBtn');
         btn.textContent = 'Скопировано';
@@ -1090,10 +1098,11 @@ function copyOAuthUrl() {
 
 function openOAuthUrl() {
     var url = document.getElementById('oauthUrl').textContent;
-    if (!url || url === '—' || url === 'Starting...') return;
+    if (!url || url === '—' || url === 'Starting...' || url === tr('Starting...')) return;
     window.open(url, '_blank');
 }
 
+initLanguage();
 bootstrap();
 setInterval(function() {
     if (!authenticated || document.hidden) return;
@@ -1109,7 +1118,52 @@ async function loadAlertStatus() {
         if (!res.ok) return;
         var a = (await res.json()).alerts || {};
         document.getElementById('al-discord').textContent = a.discord_configured ? 'Подключён' : 'Не настроен';
+        document.getElementById('disableWebhookBtn').disabled = !a.discord_configured;
+        ['alertTestBtn', 'reportStatusBtn', 'reportAccountsBtn'].forEach(function(id) {
+            document.getElementById(id).disabled = !a.discord_configured;
+        });
     } catch(e) {}
+}
+
+async function saveDiscordWebhook() {
+    var input = document.getElementById('al-webhook');
+    var url = input.value.trim();
+    if (!url) {
+        document.getElementById('error').textContent = 'Введите URL вебхука.';
+        return;
+    }
+    var btn = document.getElementById('saveWebhookBtn');
+    btn.disabled = true;
+    try {
+        var res = await fetch('/admin/alerts/webhook', { method: 'PUT', headers: headers(), body: JSON.stringify({ url: url }) });
+        var data = await res.json();
+        if (!res.ok) throw new Error(data.detail || 'Не удалось сохранить вебхук.');
+        input.value = '';
+        document.getElementById('success').textContent = 'Вебхук сохранён.';
+        await loadAlertStatus();
+    } catch(e) {
+        document.getElementById('error').textContent = e.message;
+    } finally {
+        btn.disabled = false;
+    }
+}
+
+async function disableDiscordWebhook() {
+    if (!confirm(tr('Удалить сохранённый вебхук и отключить уведомления Discord?'))) return;
+    var btn = document.getElementById('disableWebhookBtn');
+    btn.disabled = true;
+    try {
+        var res = await fetch('/admin/alerts/webhook', { method: 'DELETE', headers: headers() });
+        var data = await res.json();
+        if (!res.ok) throw new Error(data.detail || 'Не удалось отключить вебхук.');
+        document.getElementById('al-webhook').value = '';
+        document.getElementById('success').textContent = 'Вебхук отключён.';
+        await loadAlertStatus();
+    } catch(e) {
+        document.getElementById('error').textContent = e.message;
+    } finally {
+        btn.disabled = false;
+    }
 }
 
 async function sendReport(kind) {
@@ -1212,7 +1266,7 @@ async function toggleApiKey(id, active) {
 }
 
 async function removeApiKey(id) {
-    if (!confirm('Удалить API-ключ? Клиенты с этим ключом потеряют доступ.')) return;
+    if (!confirm(tr('Удалить API-ключ? Клиенты с этим ключом потеряют доступ.'))) return;
     try {
         var res = await fetch('/admin/keys/' + id, { method: 'DELETE', headers: headers() });
         if (res.ok) loadApiKeys();
@@ -1235,7 +1289,7 @@ async function downloadBackup() {
 
 async function restoreBackup(e) {
     var file = e.target.files[0]; if (!file) return;
-    if (!confirm('Restore database from ' + file.name + '? Current accounts, keys and settings will be replaced.')) { e.target.value = ''; return; }
+    if (!confirm(tr('Restore database from ') + file.name + tr('? Current accounts, keys and settings will be replaced.'))) { e.target.value = ''; return; }
     try {
         var buf = await file.arrayBuffer();
         var res = await fetch('/admin/backup/restore', { method: 'POST', headers: headers(), body: buf });

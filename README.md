@@ -75,8 +75,8 @@ Copy [`.env.example`](.env.example) for the full list. Values saved in the admin
 | `USE_PROXIES`, `PROXIES_FILE` | `false`, `proxies.txt` | Initial outbound proxy setting and proxy list. Editable in admin and persisted with SQLite. |
 | `FALLBACK_TO_DIRECT_CONNECTION` | `false` | Use the host connection when no proxy works. This exposes the host IP to Tidal. |
 | `MAX_RETRIES`, `ROTATE_PROXIES_ON_REFRESH` | `2`, `false` | Proxy retry count and whether to rotate on token refresh. |
-| `TRUST_PROXY_HEADERS` | `true` | Use `X-Forwarded-For` and `X-Real-IP` to identify clients. Set `false` for direct access. |
-| `DISCORD_WEBHOOK_URL` | Empty | Optional account and outage alerts. |
+| `TRUST_PROXY_HEADERS` | `true` | Use `X-Forwarded-For` and `X-Real-IP` to identify clients. Enable only behind a trusted reverse proxy that replaces client-supplied forwarding headers; set `false` for direct access. |
+| `DISCORD_WEBHOOK_URL` | Empty | Initial Discord webhook for account and outage alerts. Admin → System → Notifications can replace or disable it without a restart; the saved value persists in SQLite and shared Redis when enabled. The panel never returns the saved URL. |
 | `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN` | Empty | Optional shared state across instances using Upstash REST. |
 | `REDIS_POOL` | Empty | Alternative native Redis/Valkey URL. Takes precedence over the Upstash pair. |
 | `RUST_LOG` | `info` | Log filter. |
@@ -89,15 +89,15 @@ Copy [`.env.example`](.env.example) for the full list. Values saved in the admin
 
 ### Multiple instances
 
-Configure either the Upstash pair or `REDIS_POOL` on every instance in a fleet. Shared state includes app settings, Tidal access tokens, account credentials, and API key definitions and usage. SQLite still belongs to each instance. Playback jobs, request logs, metadata cache, and proxy settings remain local. Protect Redis credentials: the shared account records contain Tidal credentials.
+Configure either the Upstash pair or `REDIS_POOL` on every instance in a fleet. Shared state includes app settings, Tidal access tokens, account credentials, and API key definitions and usage. SQLite still belongs to each instance. Playback jobs, request logs, metadata cache, and proxy settings remain local. Protect Redis credentials: the shared state contains Tidal credentials and the Discord webhook token. Database backups also contain the saved webhook.
 
 Without Redis, each instance operates independently. If Redis becomes unavailable, the service continues with local state until sync recovers.
 
 ## Admin and API authentication
 
-The admin panel is at `/admin`. With `ADMIN_KEY` set, sign-in creates an HttpOnly session cookie; admin API clients can use `X-Admin-Key`. Leaving `ADMIN_KEY` empty leaves the admin panel open.
+The admin panel is at `/admin`. With `ADMIN_KEY` set, sign-in creates an HttpOnly session cookie; admin API clients can use `X-Admin-Key`. Five incorrect admin keys from one IP within five minutes lock admin authentication for 15 minutes (`429` with `Retry-After`). The same limit applies when `X-Admin-Key` is used on public API routes. Missing credentials and expired session cookies are not counted. Successful authentication clears earlier failures. Lockouts are local to each instance and reset on restart. Leaving `ADMIN_KEY` empty leaves the admin panel open.
 
-The panel manages OAuth accounts, catalog flags, credentials import/export, API keys, proxy settings, Atmos and auto-heal settings, alerts, cache, backups, and request statistics. The live log records recent API requests with status, latency, client IP, endpoint counts, and top tracks; admin, health, and favicon requests are excluded.
+The panel manages OAuth accounts, catalog flags, credentials import/export, API keys, proxy settings, Atmos and auto-heal settings, alerts, cache, backups, and request statistics. Its interface defaults to English; choose English or Russian in System → Panel settings. The choice is saved in the current browser. The live log records recent API requests with status, latency, client IP, endpoint counts, and top tracks; admin, health, and favicon requests are excluded. Three requests to scanner paths such as `wp-includes`, `.env`, or `.git/config` within one minute temporarily block the client IP from all routes for 15 minutes (`403` with `Retry-After`). The ban is local to each instance and resets on restart.
 
 Public API routes are open until you create the first API key. After that, send `X-API-Key` with requests, or use `X-Admin-Key` as the owner. `/`, `/health`, and `/admin` are exempt from API key checks. API keys can have usage quotas.
 

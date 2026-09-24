@@ -1,8 +1,10 @@
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::net::SocketAddr;
+use std::time::Instant;
 
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
 use axum::http::{Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -15,6 +17,7 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::error::AppError;
+use crate::request_log::client_ip;
 use crate::upstash::UpstashStore;
 use crate::AppState;
 
@@ -380,6 +383,7 @@ impl ApiKeyManager {
     /// non-exempt route requires X-API-Key or the owner X-Admin-Key.
     pub async fn enforce_api_key(
         State(state): State<AppState>,
+        ConnectInfo(addr): ConnectInfo<SocketAddr>,
         req: Request<Body>,
         next: Next,
     ) -> Response {
@@ -396,8 +400,19 @@ impl ApiKeyManager {
             .get("X-Admin-Key")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        if !state.config.admin_key.is_empty() && admin_key == state.config.admin_key {
-            return next.run(req).await;
+        if !state.config.admin_key.is_empty() && !admin_key.is_empty() {
+            let ip = client_ip(&state, &req, addr);
+            let now = Instant::now();
+            if let Some(retry_after) = state.admin_auth_guard.check(ip, now) {
+                return crate::admin::locked_response(retry_after);
+            }
+            if admin_key == state.config.admin_key {
+                state.admin_auth_guard.clear(ip);
+                return next.run(req).await;
+            }
+            if let Some(retry_after) = state.admin_auth_guard.failed(ip, now) {
+                return crate::admin::locked_response(retry_after);
+            }
         }
 
         match req.headers().get("X-API-Key").and_then(|v| v.to_str().ok()) {
