@@ -150,7 +150,7 @@ impl RequestLog {
         let recent: Vec<Value> = entries
             .iter()
             .rev()
-            .take(limit.min(100))
+            .take(limit.min(MAX_ENTRIES))
             .map(|e| {
                 json!({
                     "ts": e.ts,

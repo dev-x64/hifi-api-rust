@@ -169,7 +169,7 @@ body { font-family:'SF Mono','Fira Code','Cascadia Code','JetBrains Mono',Menlo,
 .term-meta { display:flex; gap:16px; flex-wrap:wrap; padding:9px 14px; border-bottom:1px solid #142114; font-family:monospace; font-size:11px; color:#5f6f60; }
 .term-meta strong { color:#9fe8b4; font-weight:600; }
 .term-meta .card-stat { font-size:11px; }
-.term-body { font-family:'SF Mono','Fira Code',Menlo,Consolas,monospace; font-size:12px; line-height:1.75; padding:12px 14px; height:280px; overflow-y:auto; color:#c9e8d2; scrollbar-width:thin; scrollbar-color:#1d3a24 transparent; }
+.term-body { font-family:'SF Mono','Fira Code',Menlo,Consolas,monospace; font-size:12px; line-height:1.75; padding:12px 14px; height:400px; overflow-y:auto; color:#c9e8d2; scrollbar-width:thin; scrollbar-color:#1d3a24 transparent; }
 .term-body::-webkit-scrollbar { width:8px; }
 .term-body::-webkit-scrollbar-thumb { background:#1d3a24; border-radius:4px; }
 .term-line { white-space:nowrap; }
@@ -184,7 +184,7 @@ body { font-family:'SF Mono','Fira Code','Cascadia Code','JetBrains Mono',Menlo,
 .term-id { color:#d2a8ff; }
 .term-dim { color:#5f6f60; }
 .term-cursor { display:inline-block; width:8px; height:14px; background:#3fb950; vertical-align:-2px; animation:termBlink 1.1s infinite; }
-@media (max-width:768px) { .term-body { height:220px; font-size:11px; } }
+@media (max-width:768px) { .term-body { height:300px; font-size:11px; } }
 
 /* Application shell */
 :root {
@@ -344,10 +344,10 @@ button:focus-visible,input:focus-visible,select:focus-visible { outline:2px soli
 
   <section id="view-overview" class="view active">
     <div id="stats" class="stats"></div>
-    <div class="section-head"><div><h2>Журнал запросов</h2><p>Последняя активность обновляется автоматически каждые 15 секунд.</p></div><button class="btn" onclick="loadRequestLog()">Обновить журнал</button></div>
+    <div class="section-head"><div><h2>Журнал запросов</h2><p>Последняя активность обновляется автоматически каждые 15 секунд.</p></div><div class="section-actions"><button class="btn" id="requestLogMore" onclick="showMoreRequests()">Показать ещё</button><button class="btn" onclick="loadRequestLog()">Обновить журнал</button></div></div>
     <div class="terminal">
       <div class="term-bar"><span class="term-dots"><i></i><i></i><i></i></span><span class="term-title">hifi-api — live request log</span><span class="term-live" id="term-live">● LIVE</span></div>
-      <div class="term-meta"><span>Всего <strong id="rq-total">—</strong></span><span>Ошибок <strong id="rq-errors">—</strong></span><span>p50 <strong id="rq-p50">—</strong></span><span>p95 <strong id="rq-p95">—</strong></span><span id="rq-endpoints"></span><span id="rq-tracks" style="color:#d2a8ff"></span></div>
+      <div class="term-meta"><span>Всего <strong id="rq-total">—</strong></span><span>Показано <strong id="rq-shown">—</strong></span><span>Ошибок <strong id="rq-errors">—</strong></span><span>p50 <strong id="rq-p50">—</strong></span><span>p95 <strong id="rq-p95">—</strong></span><span id="rq-endpoints"></span><span id="rq-tracks" style="color:#d2a8ff"></span></div>
       <div id="rq-recent" class="term-body"></div>
     </div>
   </section>
@@ -1341,12 +1341,25 @@ async function loadCacheStats() {
     } catch(e) {}
 }
 
+var requestLogLimit = 100;
+var renderedRequestLogLimit = 0;
+
+function showMoreRequests() {
+    requestLogLimit = Math.min(requestLogLimit * 2, 5000);
+    loadRequestLog();
+}
+
 async function loadRequestLog() {
     try {
-        var res = await fetch('/admin/requests?limit=20', { headers: headers() });
+        var limit = requestLogLimit;
+        var res = await fetch('/admin/requests?limit=' + limit, { headers: headers() });
         if (!res.ok) return;
         var r = (await res.json()).requests || {};
+        if (limit !== requestLogLimit) return;
         document.getElementById('rq-total').textContent = r.total != null ? r.total : '—';
+        var recent = r.recent || [];
+        document.getElementById('rq-shown').textContent = recent.length;
+        document.getElementById('requestLogMore').hidden = recent.length >= (r.total || 0) || limit >= 5000;
         document.getElementById('rq-errors').textContent = r.errors != null ? r.errors : '—';
         document.getElementById('rq-p50').textContent = r.p50_ms != null ? r.p50_ms + 'ms' : '—';
         document.getElementById('rq-p95').textContent = r.p95_ms != null ? r.p95_ms + 'ms' : '—';
@@ -1361,7 +1374,7 @@ async function loadRequestLog() {
         }
         document.getElementById('rq-tracks').innerHTML = tt ? '<span style="color:#5f6f60">top:</span> ' + tt : '';
         var rows = '';
-        for (var q of (r.recent || [])) {
+        for (var q of recent.slice().reverse()) {
             var cls = q.status >= 500 ? 'test-fail' : (q.status >= 400 ? 'test-pending' : 'test-pass');
             var t = '';
             if (q.ts) {
@@ -1376,12 +1389,18 @@ async function loadRequestLog() {
                 '<span class="term-dim">' + q.latency_ms + 'ms ' + esc(q.client_ip) + '</span></div>';
         }
         var box = document.getElementById('rq-recent');
+        var previousHeight = box.scrollHeight;
+        var previousTop = box.scrollTop;
+        var atBottom = previousHeight - previousTop - box.clientHeight < 32;
         if (rows) {
             box.innerHTML = rows + '<div class="term-line"><span class="term-dim">$</span> <span class="term-cursor"></span></div>';
-            box.scrollTop = box.scrollHeight;
+            if (atBottom) box.scrollTop = box.scrollHeight;
+            else if (limit > renderedRequestLogLimit) box.scrollTop = previousTop + box.scrollHeight - previousHeight;
+            else box.scrollTop = previousTop;
         } else {
             box.innerHTML = '<div class="term-line"><span class="term-dim">$ waiting for traffic…</span> <span class="term-cursor"></span></div>';
         }
+        renderedRequestLogLimit = limit;
     } catch(e) {}
 }
 
