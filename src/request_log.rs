@@ -14,6 +14,7 @@ use std::net::{IpAddr, SocketAddr};
 use crate::AppState;
 
 const MAX_ENTRIES: usize = 5000;
+const RATE_WINDOW_SECONDS: i64 = 60;
 
 fn should_log_path(path: &str) -> bool {
     path != "/admin"
@@ -38,22 +39,65 @@ pub struct LogEntry {
 
 pub struct RequestLog {
     entries: Mutex<VecDeque<LogEntry>>,
+    requests_per_second: Mutex<VecDeque<(i64, u64)>>,
 }
 
 impl RequestLog {
     pub fn new() -> Self {
         Self {
             entries: Mutex::new(VecDeque::with_capacity(MAX_ENTRIES)),
+            requests_per_second: Mutex::new(VecDeque::with_capacity(RATE_WINDOW_SECONDS as usize)),
         }
     }
 
     pub fn record(&self, entry: LogEntry) {
+        let timestamp = entry.ts;
         if let Ok(mut entries) = self.entries.lock() {
             if entries.len() >= MAX_ENTRIES {
                 entries.pop_front();
             }
             entries.push_back(entry);
         }
+        if let Ok(mut buckets) = self.requests_per_second.lock() {
+            buckets.retain(|(second, _)| *second > timestamp - RATE_WINDOW_SECONDS);
+            if let Some((_, count)) = buckets.iter_mut().find(|(second, _)| *second == timestamp) {
+                *count += 1;
+            } else {
+                buckets.push_back((timestamp, 1));
+            }
+        }
+    }
+
+    /// Completed API requests in the last 60 seconds, including the current second.
+    pub fn requests_last_60s(&self) -> u64 {
+        let now = chrono::Utc::now().timestamp();
+        self.requests_per_second
+            .lock()
+            .map(|buckets| {
+                buckets
+                    .iter()
+                    .filter(|(second, _)| *second > now - RATE_WINDOW_SECONDS && *second <= now)
+                    .map(|(_, count)| count)
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+
+    /// p95 of the bounded recent request log, not a lifetime latency metric.
+    pub fn recent_p95_ms(&self) -> Option<u64> {
+        let mut latencies: Vec<u64> = self
+            .entries
+            .lock()
+            .ok()?
+            .iter()
+            .map(|e| e.latency_ms)
+            .collect();
+        if latencies.is_empty() {
+            return None;
+        }
+        latencies.sort_unstable();
+        let index = ((latencies.len() as f64 * 0.95).ceil() as usize).saturating_sub(1);
+        Some(latencies[index])
     }
 
     pub fn snapshot(&self) -> Vec<LogEntry> {
@@ -231,7 +275,19 @@ pub async fn log_requests(
 
 #[cfg(test)]
 mod tests {
-    use super::should_log_path;
+    use super::{LogEntry, RequestLog, should_log_path};
+
+    fn entry(ts: i64, latency_ms: u64) -> LogEntry {
+        LogEntry {
+            ts,
+            method: "GET".into(),
+            path: "/track/:id".into(),
+            detail: String::new(),
+            status: 200,
+            latency_ms,
+            client_ip: "127.0.0.1".into(),
+        }
+    }
 
     #[test]
     fn excludes_panel_and_service_requests() {
@@ -250,6 +306,30 @@ mod tests {
         for path in ["/trackManifests/123", "/search/", "/administrator", "/healthcheck"] {
             assert!(should_log_path(path), "{path}");
         }
+    }
+
+    #[test]
+    fn rate_uses_sixty_seconds_even_after_log_eviction() {
+        let log = RequestLog::new();
+        let now = chrono::Utc::now().timestamp();
+        log.record(entry(now - 60, 1));
+        for _ in 0..5001 {
+            log.record(entry(now, 10));
+        }
+
+        assert_eq!(log.snapshot().len(), 5000);
+        assert_eq!(log.requests_last_60s(), 5001);
+    }
+
+    #[test]
+    fn recent_p95_uses_nearest_rank_and_is_empty_without_requests() {
+        let log = RequestLog::new();
+        assert_eq!(log.recent_p95_ms(), None);
+        let now = chrono::Utc::now().timestamp();
+        for latency in 1..=100 {
+            log.record(entry(now, latency));
+        }
+        assert_eq!(log.recent_p95_ms(), Some(95));
     }
 }
 

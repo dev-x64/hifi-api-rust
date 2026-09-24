@@ -228,7 +228,7 @@ button:focus-visible,input:focus-visible,select:focus-visible { outline:2px soli
 .section-head h2 { font-size:17px; letter-spacing:-.25px; }
 .section-head p { color:var(--muted); font-size:12px; margin-top:5px; line-height:1.45; }
 .section-actions { display:flex; gap:8px; flex-wrap:wrap; }
-.stats { grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px; }
+.stats { grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; }
 .stat-card { border-color:var(--line); background:linear-gradient(145deg,#151a22,#11161d); border-radius:12px; padding:18px; min-height:100px; }
 .stat-card:hover { border-color:#394452; }
 .stat-card .label { color:var(--muted); font-family:Inter,sans-serif; font-size:10px; font-weight:700; }
@@ -280,8 +280,10 @@ button:focus-visible,input:focus-visible,select:focus-visible { outline:2px soli
 .minimal-login button:disabled { opacity:.55; cursor:wait; }
 .minimal-login .auth-error { margin:11px 2px 0; min-height:18px; }
 .sr-only { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0; }
-@media (max-width:980px) {
+@media (max-width:1150px) {
   .stats { grid-template-columns:repeat(2,minmax(0,1fr)); }
+}
+@media (max-width:980px) {
   .system-grid { grid-template-columns:1fr; }
   .span-2 { grid-column:auto; }
 }
@@ -844,6 +846,8 @@ async function fetchData() {
 
         document.getElementById('stats').innerHTML =
             '<div class="stat-card"><div class="label">Всего запросов</div><div class="value">' + (stats.total_requests || 0) + '</div></div>' +
+            '<div class="stat-card" title="Среднее число завершённых API-запросов в секунду за последние 60 секунд"><div class="label">Запросов/с · 60 с</div><div class="value">' + Number(stats.requests_per_second_60s || 0).toFixed(2) + '</div></div>' +
+            '<div class="stat-card" title="95% запросов в журнале (до 5000 последних) ответили не медленнее этого значения"><div class="label">p95 ответа · до 5000</div><div class="value">' + (stats.recent_p95_ms != null ? stats.recent_p95_ms + ' <span style="font-size:15px;color:var(--muted);font-weight:500">мс</span>' : '—') + '</div></div>' +
             '<div class="stat-card"><div class="label">Доля ошибок</div><div class="value">' + (stats.error_rate || '0.00%') + '</div></div>' +
             '<div class="stat-card"><div class="label">Активные аккаунты</div><div class="value">' + (stats.healthy_accounts || 0) + '<span style="font-size:15px;color:var(--muted);font-weight:500"> / ' + (stats.total_accounts || 0) + '</span></div></div>' +
             playbackCard(stats.playback) +
