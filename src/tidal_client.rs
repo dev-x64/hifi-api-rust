@@ -48,6 +48,10 @@ impl TidalClient {
         self.proxy_manager.working_client().await
     }
 
+    pub async fn working_client_for(&self, account_id: &str) -> Result<Client, AppError> {
+        self.proxy_manager.working_client_for(account_id).await
+    }
+
     pub fn proxy_manager(&self) -> &Arc<ProxyManager> {
         &self.proxy_manager
     }
@@ -84,8 +88,6 @@ impl TidalClient {
             1
         };
 
-        let http = self.working_client().await?;
-
         let mut failed_ids: Vec<String> = Vec::new();
         let account_count = self.account_manager.playback_count().await;
         let max_account_attempts = std::cmp::max(1, account_count);
@@ -118,6 +120,8 @@ impl TidalClient {
                 }
             };
 
+            let mut http = self.working_client_for(&account.id).await?;
+
             for attempt in 0..max_retries {
 
                 let token = match self
@@ -141,6 +145,10 @@ impl TidalClient {
                     tokio::time::sleep(Duration::from_millis(jitter)).await;
                 }
 
+                // A refresh may have moved this account when the optional
+                // rotate-on-refresh setting is enabled.
+                http = self.working_client_for(&account.id).await?;
+
                 let mut req = http
                     .get(url)
                     .header("authorization", format!("Bearer {}", token))
@@ -157,12 +165,12 @@ impl TidalClient {
 
                 let resp = match req.send().await {
                     Ok(r) => {
-                        self.proxy_manager.note_success();
+                        self.proxy_manager.note_success_for(&account.id).await;
                         r
                     }
                     Err(e) => {
                         if e.is_connect() || e.is_timeout() {
-                            self.proxy_manager.note_failure();
+                            self.proxy_manager.note_failure_for(&account.id).await;
                         }
                         return Err(e.into());
                     }
@@ -189,6 +197,7 @@ impl TidalClient {
                         if let Some(ref stored_token) = *stored {
                             if stored_token != &fresh_token {
                                 drop(stored);
+                                http = self.working_client_for(&account.id).await?;
                                 let mut req2 = http
                                     .get(url)
                                     .header("authorization", format!("Bearer {}", fresh_token))
@@ -203,12 +212,12 @@ impl TidalClient {
                                 }
                                 let resp2 = match req2.send().await {
                                     Ok(r) => {
-                                        self.proxy_manager.note_success();
+                                        self.proxy_manager.note_success_for(&account.id).await;
                                         r
                                     }
                                     Err(e) => {
                                         if e.is_connect() || e.is_timeout() {
-                                            self.proxy_manager.note_failure();
+                                            self.proxy_manager.note_failure_for(&account.id).await;
                                         }
                                         return Err(e.into());
                                     }
@@ -326,8 +335,9 @@ impl TidalClient {
         url: &str,
         params: Option<Vec<(&str, &str)>>,
         token: &str,
+        account_id: &str,
     ) -> Result<Value, AppError> {
-        let http = self.working_client().await?;
+        let http = self.working_client_for(account_id).await?;
         let mut req = http
             .get(url)
             .header("authorization", format!("Bearer {}", token))
@@ -342,7 +352,18 @@ impl TidalClient {
             req = req.query(&p);
         }
 
-        let resp = req.send().await?;
+        let resp = match req.send().await {
+            Ok(resp) => {
+                self.proxy_manager.note_success_for(account_id).await;
+                resp
+            }
+            Err(e) => {
+                if e.is_connect() || e.is_timeout() {
+                    self.proxy_manager.note_failure_for(account_id).await;
+                }
+                return Err(e.into());
+            }
+        };
         let status = resp.status();
 
         if !status.is_success() {
@@ -458,7 +479,18 @@ impl TidalClient {
         if !params.is_empty() {
             req = req.query(&params);
         }
-        let resp = req.send().await?;
+        let resp = match req.send().await {
+            Ok(resp) => {
+                self.proxy_manager.note_success();
+                resp
+            }
+            Err(e) => {
+                if e.is_connect() || e.is_timeout() {
+                    self.proxy_manager.note_failure();
+                }
+                return Err(e.into());
+            }
+        };
         let status = resp.status();
         if !status.is_success() {
             return Err(AppError::UpstreamError(status, "Catalog token request failed".into()));
@@ -479,9 +511,10 @@ impl TidalClient {
         url: &str,
         params: Vec<(&str, &str)>,
     ) -> Result<Value, AppError> {
-        let http = self.working_client().await?;
+        let mut http = self.working_client_for(&account.id).await?;
         let mut token = self.token_manager.get_token(account, &http).await?;
         for attempt in 0..2 {
+            http = self.working_client_for(&account.id).await?;
             let mut req = http
                 .get(url)
                 .header("authorization", format!("Bearer {}", token))
@@ -494,7 +527,18 @@ impl TidalClient {
             if !params.is_empty() {
                 req = req.query(&params);
             }
-            let resp = req.send().await?;
+            let resp = match req.send().await {
+                Ok(resp) => {
+                    self.proxy_manager.note_success_for(&account.id).await;
+                    resp
+                }
+                Err(e) => {
+                    if e.is_connect() || e.is_timeout() {
+                        self.proxy_manager.note_failure_for(&account.id).await;
+                    }
+                    return Err(e.into());
+                }
+            };
             let status = resp.status();
             if status.as_u16() == 401 && attempt == 0 {
                 token = self.token_manager.refresh_token(account, &http).await?;

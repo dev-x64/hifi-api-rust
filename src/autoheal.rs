@@ -30,13 +30,6 @@ pub async fn start_autoheal_loop(
             if !settings.auto_heal.load(Ordering::Relaxed) {
                 continue;
             }
-            let client = match proxy_manager.working_client().await {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::debug!("Auto-heal skipped: {}", e);
-                    continue;
-                }
-            };
             let now = Utc::now().timestamp();
             for account in account_manager.list_accounts().await {
                 if !account.auto_disabled.load(Ordering::Relaxed) {
@@ -53,6 +46,13 @@ pub async fn start_autoheal_loop(
                     continue;
                 }
                 tracing::info!("Auto-heal: retrying account {}", account.label);
+                let client = match proxy_manager.working_client_for(&account.id).await {
+                    Ok(client) => client,
+                    Err(e) => {
+                        tracing::debug!("Auto-heal skipped for {}: {}", account.label, e);
+                        continue;
+                    }
+                };
                 match token_manager.refresh_token(&account, &client).await {
                     Ok(_) => {
                         let _ = account_manager.set_account_active(&account.id, true).await;

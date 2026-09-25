@@ -89,7 +89,7 @@ async fn main() {
     // ProxyManager owns the shared HTTP client (direct by default; proxied
     // when USE_PROXIES=true). The initial proxy resolve runs in the background
     // so startup is never blocked on proxy tests.
-    let proxy_manager = Arc::new(proxy_manager::ProxyManager::new(config.clone()));
+    let proxy_manager = Arc::new(proxy_manager::ProxyManager::new(config.clone(), db.clone()));
     if let Some(pool) = &db {
         let saved_enabled = sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = 'proxy_enabled'")
             .fetch_optional(pool).await.ok().flatten();
@@ -105,6 +105,7 @@ async fn main() {
             }
         }
     }
+    proxy_manager.load_assignments().await;
     proxy_manager.spawn_initial_resolve();
 
     let switching_weights = SwitchingWeights::default();

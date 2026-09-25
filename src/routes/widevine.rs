@@ -57,7 +57,7 @@ pub(crate) async fn fetch_widevine_license(
                 };
             }
         };
-        let hc = state.tidal_client.working_client().await?;
+        let mut hc = state.tidal_client.working_client_for(&account.id).await?;
         let token = match state.token_manager.get_token(&account, &hc).await {
             Ok(t) => t,
             Err(e) => {
@@ -70,11 +70,12 @@ pub(crate) async fn fetch_widevine_license(
                 continue;
             }
         };
+        hc = state.tidal_client.working_client_for(&account.id).await?;
 
         let url = "https://api.tidal.com/v2/widevine";
 
-        let send = |token: &str| {
-            hc.request(
+        let send = |client: &reqwest::Client, token: &str| {
+            client.request(
                 method.parse::<Method>().unwrap_or(Method::POST),
                 url,
             )
@@ -92,9 +93,15 @@ pub(crate) async fn fetch_widevine_license(
         // account before failing over. Transport errors are proxy-level
         // (same as make_request): surface immediately, no failover.
         let mut token_owned = token;
-        let mut resp = match send(&token_owned).await {
-            Ok(r) => r,
-            Err(_) => {
+        let mut resp = match send(&hc, &token_owned).await {
+            Ok(r) => {
+                state.proxy_manager.note_success_for(&account.id).await;
+                r
+            },
+            Err(e) => {
+                if e.is_connect() || e.is_timeout() {
+                    state.proxy_manager.note_failure_for(&account.id).await;
+                }
                 return Err(AppError::ServiceUnavailable(
                     "Error communicating with widevine server".into(),
                 ));
@@ -104,9 +111,16 @@ pub(crate) async fn fetch_widevine_license(
             match state.token_manager.refresh_token(&account, &hc).await {
                 Ok(fresh) => {
                     token_owned = fresh;
-                    match send(&token_owned).await {
-                        Ok(r) => resp = r,
-                        Err(_) => {
+                    hc = state.tidal_client.working_client_for(&account.id).await?;
+                    match send(&hc, &token_owned).await {
+                        Ok(r) => {
+                            state.proxy_manager.note_success_for(&account.id).await;
+                            resp = r;
+                        },
+                        Err(e) => {
+                            if e.is_connect() || e.is_timeout() {
+                                state.proxy_manager.note_failure_for(&account.id).await;
+                            }
                             return Err(AppError::ServiceUnavailable(
                                 "Error communicating with widevine server".into(),
                             ));

@@ -62,7 +62,7 @@ var ruToEn = {
     'Прокси': 'Proxies',
     'Маршрутизация исходящих запросов. Изменения применяются сразу.': 'Route outgoing requests. Changes take effect immediately.',
     'Статус': 'Status',
-    'Текущий': 'Current',
+    'Назначено': 'Assigned',
     'В пуле': 'In pool',
     'Сбоев': 'Failures',
     'Адреса прокси · по одному в строке': 'Proxy addresses · one per line',

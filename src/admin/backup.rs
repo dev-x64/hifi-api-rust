@@ -204,6 +204,10 @@ pub async fn restore_backup(
         .begin()
         .await
         .map_err(|e| AppError::Internal(format!("Restore failed: {}", e)))?;
+    sqlx::query("DELETE FROM proxy_assignments")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AppError::Internal(format!("Restore failed: {}", e)))?;
     for (table, cols) in [
         (
             "accounts",
@@ -257,6 +261,7 @@ pub async fn restore_backup(
             ][..],
         ),
         ("settings", &[("key", Text), ("value", Text)][..]),
+        ("proxy_assignments", &[("account_id", Text), ("proxy_url", Text)][..]),
     ] {
         if !names.contains(&table) {
             continue;
@@ -273,6 +278,18 @@ pub async fn restore_backup(
     state.account_manager.reload_from_db().await?;
     state.api_keys.reload_from_db().await?;
     state.settings.load_from_db(db).await;
+    let saved_enabled = sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = 'proxy_enabled'")
+        .fetch_optional(db).await.ok().flatten();
+    let saved_entries = sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = 'proxy_urls'")
+        .fetch_optional(db).await.ok().flatten();
+    let enabled = saved_enabled.as_deref().map(|value| value == "true")
+        .unwrap_or(state.config.use_proxies);
+    let entries = saved_entries
+        .and_then(|value| serde_json::from_str::<Vec<String>>(&value).ok())
+        .unwrap_or(state.proxy_manager.entries().await);
+    state.proxy_manager.configure(enabled, entries).await?;
+    state.proxy_manager.load_assignments().await;
+    state.proxy_manager.spawn_initial_resolve();
     // Publish the restored settings fleet-wide.
     state.settings.save_to_redis().await;
     // The restore wins: republish the restored roster and drop anything the

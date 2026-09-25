@@ -131,24 +131,15 @@ impl TokenManager {
             return Ok(token);
         }
 
-        // Upstream parity: rotate the proxy before refreshing when enabled.
-        // Re-resolve afterwards so this refresh uses the new egress.
-        let rotated_client;
-        let http_client = if self
-            .proxy_manager
-            .get()
-            .map(|pm| pm.should_rotate_on_refresh())
-            .unwrap_or(false)
-        {
-            let pm = self.proxy_manager.get().unwrap().clone();
-            pm.rotate_now();
-            match pm.working_client().await {
-                Ok(c) => {
-                    rotated_client = c;
-                    &rotated_client
-                }
-                Err(_) => http_client,
+        // Refresh through this account's egress, including manual refresh and
+        // pre-warming paths that may have received a generic client.
+        let account_client;
+        let http_client = if let Some(pm) = self.proxy_manager.get() {
+            if pm.should_rotate_on_refresh() {
+                pm.rotate_account(&account.id).await;
             }
+            account_client = pm.working_client_for(&account.id).await?;
+            &account_client
         } else {
             http_client
         };
@@ -163,7 +154,21 @@ impl TokenManager {
             ])
             .basic_auth(&account.client_id, Some(&account.client_secret))
             .send()
-            .await?;
+            .await;
+        let res = match res {
+            Ok(res) => {
+                if let Some(pm) = self.proxy_manager.get() {
+                    pm.note_success_for(&account.id).await;
+                }
+                res
+            }
+            Err(e) => {
+                if (e.is_connect() || e.is_timeout()) && self.proxy_manager.get().is_some() {
+                    self.proxy_manager.get().unwrap().note_failure_for(&account.id).await;
+                }
+                return Err(e.into());
+            }
+        };
 
         let status_code = res.status().as_u16();
         if status_code == 400 || status_code == 401 || status_code == 403 {
@@ -228,7 +233,7 @@ impl TokenManager {
         Ok(new_token)
     }
 
-    pub async fn prewarm_all(&self, manager: &AccountManager, http_client: &Client) {
+    pub async fn prewarm_all(&self, manager: &AccountManager, proxy_manager: &ProxyManager) {
         let accounts = manager.list_accounts().await;
         tracing::info!("Pre-warming tokens for {} accounts", accounts.len());
 
@@ -250,7 +255,14 @@ impl TokenManager {
             ))
             .await;
 
-            match self.refresh_token(account, http_client).await {
+            let client = match proxy_manager.working_client_for(&account.id).await {
+                Ok(client) => client,
+                Err(e) => {
+                    tracing::warn!("Pre-warm skipped for {}: {}", account.label, e);
+                    continue;
+                }
+            };
+            match self.refresh_token(account, &client).await {
                 Ok(_token) => {
                     tracing::info!(
                         "Pre-warmed token for account {} (expires at {})",
@@ -275,10 +287,7 @@ impl TokenManager {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(300)).await;
-                match proxy_manager.working_client().await {
-                    Ok(client) => self.prewarm_all(&manager, &client).await,
-                    Err(e) => tracing::warn!("Token pre-warm skipped: {}", e),
-                }
+                self.prewarm_all(&manager, &proxy_manager).await;
             }
         });
     }

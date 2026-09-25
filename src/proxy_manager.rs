@@ -1,12 +1,15 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use chrono::Utc;
+use futures::future::join_all;
 use rand::Rng;
 use reqwest::Client;
 use serde_json::{json, Value};
+use sqlx::SqlitePool;
 use tokio::sync::{Mutex, RwLock};
 
 use crate::config::Config;
@@ -30,6 +33,7 @@ fn build_client(proxy_url: Option<&str>, user_agent: &str) -> Result<Client, Str
 
 pub struct ProxyManager {
     config: Arc<Config>,
+    db: Option<SqlitePool>,
     enabled: AtomicBool,
     proxies: RwLock<Vec<String>>,
     direct_client: Client,
@@ -46,10 +50,25 @@ pub struct ProxyManager {
     rotating: AtomicBool,
     generation: AtomicU64,
     switch_lock: Mutex<()>,
+    account_routes: Mutex<AccountRoutes>,
+}
+
+struct AccountProxy {
+    url: String,
+    client: Client,
+    failures: u64,
+    verified: bool,
+}
+
+#[derive(Default)]
+struct AccountRoutes {
+    assignments: HashMap<String, AccountProxy>,
+    avoided: HashMap<String, String>,
+    last_failed: HashMap<String, i64>,
 }
 
 impl ProxyManager {
-    pub fn new(config: Arc<Config>) -> Self {
+    pub fn new(config: Arc<Config>, db: Option<SqlitePool>) -> Self {
         let proxies = if config.proxies_file.exists() {
             Self::load_proxies_from_file(&config.proxies_file)
         } else {
@@ -60,6 +79,7 @@ impl ProxyManager {
         Self {
             enabled: AtomicBool::new(config.use_proxies),
             config,
+            db,
             proxies: RwLock::new(proxies),
             direct_client: direct.clone(),
             client: ArcSwap::from_pointee(direct),
@@ -71,6 +91,41 @@ impl ProxyManager {
             rotating: AtomicBool::new(false),
             generation: AtomicU64::new(0),
             switch_lock: Mutex::new(()),
+            account_routes: Mutex::new(AccountRoutes::default()),
+        }
+    }
+
+    /// Restore local account-to-proxy bindings before requests start. A restored
+    /// proxy is checked on first use, and invalid/removed entries are replaced.
+    pub async fn load_assignments(&self) {
+        let _switch = self.switch_lock.lock().await;
+        let Some(db) = &self.db else { return; };
+        let rows = sqlx::query_as::<_, (String, String)>(
+            "SELECT p.account_id, p.proxy_url FROM proxy_assignments p JOIN accounts a ON a.id = p.account_id",
+        )
+        .fetch_all(db).await;
+        let rows = match rows {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!("Could not load proxy assignments: {e}");
+                return;
+            }
+        };
+        let entries = self.proxies.read().await.clone();
+        let mut routes = self.account_routes.lock().await;
+        routes.assignments.clear();
+        routes.avoided.clear();
+        routes.last_failed.clear();
+        for (account_id, url) in rows {
+            if !entries.contains(&url) { continue; }
+            if let Ok(client) = build_client(Some(&url), &self.config.user_agent) {
+                routes.assignments.insert(account_id, AccountProxy {
+                    url,
+                    client,
+                    failures: 0,
+                    verified: false,
+                });
+            }
         }
     }
 
@@ -100,6 +155,7 @@ impl ProxyManager {
 
     pub async fn configure(&self, enabled: bool, proxies: Vec<String>) -> Result<(), AppError> {
         let proxies = Self::normalize_proxies(proxies, enabled)?;
+        let active = proxies.clone();
         let _guard = self.switch_lock.lock().await;
         self.generation.fetch_add(1, Ordering::AcqRel);
         *self.proxies.write().await = proxies;
@@ -109,6 +165,27 @@ impl ProxyManager {
         self.ready.store(!enabled, Ordering::Release);
         self.fails.store(0, Ordering::Relaxed);
         self.last_try.store(0, Ordering::Relaxed);
+        let removed = {
+            let mut routes = self.account_routes.lock().await;
+            let mut removed = Vec::new();
+            routes.assignments.retain(|id, route| {
+                if active.contains(&route.url) { true } else {
+                    removed.push(id.clone());
+                    false
+                }
+            });
+            routes.avoided.retain(|_, url| active.contains(url));
+            routes.last_failed.clear();
+            removed
+        };
+        if let Some(db) = &self.db {
+            for id in removed {
+                if let Err(e) = sqlx::query("DELETE FROM proxy_assignments WHERE account_id = ?")
+                    .bind(id).execute(db).await {
+                    tracing::warn!("Could not clear removed proxy assignment: {e}");
+                }
+            }
+        }
         tracing::info!("Proxy mode {}", if enabled { "enabled" } else { "disabled" });
         Ok(())
     }
@@ -164,6 +241,136 @@ impl ProxyManager {
         Err(AppError::ServiceUnavailable(
             "No working proxy available and direct fallback is disabled".into(),
         ))
+    }
+
+    /// A stable egress for one Tidal account. Free proxies are preferred, so
+    /// accounts spread across the pool; extra proxies remain available for failover.
+    pub async fn working_client_for(&self, account_id: &str) -> Result<Client, AppError> {
+        let _switch = self.switch_lock.lock().await;
+        if !self.proxies_enabled() {
+            return Ok(self.direct_client.clone());
+        }
+        let entries = self.proxies.read().await.clone();
+        let mut routes = self.account_routes.lock().await;
+        if let Some(existing) = routes.assignments.get(account_id) {
+            if entries.contains(&existing.url) {
+                if existing.verified {
+                    return Ok(existing.client.clone());
+                }
+                let url = existing.url.clone();
+                if self.test_proxy(&url).await {
+                    let existing = routes.assignments.get_mut(account_id).unwrap();
+                    existing.verified = true;
+                    return Ok(existing.client.clone());
+                }
+                routes.avoided.insert(account_id.to_string(), url);
+            }
+            routes.assignments.remove(account_id);
+        }
+
+        let now = Utc::now().timestamp();
+        if routes.last_failed.get(account_id).is_some_and(|last| now - last < 30) {
+            return self.unavailable_for(account_id);
+        }
+
+        let avoid = routes.avoided.get(account_id).map(String::as_str);
+        let candidates = ordered_candidates(account_id, &entries, &routes.assignments, avoid);
+        for group in candidates.chunks(5) {
+            let checks = join_all(group.iter().map(|url| self.test_proxy(url))).await;
+            for (url, works) in group.iter().zip(checks) {
+                if !works { continue; }
+                let client = match build_client(Some(url), &self.config.user_agent) {
+                    Ok(client) => client,
+                    Err(e) => {
+                        tracing::warn!("Could not build proxy client: {e}");
+                        continue;
+                    }
+                };
+                routes.assignments.insert(account_id.to_string(), AccountProxy {
+                    url: url.clone(), client: client.clone(), failures: 0, verified: true,
+                });
+                routes.avoided.remove(account_id);
+                routes.last_failed.remove(account_id);
+                if let Some(db) = &self.db {
+                    if let Err(e) = sqlx::query(
+                        "INSERT INTO proxy_assignments (account_id, proxy_url) VALUES (?, ?) \
+                         ON CONFLICT(account_id) DO UPDATE SET proxy_url = excluded.proxy_url",
+                    )
+                    .bind(account_id)
+                    .bind(url)
+                    .execute(db)
+                    .await {
+                        tracing::warn!("Could not save proxy assignment: {e}");
+                    }
+                }
+                tracing::info!("Account {} assigned proxy {}", account_id, mask_proxy(url));
+                return Ok(client);
+            }
+        }
+        routes.last_failed.insert(account_id.to_string(), now);
+        self.unavailable_for(account_id)
+    }
+
+    fn unavailable_for(&self, account_id: &str) -> Result<Client, AppError> {
+        if self.config.fallback_to_direct {
+            tracing::warn!("No working proxy for account {} — using direct connection", account_id);
+            return Ok(self.direct_client.clone());
+        }
+        Err(AppError::ServiceUnavailable(
+            "No working proxy available and direct fallback is disabled".into(),
+        ))
+    }
+
+    pub async fn note_success_for(&self, account_id: &str) {
+        if let Some(route) = self.account_routes.lock().await.assignments.get_mut(account_id) {
+            route.failures = 0;
+        }
+    }
+
+    pub async fn note_failure_for(&self, account_id: &str) {
+        if !self.proxies_enabled() { return; }
+        let should_rotate = {
+            let mut routes = self.account_routes.lock().await;
+            if let Some(route) = routes.assignments.get_mut(account_id) {
+                route.failures += 1;
+                route.failures >= 3
+            } else { false }
+        };
+        if should_rotate {
+            self.rotate_account(account_id).await;
+        }
+    }
+
+    /// Drop only this account's binding; its next request picks a tested spare.
+    pub async fn rotate_account(&self, account_id: &str) {
+        let _switch = self.switch_lock.lock().await;
+        let mut routes = self.account_routes.lock().await;
+        let old = routes.assignments.remove(account_id).map(|r| r.url);
+        if let Some(url) = old {
+            routes.avoided.insert(account_id.to_string(), url.clone());
+            routes.last_failed.remove(account_id);
+            tracing::warn!("Account {} leaving proxy {}", account_id, mask_proxy(&url));
+            if let Some(db) = &self.db {
+                if let Err(e) = sqlx::query("DELETE FROM proxy_assignments WHERE account_id = ?")
+                    .bind(account_id).execute(db).await {
+                    tracing::warn!("Could not clear proxy assignment: {e}");
+                }
+            }
+        }
+    }
+
+    pub async fn forget_account(&self, account_id: &str) {
+        let _switch = self.switch_lock.lock().await;
+        let mut routes = self.account_routes.lock().await;
+        routes.assignments.remove(account_id);
+        routes.avoided.remove(account_id);
+        routes.last_failed.remove(account_id);
+        if let Some(db) = &self.db {
+            if let Err(e) = sqlx::query("DELETE FROM proxy_assignments WHERE account_id = ?")
+                .bind(account_id).execute(db).await {
+                tracing::warn!("Could not delete proxy assignment: {e}");
+            }
+        }
     }
 
     /// Attempt one resolve, throttled to at most once per 30s. Returns ready state.
@@ -248,14 +455,6 @@ impl ProxyManager {
             self.fails.store(0, Ordering::Relaxed);
             self.rotate();
         }
-    }
-
-    /// Swap to the next proxy immediately (round-robin); health is verified
-    /// in the background so a failing request never blocks on proxy tests.
-    /// Public entry point for refresh-triggered rotation (upstream:
-    /// ROTATE_PROXIES_ON_REFRESH).
-    pub fn rotate_now(self: &Arc<Self>) {
-        self.rotate();
     }
 
     /// True when token refreshes should rotate the proxy first.
@@ -370,17 +569,43 @@ impl ProxyManager {
     pub async fn status(&self) -> Value {
         let proxies = self.proxies.read().await;
         let current = self.current.read().await;
+        let routes = self.account_routes.lock().await;
+        let mut assignments: Vec<Value> = routes.assignments.iter().map(|(id, route)| json!({
+            "account_id": id, "proxy": mask_proxy(&route.url), "verified": route.verified,
+            "consecutive_fails": route.failures,
+        })).collect();
+        assignments.sort_by(|a, b| a["account_id"].as_str().cmp(&b["account_id"].as_str()));
         json!({
             "enabled": self.proxies_enabled(),
-            "ready": self.ready.load(Ordering::Relaxed),
+            "ready": self.ready.load(Ordering::Relaxed) || routes.assignments.values().any(|route| route.verified),
             "current": current.as_ref().map(|p| mask_proxy(p)),
             "pool_size": proxies.len(),
             "consecutive_fails": self.fails.load(Ordering::Relaxed),
             "last_try": self.last_try.load(Ordering::Relaxed),
             "fallback_to_direct": self.config.fallback_to_direct,
             "entries": proxies.clone(),
+            "assignments": assignments,
         })
     }
+}
+
+fn ordered_candidates(
+    account_id: &str,
+    entries: &[String],
+    assignments: &HashMap<String, AccountProxy>,
+    avoid: Option<&str>,
+) -> Vec<String> {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    account_id.hash(&mut hasher);
+    let offset = hasher.finish() as usize;
+    let mut candidates: Vec<(usize, &String)> = entries.iter().enumerate().collect();
+    candidates.sort_by_key(|(index, url)| {
+        let used = assignments.values().filter(|route| route.url.as_str() == url.as_str()).count();
+        let avoided = usize::from(Some(url.as_str()) == avoid && entries.len() > 1);
+        (avoided, used, (index + entries.len() - offset % entries.len()) % entries.len())
+    });
+    candidates.into_iter().map(|(_, url)| url.clone()).collect()
 }
 
 fn mask_proxy(url: &str) -> String {
@@ -391,5 +616,97 @@ fn mask_proxy(url: &str) -> String {
             None => url.to_string(),
         },
         None => url.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn fake_proxy() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut buf = [0; 4096];
+                    let _ = stream.read(&mut buf).await;
+                    let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await;
+                });
+            }
+        });
+        (url, task)
+    }
+
+    #[test]
+    fn assignments_use_distinct_proxies_before_sharing() {
+        let entries: Vec<String> = (0..12).map(|n| format!("http://proxy-{n}:8080")).collect();
+        let mut assignments = HashMap::new();
+        for n in 0..10 {
+            let id = format!("account-{n}");
+            let url = ordered_candidates(&id, &entries, &assignments, None).remove(0);
+            assignments.insert(id, AccountProxy {
+                url,
+                client: Client::new(),
+                failures: 0,
+                verified: true,
+            });
+        }
+        let distinct: std::collections::HashSet<_> = assignments.values().map(|r| r.url.clone()).collect();
+        assert_eq!(distinct.len(), 10);
+        let old = assignments.remove("account-0").unwrap().url;
+        let replacement = ordered_candidates("account-0", &entries, &assignments, Some(&old));
+        assert_ne!(replacement[0], old);
+        assert!(!distinct.contains(&replacement[0]));
+    }
+
+    #[tokio::test]
+    async fn account_failover_keeps_other_binding_and_persists() {
+        let (first, first_server) = fake_proxy().await;
+        let (second, second_server) = fake_proxy().await;
+        let db = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:").await.unwrap();
+        sqlx::query("CREATE TABLE accounts (id TEXT PRIMARY KEY)").execute(&db).await.unwrap();
+        sqlx::query("CREATE TABLE proxy_assignments (account_id TEXT PRIMARY KEY, proxy_url TEXT NOT NULL)")
+            .execute(&db).await.unwrap();
+        for id in ["account-a", "account-b"] {
+            sqlx::query("INSERT INTO accounts (id) VALUES (?)").bind(id).execute(&db).await.unwrap();
+        }
+        let mut config = Config::from_env();
+        config.use_proxies = true;
+        config.fallback_to_direct = false;
+        config.proxies_file = std::path::PathBuf::from("/tmp/hifi-test-no-proxies-file");
+        let config = Arc::new(config);
+        let manager = ProxyManager::new(config.clone(), Some(db.clone()));
+        manager.configure(true, vec![first.clone(), second.clone()]).await.unwrap();
+        manager.working_client_for("account-a").await.unwrap();
+        manager.working_client_for("account-b").await.unwrap();
+        let before = manager.status().await;
+        let bindings = before["assignments"].as_array().unwrap();
+        let a_before = bindings.iter().find(|v| v["account_id"] == "account-a").unwrap()["proxy"].as_str().unwrap().to_string();
+        let b_before = bindings.iter().find(|v| v["account_id"] == "account-b").unwrap()["proxy"].as_str().unwrap().to_string();
+        assert_ne!(a_before, b_before);
+
+        for _ in 0..3 { manager.note_failure_for("account-a").await; }
+        manager.working_client_for("account-a").await.unwrap();
+        let after = manager.status().await;
+        let bindings = after["assignments"].as_array().unwrap();
+        let a_after = bindings.iter().find(|v| v["account_id"] == "account-a").unwrap()["proxy"].as_str().unwrap();
+        let b_after = bindings.iter().find(|v| v["account_id"] == "account-b").unwrap()["proxy"].as_str().unwrap();
+        assert_ne!(a_after, a_before);
+        assert_eq!(b_after, b_before);
+
+        let restarted = ProxyManager::new(config, Some(db));
+        restarted.configure(true, vec![first, second]).await.unwrap();
+        restarted.load_assignments().await;
+        let restored = restarted.status().await;
+        let restored_a = restored["assignments"].as_array().unwrap().iter()
+            .find(|v| v["account_id"] == "account-a").unwrap()["proxy"].as_str().unwrap();
+        assert_eq!(restored_a, a_after);
+        first_server.abort();
+        second_server.abort();
     }
 }

@@ -58,7 +58,7 @@ pub(crate) async fn fetch_video_playback(
             Ok(a) => a,
             Err(e) => return Err(last_err.unwrap_or(e)),
         };
-        let hc = state.tidal_client.working_client().await?;
+        let hc = state.tidal_client.working_client_for(&account.id).await?;
         let token = match state.token_manager.get_token(&account, &hc).await {
             Ok(t) => t,
             Err(e) => {
@@ -80,7 +80,7 @@ pub(crate) async fn fetch_video_playback(
         };
         match state
             .tidal_client
-            .make_authed_request(&url, Some(params()), &token)
+            .make_authed_request(&url, Some(params()), &token, &account.id)
             .await
         {
             Ok(data) => {
@@ -95,7 +95,7 @@ pub(crate) async fn fetch_video_playback(
                     Ok(fresh) => {
                         match state
                             .tidal_client
-                            .make_authed_request(&url, Some(params()), &fresh)
+                            .make_authed_request(&url, Some(params()), &fresh, &account.id)
                             .await
                         {
                             Ok(data) => {

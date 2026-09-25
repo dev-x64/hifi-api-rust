@@ -105,5 +105,14 @@ pub async fn init_pool(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
     .execute(&pool)
     .await?;
 
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS proxy_assignments (
+            account_id TEXT PRIMARY KEY,
+            proxy_url TEXT NOT NULL
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
     Ok(pool)
 }

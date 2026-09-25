@@ -111,6 +111,7 @@ pub async fn remove_account(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, AppError> {
     state.account_manager.remove_account(&id).await?;
+    state.proxy_manager.forget_account(&id).await;
     Ok(Json(json!({ "message": "Account removed" })))
 }
 
@@ -168,7 +169,7 @@ pub async fn refresh_account_token(
         .await
         .ok_or_else(|| AppError::NotFound(format!("Account {} not found", id)))?;
 
-    let hc = state.tidal_client.working_client().await?;
+    let hc = state.tidal_client.working_client_for(&account.id).await?;
     match state
         .token_manager
         .refresh_token(&account, &hc)
@@ -206,14 +207,14 @@ pub async fn test_all_accounts(
 
     let accounts = state.account_manager.list_accounts().await;
     let country = &state.config.country_code;
-    let client = state.tidal_client.working_client().await?;
     let token_manager = state.token_manager.clone();
 
     let mut handles = Vec::new();
     for account in &accounts {
         let acc = account.clone();
-        let c = client.clone();
+        let c = state.tidal_client.working_client_for(&account.id).await?;
         let tm = token_manager.clone();
+        let pm = state.proxy_manager.clone();
         let cc = country.clone();
         handles.push(tokio::spawn(async move {
             let label = acc.label.clone();
@@ -223,6 +224,10 @@ pub async fn test_all_accounts(
             let start = Instant::now();
             match tm.get_token(&acc, &c).await {
                 Ok(token) => {
+                    let c = match pm.working_client_for(&id).await {
+                        Ok(client) => client,
+                        Err(e) => return json!({"id": id, "label": label, "ok": false, "error": e.to_string()}),
+                    };
                     let url = format!(
                         "https://api.tidal.com/v1/search/tracks?query=test&limit=1&countryCode={}",
                         cc
@@ -409,7 +414,7 @@ pub async fn test_account(
     let is_active = account.is_active.load(std::sync::atomic::Ordering::Relaxed);
     let start = Instant::now();
 
-    let hc = state.tidal_client.working_client().await?;
+    let hc = state.tidal_client.working_client_for(&account.id).await?;
     match state
         .token_manager
         .get_token(&account, &hc)
@@ -417,6 +422,7 @@ pub async fn test_account(
     {
         Ok(token) => {
             let token_ms = start.elapsed().as_millis() as u64;
+            let hc = state.tidal_client.working_client_for(&account.id).await?;
             let resp = hc
                 .get("https://api.tidal.com/v1/tracks/1/")
                 .header("authorization", format!("Bearer {}", token))
