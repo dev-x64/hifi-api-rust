@@ -85,7 +85,7 @@ Copy [`.env.example`](.env.example) for the full list. Values saved in the admin
 
 ### Proxies
 
-`proxies.txt` accepts one `http://` or `https://` proxy URL per line, optionally with credentials. Each Tidal account is assigned a working proxy, with unused proxies preferred so accounts spread across the pool. Assignments persist in local SQLite and are reused after restart. After three consecutive connection or timeout errors, only the affected account moves to another working proxy. If no proxy is usable, Tidal requests fail unless `FALLBACK_TO_DIRECT_CONNECTION=true`. The admin panel can change the list and switch proxy mode without restarting the server. `ROTATE_PROXIES_ON_REFRESH=true` rotates only the account being refreshed.
+`proxies.txt` accepts one `http://` or `https://` proxy URL per line, optionally with credentials. Each Tidal account is assigned a working proxy, with unused proxies preferred so accounts spread across the pool. Assignments persist in local SQLite and are reused after restart. When working proxies are added, accounts sharing a proxy are moved to the new spare proxies until the pool is balanced; unaffected bindings stay in place. After three consecutive connection or timeout errors, only the affected account moves to another working proxy. If no proxy is usable, Tidal requests fail unless `FALLBACK_TO_DIRECT_CONNECTION=true`. The admin panel can change the list and switch proxy mode without restarting the server. `ROTATE_PROXIES_ON_REFRESH=true` rotates only the account being refreshed.
 
 ### Multiple instances
 

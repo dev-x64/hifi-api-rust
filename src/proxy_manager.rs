@@ -127,6 +127,10 @@ impl ProxyManager {
                 });
             }
         }
+        drop(routes);
+        if self.proxies_enabled() {
+            self.rebalance_assignments_locked(&entries).await;
+        }
     }
 
     pub fn proxies_enabled(&self) -> bool {
@@ -157,6 +161,9 @@ impl ProxyManager {
         let proxies = Self::normalize_proxies(proxies, enabled)?;
         let active = proxies.clone();
         let _guard = self.switch_lock.lock().await;
+        let previous = self.proxies.read().await.clone();
+        let added = active.iter().any(|url| !previous.contains(url));
+        let was_enabled = self.proxies_enabled();
         self.generation.fetch_add(1, Ordering::AcqRel);
         *self.proxies.write().await = proxies;
         *self.current.write().await = None;
@@ -186,8 +193,65 @@ impl ProxyManager {
                 }
             }
         }
+        if enabled && (added || !was_enabled) {
+            self.rebalance_assignments_locked(&active).await;
+        }
         tracing::info!("Proxy mode {}", if enabled { "enabled" } else { "disabled" });
         Ok(())
+    }
+
+    /// Called with switch_lock held. Move at most one account onto each tested
+    /// spare proxy, leaving all other account bindings intact.
+    async fn rebalance_assignments_locked(&self, entries: &[String]) {
+        let mut routes = self.account_routes.lock().await;
+        let mut loads: HashMap<String, usize> = HashMap::new();
+        for route in routes.assignments.values() {
+            *loads.entry(route.url.clone()).or_default() += 1;
+        }
+        if !loads.values().any(|count| *count > 1) {
+            return;
+        }
+        let free: Vec<&String> = entries.iter().filter(|url| !loads.contains_key(*url)).collect();
+        let checks = join_all(free.iter().map(|url| self.test_proxy(url))).await;
+        for (target, works) in free.into_iter().zip(checks) {
+            if !works { continue; }
+            let Some(source) = loads.iter()
+                .filter(|(_, count)| **count > 1)
+                .max_by(|(url_a, count_a), (url_b, count_b)| count_a.cmp(count_b).then(url_a.cmp(url_b)))
+                .map(|(url, _)| url.clone()) else { break; };
+            let Some(account_id) = routes.assignments.iter()
+                .filter(|(_, route)| route.url.as_str() == source.as_str())
+                .map(|(id, _)| id.clone())
+                .max() else { continue; };
+            let client = match build_client(Some(target), &self.config.user_agent) {
+                Ok(client) => client,
+                Err(e) => {
+                    tracing::warn!("Could not build proxy client: {e}");
+                    continue;
+                }
+            };
+            routes.assignments.insert(account_id.clone(), AccountProxy {
+                url: target.clone(), client, failures: 0, verified: true,
+            });
+            routes.avoided.remove(&account_id);
+            routes.last_failed.remove(&account_id);
+            *loads.get_mut(&source).unwrap() -= 1;
+            loads.insert(target.clone(), 1);
+            if let Some(db) = &self.db {
+                if let Err(e) = sqlx::query(
+                    "INSERT INTO proxy_assignments (account_id, proxy_url) VALUES (?, ?) \
+                     ON CONFLICT(account_id) DO UPDATE SET proxy_url = excluded.proxy_url",
+                )
+                .bind(&account_id)
+                .bind(target)
+                .execute(db)
+                .await {
+                    tracing::warn!("Could not save proxy assignment: {e}");
+                }
+            }
+            tracing::info!("Account {} rebalanced from {} to {}",
+                account_id, mask_proxy(&source), mask_proxy(target));
+        }
     }
 
     fn load_proxies_from_file(path: &std::path::Path) -> Vec<String> {
@@ -708,5 +772,41 @@ mod tests {
         assert_eq!(restored_a, a_after);
         first_server.abort();
         second_server.abort();
+    }
+
+    #[tokio::test]
+    async fn adding_proxies_moves_only_overloaded_accounts() {
+        let mut proxies = Vec::new();
+        let mut servers = Vec::new();
+        for _ in 0..5 {
+            let (url, server) = fake_proxy().await;
+            proxies.push(url);
+            servers.push(server);
+        }
+        let mut config = Config::from_env();
+        config.use_proxies = true;
+        config.fallback_to_direct = false;
+        config.proxies_file = std::path::PathBuf::from("/tmp/hifi-test-no-proxies-file");
+        let manager = ProxyManager::new(Arc::new(config), None);
+        manager.configure(true, proxies[..3].to_vec()).await.unwrap();
+        for n in 0..5 {
+            manager.working_client_for(&format!("account-{n}")).await.unwrap();
+        }
+        let before = manager.status().await;
+        let before: HashMap<String, String> = before["assignments"].as_array().unwrap().iter()
+            .map(|row| (row["account_id"].as_str().unwrap().to_string(), row["proxy"].as_str().unwrap().to_string()))
+            .collect();
+        assert_eq!(before.values().collect::<std::collections::HashSet<_>>().len(), 3);
+
+        manager.configure(true, proxies).await.unwrap();
+        let after = manager.status().await;
+        let after: HashMap<String, String> = after["assignments"].as_array().unwrap().iter()
+            .map(|row| (row["account_id"].as_str().unwrap().to_string(), row["proxy"].as_str().unwrap().to_string()))
+            .collect();
+        assert_eq!(after.values().collect::<std::collections::HashSet<_>>().len(), 5);
+        assert_eq!(before.iter().filter(|(id, url)|
+            after.get(id.as_str()).map(String::as_str) == Some(url.as_str())
+        ).count(), 3);
+        for server in servers { server.abort(); }
     }
 }
