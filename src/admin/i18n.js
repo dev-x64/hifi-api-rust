@@ -52,7 +52,7 @@ var ruToEn = {
     'Системные настройки': 'System settings',
     'Интеграции, резервные копии и обслуживание.': 'Integrations, backups, and maintenance.',
     'Настройки панели': 'Panel settings',
-    'Язык интерфейса сохраняется в этом браузере.': 'The interface language is saved in this browser.',
+    'Язык интерфейса сохраняется в cookie этого браузера.': 'The interface language is saved in a browser cookie.',
     'Язык интерфейса': 'Interface language',
     'Воспроизведение': 'Playback',
     'Настройки выбора формата и автоматического восстановления.': 'Format selection and automatic recovery settings.',
@@ -238,6 +238,14 @@ var renderedTexts = new WeakMap();
 var sourceAttributes = new WeakMap();
 var translatableAttributes = ['placeholder', 'aria-label', 'title'];
 
+function readLanguageCookie() {
+    var prefix = languageKey + '=';
+    var cookie = document.cookie.split(';').map(function(part) { return part.trim(); })
+        .find(function(part) { return part.indexOf(prefix) === 0; });
+    var value = cookie ? cookie.slice(prefix.length) : '';
+    return value === 'ru' || value === 'en' ? value : null;
+}
+
 function localizedCore(source) {
     var dictionary = adminLanguage === 'ru' ? enToRu : ruToEn;
     if (Object.prototype.hasOwnProperty.call(dictionary, source)) return dictionary[source];
@@ -369,7 +377,8 @@ function localizeTree(root) {
 
 function setLanguage(language) {
     adminLanguage = language === 'ru' ? 'ru' : 'en';
-    try { localStorage.setItem(languageKey, adminLanguage); } catch (_) {}
+    document.cookie = languageKey + '=' + adminLanguage + '; Path=/admin; Max-Age=31536000; SameSite=Lax' +
+        (location.protocol === 'https:' ? '; Secure' : '');
     document.documentElement.lang = adminLanguage;
     document.title = adminLanguage === 'ru' ? 'HiFi API — управление' : 'HiFi API — Admin';
     var select = document.getElementById('panel-language');
@@ -378,9 +387,12 @@ function setLanguage(language) {
 }
 
 function initLanguage() {
-    try { adminLanguage = localStorage.getItem(languageKey) === 'ru' ? 'ru' : 'en'; }
-    catch (_) { adminLanguage = 'en'; }
-    setLanguage(adminLanguage);
+    var saved = readLanguageCookie();
+    if (!saved) {
+        try { saved = localStorage.getItem(languageKey); } catch (_) {}
+    }
+    setLanguage(saved);
+    try { localStorage.removeItem(languageKey); } catch (_) {}
     new MutationObserver(function(mutations) {
         mutations.forEach(function(mutation) {
             if (mutation.type === 'characterData') {
