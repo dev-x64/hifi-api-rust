@@ -9,6 +9,7 @@ use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
 use crate::error::AppError;
+use crate::proxy_manager::ProxyManager;
 use crate::upstash::UpstashStore;
 
 #[derive(Clone, Debug)]
@@ -195,6 +196,7 @@ pub struct AccountManager {
     catalog_rr: AtomicU64,
     /// Shared cross-instance state (None = single-host mode, skip sync).
     upstash: OnceLock<Arc<UpstashStore>>,
+    proxy_manager: OnceLock<Arc<ProxyManager>>,
 }
 
 impl AccountManager {
@@ -239,6 +241,7 @@ impl AccountManager {
             rr_seq: AtomicU64::new(0),
             catalog_rr: AtomicU64::new(0),
             upstash: OnceLock::new(),
+            proxy_manager: OnceLock::new(),
         }
     }
 
@@ -247,6 +250,10 @@ impl AccountManager {
         if let Some(s) = store {
             let _ = self.upstash.set(s);
         }
+    }
+
+    pub fn set_proxy_manager(&self, manager: Arc<ProxyManager>) {
+        let _ = self.proxy_manager.set(manager);
     }
 
     fn upstash(&self) -> Option<Arc<UpstashStore>> {
@@ -379,6 +386,13 @@ impl AccountManager {
         state.updated_at.store(now, Ordering::Relaxed);
         self.accounts.write().await.push(state.clone());
         self.push_account_to_redis(&state).await;
+        if let Some(proxy_manager) = self.proxy_manager.get() {
+            if proxy_manager.proxies_enabled() {
+                if let Err(e) = proxy_manager.working_client_for(&id).await {
+                    tracing::warn!("Account {id} added without a working proxy: {e}");
+                }
+            }
+        }
         Ok(state)
     }
 
@@ -400,6 +414,9 @@ impl AccountManager {
                 .del_many(&[UpstashStore::k_account(id), UpstashStore::k_token(id)])
                 .await;
             store.srem(&UpstashStore::k_accounts_set(), id).await;
+        }
+        if let Some(proxy_manager) = self.proxy_manager.get() {
+            proxy_manager.forget_account(id).await;
         }
         Ok(())
     }
@@ -850,6 +867,7 @@ impl AccountManager {
                 .collect();
             let values = store.mget(&keys).await;
             let mut accounts = self.accounts.write().await;
+            let mut restored_ids = Vec::new();
             for (id, payload) in remote_ids.iter().zip(values.iter()) {
                 let raw = match payload {
                     Some(r) => r,
@@ -982,6 +1000,7 @@ impl AccountManager {
                     }
                     tracing::info!("Restored account {} from Redis backup", state.label);
                     accounts.push(state);
+                    restored_ids.push(id.clone());
                 }
             }
             // Push anything local that Redis never saw (added while Redis
@@ -995,6 +1014,18 @@ impl AccountManager {
             drop(accounts);
             for acc in to_push {
                 self.push_account_to_redis(&acc).await;
+            }
+            if !restored_ids.is_empty() {
+                if let Some(proxy_manager) = self.proxy_manager.get().filter(|pm| pm.proxies_enabled()) {
+                    let proxy_manager = proxy_manager.clone();
+                    tokio::spawn(async move {
+                        for id in restored_ids {
+                            if let Err(e) = proxy_manager.working_client_for(&id).await {
+                                tracing::warn!("Restored account {id} has no working proxy: {e}");
+                            }
+                        }
+                    });
+                }
             }
         }
     }
@@ -1406,6 +1437,67 @@ mod tests {
         reloaded.set_account_active(&account.id, true).await.unwrap();
         assert_eq!(restored.disabled_at.load(Ordering::Relaxed), 0);
 
+        db.close().await;
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn adding_and_removing_account_updates_proxy_assignments() {
+        use crate::config::Config;
+        use crate::proxy_manager::ProxyManager;
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let proxy_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut request = [0; 4096];
+                    let _ = stream.read(&mut request).await;
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                        .await;
+                });
+            }
+        });
+
+        let path = std::env::temp_dir().join(format!(
+            "hifi-proxy-lifecycle-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let db = crate::db::init_pool(&format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        let mut config = Config::from_env();
+        config.use_proxies = true;
+        config.fallback_to_direct = false;
+        config.proxies_file = std::path::PathBuf::from("/tmp/hifi-test-no-proxies-file");
+        let proxy_manager = Arc::new(ProxyManager::new(Arc::new(config), Some(db.clone())));
+        proxy_manager.configure(true, vec![proxy_url]).await.unwrap();
+        let account_manager = AccountManager::new(Some(db.clone()), SwitchingWeights::default());
+        account_manager.set_proxy_manager(proxy_manager.clone());
+
+        let account = account_manager
+            .add_account("a".into(), "c".into(), "s".into(), "rt".into(), None)
+            .await
+            .unwrap();
+        let status = proxy_manager.status().await;
+        assert_eq!(status["assignments"].as_array().unwrap().len(), 1);
+        assert_eq!(status["assignments"][0]["account_id"], account.id);
+        account_manager.remove_account(&account.id).await.unwrap();
+        let status = proxy_manager.status().await;
+        assert!(status["assignments"].as_array().unwrap().is_empty());
+        let saved: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM proxy_assignments")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(saved, 0);
+
+        server.abort();
         db.close().await;
         std::fs::remove_file(path).unwrap();
     }

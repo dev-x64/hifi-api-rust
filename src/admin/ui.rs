@@ -995,7 +995,7 @@ async function removeAccount(id) {
         var res = await fetch('/admin/accounts/' + id, {
             method: 'DELETE', headers: headers()
         });
-        if (res.ok) fetchData();
+        if (res.ok) { await fetchData(); loadProxyStatus(); }
     } catch(e) {
         document.getElementById('error').textContent = e.message;
     }
@@ -1045,7 +1045,8 @@ async function addAccount() {
         if (res.ok) {
             document.getElementById('success').textContent = 'Аккаунт добавлен.';
             closeAddAccount();
-            fetchData();
+            await fetchData();
+            loadProxyStatus();
             document.getElementById('new-label').value = '';
             document.getElementById('new-user-id').value = '';
             document.getElementById('new-client-id').value = '';
@@ -1109,7 +1110,7 @@ function pollOAuth() {
             if (data.status === 'complete') {
                 document.getElementById('oauthStatus').textContent = 'Аккаунт «' + data.label + '» добавлен.';
                 if (oauthPollInterval) { clearInterval(oauthPollInterval); oauthPollInterval = null; }
-                setTimeout(function() { closeOAuth(); fetchData(); }, 1500);
+                setTimeout(function() { closeOAuth(); fetchData().then(loadProxyStatus); }, 1500);
             } else if (data.status === 'error') {
                 document.getElementById('oauthStatus').textContent = 'Error: ' + data.error;
                 if (oauthPollInterval) { clearInterval(oauthPollInterval); oauthPollInterval = null; }
@@ -1481,7 +1482,7 @@ async function loadProxyStatus() {
         proxyEnabled = !!p.enabled;
         var trying = !p.last_try || Date.now() / 1000 - p.last_try < 20;
         document.getElementById('px-status').textContent = !p.enabled ? 'Напрямую' : (assignments.some(function(a) { return a.verified; }) || p.ready ? 'Активен' : (trying ? 'Проверяем прокси' : 'Нет рабочего прокси'));
-        document.getElementById('px-current').textContent = p.enabled ? assignments.filter(function(a) { return a.verified; }).length : '—';
+        document.getElementById('px-current').textContent = p.enabled ? assignments.length : '—';
         document.getElementById('px-pool').textContent = p.pool_size != null ? p.pool_size : '—';
         document.getElementById('px-fails').textContent = assignments.reduce(function(sum, a) { return sum + (a.consecutive_fails || 0); }, 0);
         document.getElementById('px-assignments').textContent = p.enabled ? assignments.map(function(a) {
@@ -1555,7 +1556,8 @@ async function importCredentials(e) {
         if (res.ok) {
             document.getElementById('success').textContent = 'Imported ' + data.imported + ' accounts (skipped ' + data.skipped + ')';
             document.getElementById('importResult').textContent = data.errors && data.errors.length ? 'Errors: ' + JSON.stringify(data.errors).slice(0, 400) : '';
-            fetchData();
+            await fetchData();
+            loadProxyStatus();
         } else { document.getElementById('error').textContent = data.detail || 'Import failed'; }
     } catch(err) { document.getElementById('error').textContent = 'Import error: ' + err.message; }
     e.target.value = '';

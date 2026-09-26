@@ -130,6 +130,7 @@ async fn main() {
     }
 
     let account_manager = Arc::new(AccountManager::new(db.clone(), switching_weights));
+    account_manager.set_proxy_manager(proxy_manager.clone());
 
     if let Err(e) = account_manager.load_from_db().await {
         tracing::warn!("Could not load accounts from DB: {}", e);

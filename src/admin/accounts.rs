@@ -130,7 +130,6 @@ pub async fn remove_account(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, AppError> {
     state.account_manager.remove_account(&id).await?;
-    state.proxy_manager.forget_account(&id).await;
     Ok(Json(json!({ "message": "Account removed" })))
 }
 
