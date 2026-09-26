@@ -163,7 +163,6 @@ var ruToEn = {
     'Проверка FULL/PREVIEW отправляет до четырёх запросов к Tidal': 'FULL/PREVIEW check sends up to four Tidal requests',
     'Неизвестно': 'Unknown',
     'Не удалось определить': 'Inconclusive',
-    'FULL · проверено вручную': 'FULL · manually verified',
     'FULL/PREVIEW': 'FULL/PREVIEW',
     'Изменить': 'Edit',
     'Дублировать': 'Duplicate',

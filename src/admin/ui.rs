@@ -867,7 +867,6 @@ async function fetchData() {
             '<div class="stat-card" title="95% запросов в журнале (до 5000 последних) ответили не медленнее этого значения"><div class="label">p95 ответа · до 5000</div><div class="value">' + (stats.recent_p95_ms != null ? stats.recent_p95_ms + ' <span style="font-size:15px;color:var(--muted);font-weight:500">мс</span>' : '—') + '</div></div>' +
             '<div class="stat-card"><div class="label">Доля ошибок</div><div class="value">' + (stats.error_rate || '0.00%') + '</div></div>' +
             '<div class="stat-card"><div class="label">Активные аккаунты</div><div class="value">' + (stats.healthy_accounts || 0) + '<span style="font-size:15px;color:var(--muted);font-weight:500"> / ' + (stats.total_accounts || 0) + '</span></div></div>' +
-            '<div class="stat-card"><div class="label">FULL · проверено вручную</div><div class="value">' + (stats.premium_accounts || 0) + '</div></div>' +
             playbackCard(stats.playback) +
             catalogCard(stats.catalog) +
             redisCard(stats.redis);
