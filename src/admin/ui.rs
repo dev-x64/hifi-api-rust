@@ -617,12 +617,21 @@ function playbackCard(pb) {
     return '<div class="stat-card"><div class="label">Воспроизведение · ' + active + '/' + pool + '</div><div class="value">' + pending + ' <span style="font-size:14px;color:var(--muted);font-weight:500">в очереди</span></div></div>';
 }
 
-function catalogCard(cat) {
+function catalogCard(cat, accounts) {
     cat = cat || {};
+    accounts = accounts || [];
     var mode = cat.mode || 'pool';
-    var label = mode === 'static_token' ? 'Статичный токен' : (mode === 'account' ? esc(cat.label || 'Каталог') : 'Общий пул');
-    var color = mode === 'pool' ? '#8b949e' : '#d2a8ff';
-    return '<div class="stat-card"><div class="label">Каталог</div><div class="value" style="font-size:18px;color:' + color + '">' + label + '</div></div>';
+    var catalog = accounts.filter(function(a) { return a.is_catalog; });
+    var active = catalog.filter(function(a) { return a.is_active; });
+    var label = mode === 'static_token' ? 'Статичный токен' :
+        (active.length ? active.length + ' ' + plural(active.length, 'активный аккаунт', 'активных аккаунта', 'активных аккаунтов') : 'Общий пул');
+    var detail = mode === 'static_token'
+        ? (active.length ? 'Резерв: ' + active.length + ' ' + plural(active.length, 'Catalog аккаунт', 'Catalog аккаунта', 'Catalog аккаунтов') : 'Метаданные через токен')
+        : (active.length ? (active.length > 1 ? 'По очереди: ' : '') + active.map(function(a) { return a.label || 'Без названия'; }).join(' · ') :
+            (catalog.length ? 'Catalog аккаунты неактивны; используется пул воспроизведения' : 'Метаданные через пул воспроизведения'));
+    var color = mode === 'pool' || (mode !== 'static_token' && !active.length) ? '#8b949e' : '#d2a8ff';
+    return '<div class="stat-card"><div class="label">Каталог</div><div class="value" style="font-size:18px;color:' + color + '">' + esc(label) + '</div>' +
+        '<div style="font-size:11px;color:var(--muted);margin-top:5px;overflow-wrap:anywhere">' + esc(detail) + '</div></div>';
 }
 
 function redisCard(redis) {    redis = redis || {};
@@ -868,7 +877,7 @@ async function fetchData() {
             '<div class="stat-card"><div class="label">Доля ошибок</div><div class="value">' + (stats.error_rate || '0.00%') + '</div></div>' +
             '<div class="stat-card"><div class="label">Активные аккаунты</div><div class="value">' + (stats.healthy_accounts || 0) + '<span style="font-size:15px;color:var(--muted);font-weight:500"> / ' + (stats.total_accounts || 0) + '</span></div></div>' +
             playbackCard(stats.playback) +
-            catalogCard(stats.catalog) +
+            catalogCard(stats.catalog, accounts.accounts) +
             redisCard(stats.redis);
 
         var html = '';
