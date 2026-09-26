@@ -229,6 +229,9 @@ button:focus-visible,input:focus-visible,select:focus-visible { outline:2px soli
 .section-head p { color:var(--muted); font-size:12px; margin-top:5px; line-height:1.45; }
 .section-actions { display:flex; gap:8px; flex-wrap:wrap; }
 .stats { grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; }
+.overview-proxy { display:flex; flex-wrap:wrap; align-items:center; gap:6px 10px; margin:-8px 0 22px; color:var(--muted); font:11px/1.5 Inter,sans-serif; }
+.overview-proxy strong { color:#b8c1cc; font-weight:600; }
+.overview-proxy .separator { opacity:.45; }
 .stat-card { border-color:var(--line); background:linear-gradient(145deg,#151a22,#11161d); border-radius:12px; padding:18px; min-height:100px; }
 .stat-card:hover { border-color:#394452; }
 .stat-card .label { color:var(--muted); font-family:Inter,sans-serif; font-size:10px; font-weight:700; }
@@ -344,6 +347,7 @@ button:focus-visible,input:focus-visible,select:focus-visible { outline:2px soli
 
   <section id="view-overview" class="view active">
     <div id="stats" class="stats"></div>
+    <div id="overviewProxy" class="overview-proxy"><span>Прокси</span><span class="separator">·</span><span>—</span></div>
     <div class="section-head"><div><h2>Журнал запросов</h2><p>Последняя активность обновляется автоматически каждые 15 секунд.</p></div><div class="section-actions"><button class="btn" id="requestLogMore" onclick="showMoreRequests()">Показать ещё</button><button class="btn" onclick="loadRequestLog()">Обновить журнал</button></div></div>
     <div class="terminal">
       <div class="term-bar"><span class="term-dots"><i></i><i></i><i></i></span><span class="term-title">hifi-api — live request log</span><span class="term-live" id="term-live">● LIVE</span></div>
@@ -516,6 +520,7 @@ function showView(name) {
     document.getElementById('pageTitle').textContent = meta[1];
     document.getElementById('pageSubtitle').textContent = meta[2];
     toggleSidebar(false);
+    if (name === 'overview') loadProxyStatus();
     window.scrollTo({ top:0, behavior:'smooth' });
 }
 
@@ -559,7 +564,7 @@ async function refreshAll() {
 }
 
 function refreshCurrentView() {
-    if (currentView === 'overview') { fetchData(); loadRequestLog(); }
+    if (currentView === 'overview') { fetchData(); loadRequestLog(); loadProxyStatus(); }
     else if (currentView === 'accounts') fetchData();
     else if (currentView === 'access') loadApiKeys();
     else Promise.all([loadSettings(), loadProxyStatus(), loadAlertStatus(), loadCacheStats()]);
@@ -1150,7 +1155,7 @@ bootstrap();
 setInterval(function() {
     if (!authenticated || document.hidden) return;
     if (currentView === 'overview' || currentView === 'accounts') fetchData();
-    if (currentView === 'overview') loadRequestLog();
+    if (currentView === 'overview') { loadRequestLog(); loadProxyStatus(); }
     if (currentView === 'access') loadApiKeys();
     if (currentView === 'system') { loadProxyStatus(); loadAlertStatus(); loadCacheStats(); }
 }, 15000);
@@ -1481,10 +1486,14 @@ async function loadProxyStatus() {
         var assignments = p.assignments || [];
         proxyEnabled = !!p.enabled;
         var trying = !p.last_try || Date.now() / 1000 - p.last_try < 20;
-        document.getElementById('px-status').textContent = !p.enabled ? 'Напрямую' : (assignments.some(function(a) { return a.verified; }) || p.ready ? 'Активен' : (trying ? 'Проверяем прокси' : 'Нет рабочего прокси'));
+        var status = !p.enabled ? 'Напрямую' : (assignments.some(function(a) { return a.verified; }) || p.ready ? 'Активен' : (trying ? 'Проверяем прокси' : 'Нет рабочего прокси'));
+        document.getElementById('px-status').textContent = status;
         document.getElementById('px-current').textContent = p.enabled ? assignments.length : '—';
         document.getElementById('px-pool').textContent = p.pool_size != null ? p.pool_size : '—';
         document.getElementById('px-fails').textContent = assignments.reduce(function(sum, a) { return sum + (a.consecutive_fails || 0); }, 0);
+        document.getElementById('overviewProxy').innerHTML = '<span>Прокси</span><span class="separator">·</span><span>' + status + '</span>' +
+            (p.enabled ? '<span class="separator">·</span><span>Назначено <strong>' + assignments.length + '</strong></span>' +
+                '<span class="separator">·</span><span>В пуле <strong>' + (p.pool_size != null ? p.pool_size : '—') + '</strong></span>' : '');
         document.getElementById('px-assignments').textContent = p.enabled ? assignments.map(function(a) {
             var account = (window._accounts || []).find(function(item) { return item.id === a.account_id; });
             return (account ? account.label : a.account_id.slice(0, 8)) + ' → ' + a.proxy + (a.verified ? '' : ' · проверяется');
