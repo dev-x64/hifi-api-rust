@@ -347,7 +347,8 @@ button:focus-visible,input:focus-visible,select:focus-visible { outline:2px soli
     <div class="section-head"><div><h2>Журнал запросов</h2><p>Последняя активность обновляется автоматически каждые 15 секунд.</p></div><div class="section-actions"><button class="btn" id="requestLogMore" onclick="showMoreRequests()">Показать ещё</button><button class="btn" onclick="loadRequestLog()">Обновить журнал</button></div></div>
     <div class="terminal">
       <div class="term-bar"><span class="term-dots"><i></i><i></i><i></i></span><span class="term-title">hifi-api — live request log</span><span class="term-live" id="term-live">● LIVE</span></div>
-      <div class="term-meta"><span>Всего <strong id="rq-total">—</strong></span><span>Показано <strong id="rq-shown">—</strong></span><span>Ошибок <strong id="rq-errors">—</strong></span><span>p50 <strong id="rq-p50">—</strong></span><span>p95 <strong id="rq-p95">—</strong></span><span id="rq-endpoints"></span><span id="rq-tracks" style="color:#d2a8ff"></span></div>
+      <div class="term-meta"><span>Всего <strong id="rq-total">—</strong></span><span>Показано <strong id="rq-shown">—</strong></span><span>Ошибок <strong id="rq-errors">—</strong></span><span>4xx без 429 <strong id="rq-user-errors">—</strong></span><span>429/5xx <strong id="rq-upstream-errors">—</strong></span><span>p50 <strong id="rq-p50">—</strong></span><span>p95 <strong id="rq-p95">—</strong></span><span id="rq-endpoints"></span><span id="rq-tracks" style="color:#d2a8ff"></span></div>
+      <div class="term-meta" id="rq-slowest"></div>
       <div id="rq-recent" class="term-body"></div>
     </div>
   </section>
@@ -373,10 +374,10 @@ button:focus-visible,input:focus-visible,select:focus-visible { outline:2px soli
     <div class="section-head"><div><h2>Системные настройки</h2><p>Интеграции, резервные копии и обслуживание.</p></div></div>
     <div class="system-grid">
       <div class="form-section"><h3>Настройки панели</h3><p class="form-copy">Язык интерфейса сохраняется в этом браузере.</p><div class="form-group"><label for="panel-language">Язык интерфейса</label><select id="panel-language" class="select" style="width:100%;padding:10px 12px" onchange="setLanguage(this.value)"><option value="en">English</option><option value="ru">Русский</option></select></div></div>
-      <div class="form-section"><h3>Воспроизведение</h3><p class="form-copy">Настройки выбора формата и автоматического восстановления.</p><div class="form-group" style="margin-bottom:16px"><label>Формат по умолчанию</label><select id="rl-atmos" class="select" style="width:100%;padding:10px 12px"><option value="high">HIGH · AAC 320 kbps (v1)</option><option value="off">FLAC в приоритете</option><option value="prefer">Atmos в приоритете</option></select></div><label style="display:flex;align-items:center;gap:9px;font-size:12px;color:#c9d1d9;margin-bottom:18px"><input type="checkbox" id="rl-autoheal"> Автовосстановление отключённых системой аккаунтов</label><button class="btn btn-primary" onclick="saveSettings()">Сохранить</button></div>
+      <div class="form-section"><h3>Воспроизведение</h3><p class="form-copy">Настройки выбора формата и автоматического восстановления.</p><div class="form-group" style="margin-bottom:16px"><label>Формат по умолчанию</label><select id="rl-atmos" class="select" style="width:100%;padding:10px 12px"><option value="high">HIGH · AAC 320 kbps (v1)</option><option value="off">FLAC в приоритете</option><option value="prefer">Atmos в приоритете</option></select></div><label style="display:flex;align-items:center;gap:9px;font-size:12px;color:#c9d1d9;margin-bottom:18px"><input type="checkbox" id="rl-autoheal"> Автовосстановление отключённых системой аккаунтов</label><div class="section-actions"><button class="btn btn-primary" onclick="saveSettings()">Сохранить</button><button class="btn" id="clearPlaybackBtn" onclick="clearPlaybackQueue()">Очистить очередь</button></div></div>
       <div class="form-section"><h3>Прокси</h3><p class="form-copy">Маршрутизация исходящих запросов. Изменения применяются сразу.</p><div class="card-stats" style="margin-bottom:16px"><span class="card-stat">Статус <strong id="px-status">—</strong></span><span class="card-stat">Назначено <strong id="px-current">—</strong></span><span class="card-stat">В пуле <strong id="px-pool">—</strong></span><span class="card-stat">Сбоев <strong id="px-fails">—</strong></span></div><div id="px-assignments" class="helper" style="white-space:pre-line;margin-bottom:16px"></div><div class="form-group"><label for="px-list">Адреса прокси · по одному в строке</label><textarea id="px-list" spellcheck="false" placeholder="http://user:password@host:port" oninput="proxyListDirty=true"></textarea></div><div class="section-actions" style="margin-top:12px"><button class="btn btn-primary" id="pxToggleBtn" onclick="toggleProxies()">Включить прокси</button><button class="btn" id="pxSaveBtn" onclick="saveProxyList()">Сохранить список</button></div><p class="helper" id="px-persist" style="margin-top:11px"></p></div>
       <div class="form-section"><h3>Уведомления</h3><p class="form-copy">Discord-оповещения о риске блокировки и недоступности аккаунтов.</p><div class="card-stats" style="margin-bottom:15px"><span class="card-stat">Discord <strong id="al-discord">—</strong></span></div><div class="form-group"><label for="al-webhook">URL вебхука Discord</label><input type="password" id="al-webhook" placeholder="https://discord.com/api/webhooks/…" autocomplete="new-password" spellcheck="false"></div><p class="helper" style="margin:8px 0 14px">Сохранённый URL скрыт. Введите новый, чтобы заменить его.</p><div class="section-actions" style="margin-bottom:15px"><button class="btn btn-primary" onclick="saveDiscordWebhook()" id="saveWebhookBtn">Сохранить вебхук</button><button class="btn btn-danger" onclick="disableDiscordWebhook()" id="disableWebhookBtn">Отключить вебхук</button></div><div class="section-actions"><button class="btn" onclick="testAlert()" id="alertTestBtn">Тест</button><button class="btn" onclick="sendReport('status')" id="reportStatusBtn">Статус</button><button class="btn" onclick="sendReport('accounts')" id="reportAccountsBtn">Аккаунты</button></div></div>
-      <div class="form-section"><h3>Кэш</h3><p class="form-copy">Очистка безопасна, но первые ответы после неё могут быть медленнее.</p><div class="card-stats" style="margin-bottom:15px"><span class="card-stat">Попадания <strong id="cc-hits">—</strong></span><span class="card-stat">Промахи <strong id="cc-misses">—</strong></span></div><button class="btn" onclick="clearCache()" id="clearCacheBtn">Очистить кэш</button></div>
+      <div class="form-section"><h3>Кэш</h3><p class="form-copy">Очистка безопасна, но первые ответы после неё могут быть медленнее.</p><div class="card-stats" style="margin-bottom:15px"><span class="card-stat">Попадания <strong id="cc-hits">—</strong></span><span class="card-stat">Промахи <strong id="cc-misses">—</strong></span><span class="card-stat">Устаревшие <strong id="cc-stale">—</strong></span><span class="card-stat">Отрицательные <strong id="cc-negative">—</strong></span></div><button class="btn" onclick="clearCache()" id="clearCacheBtn">Очистить кэш</button></div>
       <div class="form-section"><h3>Учётные данные</h3><p class="form-copy">Экспортируйте или импортируйте Tidal-аккаунты в JSON. Дубликаты токенов будут пропущены.</p><div class="section-actions"><button class="btn" onclick="exportCredentials()">Экспорт JSON</button><button class="btn" onclick="document.getElementById('importFile').click()">Импорт JSON</button><input type="file" id="importFile" accept=".json,application/json" style="display:none" onchange="importCredentials(event)"></div><div id="importResult" class="helper" style="margin-top:10px"></div></div>
       <div class="form-section"><h3>База данных</h3><p class="form-copy">Скачайте полный снимок или восстановите состояние без перезапуска.</p><div class="section-actions"><button class="btn" onclick="downloadBackup()">Скачать копию</button><button class="btn btn-danger" onclick="document.getElementById('restoreFile').click()">Восстановить</button><input type="file" id="restoreFile" accept=".db,.sqlite,.sqlite3,application/x-sqlite3" style="display:none" onchange="restoreBackup(event)"></div><div id="restoreResult" class="helper" style="margin-top:10px"></div></div>
     </div>
@@ -850,6 +851,7 @@ async function fetchData() {
             '<div class="stat-card" title="95% запросов в журнале (до 5000 последних) ответили не медленнее этого значения"><div class="label">p95 ответа · до 5000</div><div class="value">' + (stats.recent_p95_ms != null ? stats.recent_p95_ms + ' <span style="font-size:15px;color:var(--muted);font-weight:500">мс</span>' : '—') + '</div></div>' +
             '<div class="stat-card"><div class="label">Доля ошибок</div><div class="value">' + (stats.error_rate || '0.00%') + '</div></div>' +
             '<div class="stat-card"><div class="label">Активные аккаунты</div><div class="value">' + (stats.healthy_accounts || 0) + '<span style="font-size:15px;color:var(--muted);font-weight:500"> / ' + (stats.total_accounts || 0) + '</span></div></div>' +
+            '<div class="stat-card"><div class="label">FULL · проверено вручную</div><div class="value">' + (stats.premium_accounts || 0) + '</div></div>' +
             playbackCard(stats.playback) +
             catalogCard(stats.catalog) +
             redisCard(stats.redis);
@@ -868,14 +870,18 @@ async function fetchData() {
                 var tokenStr = timeStr(a.token_expires_at);
                 var uid = a.user_id || '-';
                 var catalogBadge = a.is_catalog ? '<span class="status-label" style="color:#d2a8ff;background:rgba(210,168,255,0.1)">Каталог</span>' : '';
+                var premiumLabel = a.premium_status === 'premium' ? 'FULL' : (a.premium_status === 'preview-only' ? 'PREVIEW' : 'Неизвестно');
+                var premiumColor = a.premium_status === 'premium' ? 'var(--green)' : (a.premium_status === 'preview-only' ? '#f0ad4e' : 'var(--muted)');
+                var premiumBadge = '<span class="status-label" style="color:' + premiumColor + '">' + premiumLabel + '</span>';
                 var catalogBtn = a.is_catalog
                     ? '<button class="btn" onclick="setCatalog(\'' + a.id + '\',false)" title="Вернуть в пул воспроизведения">Из каталога</button>'
                     : '<button class="btn" onclick="setCatalog(\'' + a.id + '\',true)" title="Использовать только для метаданных">В каталог</button>';
                 html += '<div class="account-card" data-search="' + esc((label + ' ' + uid + ' ' + a.client_id).toLowerCase()) + '">' +
                     '<div class="card-header">' +
-                        '<div class="left"><span class="acc-num">' + (i + 1) + '</span><span class="' + statusClass + '"></span><span class="label">' + esc(label) + '</span><span class="status-label ' + (a.is_active ? 'status-ok' : 'status-err') + '">' + statusText + '</span>' + catalogBadge + '</div>' +
+                        '<div class="left"><span class="acc-num">' + (i + 1) + '</span><span class="' + statusClass + '"></span><span class="label">' + esc(label) + '</span><span class="status-label ' + (a.is_active ? 'status-ok' : 'status-err') + '">' + statusText + '</span>' + catalogBadge + premiumBadge + '</div>' +
                         '<div class="card-actions">' +
                             '<button class="btn" onclick="refreshAccount(\'' + a.id + '\')">Обновить токен</button>' +
+                            '<button class="btn" onclick="checkPremium(\'' + a.id + '\')" title="Проверка FULL/PREVIEW отправляет до четырёх запросов к Tidal">Проверить FULL</button>' +
                             '<button class="btn" onclick="openEdit(\'' + a.id + '\')">Изменить</button>' +
                             '<button class="btn" onclick="duplicateAccount(\'' + a.id + '\')">Дублировать</button>' +
                             catalogBtn +
@@ -894,6 +900,7 @@ async function fetchData() {
                             '<span class="card-stat">Ошибок <strong>' + a.error_count + '</strong></span>' +
                             (a.auto_disabled ? '<span class="card-stat">Автовосстановление <strong>повтор</strong></span>' : '') +
                             '<span class="card-stat">Токен <strong>' + tokenStr + '</strong></span>' +
+                            (a.premium_checked_at ? '<span class="card-stat">FULL/PREVIEW <strong>' + new Date(a.premium_checked_at * 1000).toLocaleString() + '</strong></span>' : '') +
                             '<span class="card-stat test-badge" id="test-' + a.id + '" onclick="showTestDetails(\'' + a.id + '\')">Проверка <strong>—</strong></span>' +
                         '</div>' +
                     '</div>' +
@@ -936,6 +943,20 @@ async function refreshAccount(id) {
         }
     } catch(e) {
         document.getElementById('error').textContent = e.message;
+    }
+}
+
+async function checkPremium(id) {
+    try {
+        var res = await fetch('/admin/accounts/' + id + '/check-premium', { method: 'POST', headers: headers() });
+        var data = await res.json();
+        if (!res.ok) throw new Error(data.detail || 'HTTP ' + res.status);
+        var label = data.premium === 'premium' ? 'FULL' : (data.premium === 'preview-only' ? 'PREVIEW' : 'Не удалось определить');
+        document.getElementById(data.premium === 'premium' ? 'success' : 'error').textContent =
+            'Аккаунт ' + id.slice(0, 8) + ': ' + label + (data.reason ? ' — ' + data.reason : '');
+        fetchData();
+    } catch(e) {
+        document.getElementById('error').textContent = 'Проверка FULL/PREVIEW: ' + e.message;
     }
 }
 
@@ -1331,6 +1352,23 @@ async function clearCache() {
     }
 }
 
+async function clearPlaybackQueue() {
+    var btn = document.getElementById('clearPlaybackBtn');
+    btn.disabled = true;
+    try {
+        var res = await fetch('/admin/playback/clear', { method: 'POST', headers: headers() });
+        var data = await res.json();
+        if (!res.ok) throw new Error(data.detail || 'HTTP ' + res.status);
+        document.getElementById('success').textContent =
+            'Очередь очищена: ожидавших ' + data.cancelled_queued + ', выполнявшихся ' + data.marked_processing;
+        fetchData();
+    } catch(e) {
+        document.getElementById('error').textContent = 'Очистка очереди: ' + e.message;
+    } finally {
+        btn.disabled = false;
+    }
+}
+
 async function loadCacheStats() {
     try {
         var res = await fetch('/admin/cache', { headers: headers() });
@@ -1338,6 +1376,8 @@ async function loadCacheStats() {
         var c = (await res.json()).cache || {};
         document.getElementById('cc-hits').textContent = c.hits != null ? c.hits : '—';
         document.getElementById('cc-misses').textContent = c.misses != null ? c.misses : '—';
+        document.getElementById('cc-stale').textContent = c.stale != null ? c.stale : '—';
+        document.getElementById('cc-negative').textContent = c.negative != null ? c.negative : '—';
     } catch(e) {}
 }
 
@@ -1361,6 +1401,8 @@ async function loadRequestLog() {
         document.getElementById('rq-shown').textContent = recent.length;
         document.getElementById('requestLogMore').hidden = recent.length >= (r.total || 0) || limit >= 5000;
         document.getElementById('rq-errors').textContent = r.errors != null ? r.errors : '—';
+        document.getElementById('rq-user-errors').textContent = r.user_errors != null ? r.user_errors : '—';
+        document.getElementById('rq-upstream-errors').textContent = r.upstream_errors != null ? r.upstream_errors : '—';
         document.getElementById('rq-p50').textContent = r.p50_ms != null ? r.p50_ms + 'ms' : '—';
         document.getElementById('rq-p95').textContent = r.p95_ms != null ? r.p95_ms + 'ms' : '—';
         var ep = '';
@@ -1373,6 +1415,12 @@ async function loadRequestLog() {
             tt += '<span>#' + esc(t.id) + ' <strong>×' + t.hits + '</strong></span>';
         }
         document.getElementById('rq-tracks').innerHTML = tt ? '<span style="color:#5f6f60">top:</span> ' + tt : '';
+        var slow = '';
+        for (var item of (r.slowest || [])) {
+            slow += '<span>' + esc(item.endpoint) + (item.detail ? ' #' + esc(item.detail) : '') +
+                ' <strong>' + item.latency_ms + 'ms</strong></span>';
+        }
+        document.getElementById('rq-slowest').innerHTML = slow ? '<span>Самые медленные:</span> ' + slow : '';
         var rows = '';
         for (var q of recent.slice().reverse()) {
             var cls = q.status >= 500 ? 'test-fail' : (q.status >= 400 ? 'test-pending' : 'test-pass');
@@ -1386,7 +1434,9 @@ async function loadRequestLog() {
                 '<span class="term-path">' + esc(q.path) + '</span>' +
                 (q.detail ? ' <span class="term-id">#' + esc(q.detail) + '</span>' : '') + ' ' +
                 '<span class="' + cls + '">' + q.status + '</span> ' +
-                '<span class="term-dim">' + q.latency_ms + 'ms ' + esc(q.client_ip) + '</span></div>';
+                '<span class="term-dim">' + q.latency_ms + 'ms ' + esc(q.client_ip) + '</span>' +
+                (q.cache ? ' <span class="term-id">CACHE ' + esc(q.cache) + '</span>' : '') +
+                (q.slow ? ' <span class="test-pending">SLOW</span>' : '') + '</div>';
         }
         var box = document.getElementById('rq-recent');
         var previousHeight = box.scrollHeight;

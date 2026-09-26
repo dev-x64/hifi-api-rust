@@ -30,6 +30,8 @@ var ruToEn = {
     'Всего': 'Total',
     'Показано': 'Shown',
     'Ошибок': 'Errors',
+    '4xx без 429': '4xx excluding 429',
+    'Самые медленные:': 'Slowest:',
     'Tidal-аккаунты': 'Tidal accounts',
     'Управляйте пулом воспроизведения, токенами и каталогом.': 'Manage the playback pool, tokens, and catalog.',
     'Проверить все': 'Test all',
@@ -59,6 +61,7 @@ var ruToEn = {
     'Atmos в приоритете': 'Prefer Atmos',
     'Автовосстановление отключённых системой аккаунтов': 'Automatically recover system-disabled accounts',
     'Сохранить': 'Save',
+    'Очистить очередь': 'Clear queue',
     'Прокси': 'Proxies',
     'Маршрутизация исходящих запросов. Изменения применяются сразу.': 'Route outgoing requests. Changes take effect immediately.',
     'Статус': 'Status',
@@ -86,6 +89,8 @@ var ruToEn = {
     'Очистка безопасна, но первые ответы после неё могут быть медленнее.': 'Clearing is safe, but the first responses may be slower.',
     'Попадания': 'Hits',
     'Промахи': 'Misses',
+    'Устаревшие': 'Stale',
+    'Отрицательные': 'Negative',
     'Очистить кэш': 'Clear cache',
     'Учётные данные': 'Credentials',
     'Экспортируйте или импортируйте Tidal-аккаунты в JSON. Дубликаты токенов будут пропущены.': 'Export or import Tidal accounts as JSON. Duplicate tokens are skipped.',
@@ -149,6 +154,12 @@ var ruToEn = {
     'Использовать только для метаданных': 'Use only for metadata',
     'В каталог': 'Move to catalog',
     'Обновить токен': 'Refresh token',
+    'Проверить FULL': 'Check FULL',
+    'Проверка FULL/PREVIEW отправляет до четырёх запросов к Tidal': 'FULL/PREVIEW check sends up to four Tidal requests',
+    'Неизвестно': 'Unknown',
+    'Не удалось определить': 'Inconclusive',
+    'FULL · проверено вручную': 'FULL · manually verified',
+    'FULL/PREVIEW': 'FULL/PREVIEW',
     'Изменить': 'Edit',
     'Дублировать': 'Duplicate',
     'Удалить': 'Delete',
@@ -239,6 +250,10 @@ function localizedCore(source) {
         if (match) return match[1] + ' hr ' + match[2] + ' min';
         match = source.match(/^Воспроизведение · (.+)$/);
         if (match) return 'Playback · ' + match[1];
+        match = source.match(/^Аккаунт (.+): (FULL|PREVIEW|Не удалось определить)(.*)$/);
+        if (match) return 'Account ' + match[1] + ': ' + (ruToEn[match[2]] || match[2]) + match[3];
+        match = source.match(/^Очередь очищена: ожидавших (\d+), выполнявшихся (\d+)$/);
+        if (match) return 'Queue cleared: ' + match[1] + ' pending, ' + match[2] + ' processing';
         match = source.match(/^Успешно: (\d+) · Ошибок: (\d+) · Нажмите на строку для деталей$/);
         if (match) return 'Passed: ' + match[1] + ' · Failed: ' + match[2] + ' · Select a row for details';
         match = source.match(/^Проверка: (.+)$/);
@@ -254,6 +269,8 @@ function localizedCore(source) {
         match = source.match(/^(.+… · )использовано (.+) · (активен|отключён)$/);
         if (match) return match[1] + 'used ' + match[2] + ' · ' + ruToEn[match[3]];
         var prefixes = {
+            'Проверка FULL/PREVIEW: ': 'FULL/PREVIEW check: ',
+            'Очистка очереди: ': 'Queue clear: ',
             'Проверка не удалась: ': 'Test failed: ',
             'Ошибка проверки: ': 'Test error: ',
             'Ошибка ': 'Error ',
