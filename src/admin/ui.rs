@@ -381,7 +381,7 @@ button:focus-visible,input:focus-visible,select:focus-visible { outline:2px soli
     <div class="section-head"><div><h2>Системные настройки</h2><p>Интеграции, резервные копии и обслуживание.</p></div></div>
     <div class="system-grid">
       <div class="form-section"><h3>Настройки панели</h3><p class="form-copy">Язык интерфейса сохраняется в cookie этого браузера.</p><div class="form-group"><label for="panel-language">Язык интерфейса</label><select id="panel-language" class="select" style="width:100%;padding:10px 12px" onchange="setLanguage(this.value)"><option value="en">English</option><option value="ru">Русский</option></select></div></div>
-      <div class="form-section"><h3>Воспроизведение</h3><p class="form-copy">Настройки выбора формата и автоматического восстановления.</p><div class="form-group" style="margin-bottom:16px"><label>Формат по умолчанию</label><select id="rl-atmos" class="select" style="width:100%;padding:10px 12px"><option value="high">HIGH · AAC 320 kbps (v1)</option><option value="off">FLAC в приоритете</option><option value="prefer">Atmos в приоритете</option></select></div><label style="display:flex;align-items:center;gap:9px;font-size:12px;color:#c9d1d9;margin-bottom:18px"><input type="checkbox" id="rl-autoheal"> Автовосстановление отключённых системой аккаунтов</label><div class="section-actions"><button class="btn btn-primary" onclick="saveSettings()">Сохранить</button><button class="btn" id="clearPlaybackBtn" onclick="clearPlaybackQueue()">Очистить очередь</button></div></div>
+      <div class="form-section"><h3>Воспроизведение</h3><p class="form-copy">Настройки выбора формата и автоматического восстановления.</p><div class="form-group" style="margin-bottom:16px"><label>Формат по умолчанию</label><select id="rl-atmos" class="select" style="width:100%;padding:10px 12px"><option value="high">HIGH · AAC 320 kbps (v1)</option><option value="off">FLAC в приоритете</option><option value="prefer">Atmos в приоритете</option></select></div><p class="form-copy">Автовосстановление всегда включено. Отключённые вручную аккаунты остаются выключенными.</p><div class="section-actions"><button class="btn btn-primary" onclick="saveSettings()">Сохранить</button><button class="btn" id="clearPlaybackBtn" onclick="clearPlaybackQueue()">Очистить очередь</button></div></div>
       <div class="form-section"><h3>Прокси</h3><p class="form-copy">Маршрутизация исходящих запросов. Изменения применяются сразу.</p><div class="card-stats" style="margin-bottom:16px"><span class="card-stat">Статус <strong id="px-status">—</strong></span><span class="card-stat">Назначено <strong id="px-current">—</strong></span><span class="card-stat">В пуле <strong id="px-pool">—</strong></span><span class="card-stat">Сбоев <strong id="px-fails">—</strong></span></div><div id="px-assignments" class="helper" style="white-space:pre-line;margin-bottom:16px"></div><div class="form-group"><label for="px-list">Адреса прокси · по одному в строке</label><textarea id="px-list" spellcheck="false" placeholder="http://user:password@host:port" oninput="proxyListDirty=true"></textarea></div><div class="section-actions" style="margin-top:12px"><button class="btn btn-primary" id="pxToggleBtn" onclick="toggleProxies()">Включить прокси</button><button class="btn" id="pxSaveBtn" onclick="saveProxyList()">Сохранить список</button></div><p class="helper" id="px-persist" style="margin-top:11px"></p></div>
       <div class="form-section"><h3>Уведомления</h3><p class="form-copy">Discord-оповещения о риске блокировки и недоступности аккаунтов.</p><div class="card-stats" style="margin-bottom:15px"><span class="card-stat">Discord <strong id="al-discord">—</strong></span></div><div class="form-group"><label for="al-webhook">URL вебхука Discord</label><input type="password" id="al-webhook" placeholder="https://discord.com/api/webhooks/…" autocomplete="new-password" spellcheck="false"></div><p class="helper" style="margin:8px 0 14px">Сохранённый URL скрыт. Введите новый, чтобы заменить его.</p><div class="section-actions" style="margin-bottom:15px"><button class="btn btn-primary" onclick="saveDiscordWebhook()" id="saveWebhookBtn">Сохранить вебхук</button><button class="btn btn-danger" onclick="disableDiscordWebhook()" id="disableWebhookBtn">Отключить вебхук</button></div><div class="section-actions"><button class="btn" onclick="testAlert()" id="alertTestBtn">Тест</button><button class="btn" onclick="sendReport('status')" id="reportStatusBtn">Статус</button><button class="btn" onclick="sendReport('accounts')" id="reportAccountsBtn">Аккаунты</button></div></div>
       <div class="form-section"><h3>Кэш</h3><p class="form-copy">Очистка безопасна, но первые ответы после неё могут быть медленнее.</p><div class="card-stats" style="margin-bottom:15px"><span class="card-stat">Попадания <strong id="cc-hits">—</strong></span><span class="card-stat">Промахи <strong id="cc-misses">—</strong></span><span class="card-stat">Устаревшие <strong id="cc-stale">—</strong></span><span class="card-stat">Отрицательные <strong id="cc-negative">—</strong></span></div><button class="btn" onclick="clearCache()" id="clearCacheBtn">Очистить кэш</button></div>
@@ -1563,7 +1563,6 @@ async function loadSettings() {
         if (!res.ok) return;
         var d = await res.json();
         var r = d.settings || d.rate_limits || {};
-        document.getElementById('rl-autoheal').checked = r.auto_heal !== false;
         document.getElementById('rl-atmos').value = r.atmos_mode || 'off';
     } catch(e) {}
 }
@@ -1603,7 +1602,6 @@ async function importCredentials(e) {
 async function saveSettings() {
     var body = {
         settings: {
-            auto_heal: document.getElementById('rl-autoheal').checked,
             atmos_mode: document.getElementById('rl-atmos').value
         }
     };
@@ -1615,7 +1613,6 @@ async function saveSettings() {
             document.getElementById('success').textContent = 'Settings saved!';
             var d = await res.json();
             var r = d.settings || d.rate_limits || {};
-            document.getElementById('rl-autoheal').checked = r.auto_heal !== false;
             document.getElementById('rl-atmos').value = r.atmos_mode || 'off';
         } else {
             var d = await res.json();

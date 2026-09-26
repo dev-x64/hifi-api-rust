@@ -15,7 +15,7 @@ use crate::AppState;
 const AUTH_CLIENT_ID: &str = "fX2JxdmntZWK0ixT";
 const AUTH_CLIENT_SECRET: &str = "1Nm5AfDAjxrgJFJbKNWLeAyKGVGmINuXPPLHVXAvxAg=";
 const REQUEST_CLIENT_ID: &str = "lw3vR6GE1vtNBsjv";
-const REQUEST_CLIENT_SECRET: &str = "Y8tIpqKJxs9BEIwYr0I9bSbMWDsogXJx9LaN3mCHwD4%3D";
+const REQUEST_CLIENT_SECRET: &str = "Y8tIpqKJxs9BEIwYr0I9bSbMWDsogXJx9LaN3mCHwD4=";
 
 #[derive(Clone)]
 pub enum SetupStatus {
@@ -114,7 +114,7 @@ pub async fn start_setup(
         .and_then(|b| b.label.clone())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
-    let http_client = state.tidal_client.working_client().await?;
+    let http_client = state.proxy_manager.working_auth_client().await?;
 
     let auth_resp: DeviceAuthorization = http_client
         .post("https://auth.tidal.com/v1/oauth2/device_authorization")
@@ -173,7 +173,10 @@ pub async fn start_setup(
                     ("device_code", &device_code),
                     ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
                 ])
-                .basic_auth(AUTH_CLIENT_ID, Some(AUTH_CLIENT_SECRET))
+                .basic_auth(
+                    crate::token_manager::oauth_basic_component(AUTH_CLIENT_ID),
+                    Some(crate::token_manager::oauth_basic_component(AUTH_CLIENT_SECRET)),
+                )
                 .send()
                 .await
             {
@@ -195,7 +198,7 @@ pub async fn start_setup(
                 Ok(text) => match serde_json::from_str(&text) {
                     Ok(t) => t,
                     Err(e) => {
-                        tracing::warn!("OAuth token parse failed: {} body: {}", e, &text[..text.len().min(300)]);
+                        tracing::warn!("OAuth token parse failed: {}", e);
                         let mut sessions = sessions.write().await;
                         if let Some(session) = sessions.get_mut(&sid) {
                             session.status = SetupStatus::Error(format!("Parse failed: {}", e));

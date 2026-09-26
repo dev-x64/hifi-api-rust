@@ -67,6 +67,12 @@ Commit `Cargo.toml` and the updated `Cargo.lock` together. The API response, sta
 
 ## Configuration
 
+Token renewal and auto-heal are always enabled. Legacy `AUTO_HEAL` and persisted `auto_heal` settings are ignored. Recovery retries use backoff and respect `Retry-After`; manually disabled accounts stay off.
+
+Refresh uses the account's assigned proxy and a separate HTTP/1.1 auth client. API connections negotiate HTTP normally. Requests have connect/read/total deadlines of 5/15/25 seconds; each refresh operation has a 45-second deadline. The background worker checks accounts every 30 seconds after its previous pass, with up to four concurrent renewals. Temporary auth failures back off from roughly 30 seconds to one hour; explicit OAuth credential errors start at five minutes. Revoked credentials can still require reauthorization.
+
+Legacy URL-encoded client secrets are normalized when loaded/imported. Store raw secrets (`=` rather than `%3D`); request builders perform the required wire encoding. Rotated refresh tokens are persisted. After an auth 403 or `invalid_client`, the next scheduled attempt can try the alternate Basic/form authentication shape without an immediate retry burst.
+
 Copy [`.env.example`](.env.example) for the full list. Values saved in the admin panel can override initial environment defaults where noted.
 
 | Variable | Default | Purpose |
@@ -82,7 +88,6 @@ Copy [`.env.example`](.env.example) for the full list. Values saved in the admin
 | `CATALOG_TOKEN` | Empty | Static metadata bearer token; cannot refresh itself. `CATALOG_ACCESS_TOKEN` is also accepted. |
 | `COUNTRY_CODE` | `US` | Default Tidal catalog region. |
 | `ATMOS_MODE` | `prefer` | Default playback mode: `prefer`, `off`, or `high`. The admin setting and `?atmos=` can override it. |
-| `AUTO_HEAL` | `true` | Retry accounts disabled by system errors; does not turn manually disabled accounts on. Editable in admin. |
 | `USE_PROXIES`, `PROXIES_FILE` | `false`, `proxies.txt` | Initial outbound proxy setting and proxy list. Editable in admin and persisted with SQLite. |
 | `FALLBACK_TO_DIRECT_CONNECTION` | `false` | Use the host connection when no proxy works. This exposes the host IP to Tidal. |
 | `MAX_RETRIES`, `ROTATE_PROXIES_ON_REFRESH` | `2`, `false` | Proxy retry count and whether to rotate on token refresh. |

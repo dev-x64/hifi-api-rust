@@ -104,7 +104,7 @@ pub(crate) async fn fetch_video_playback(
             }
             Err(AppError::UpstreamError(status, _)) if status.as_u16() == 401 => {
                 // Refresh once and retry the same account before failing over.
-                match state.token_manager.refresh_token(&account, &hc).await {
+                match state.token_manager.refresh_after_unauthorized(&account, &hc, &token).await {
                     Ok(fresh) => {
                         match state
                             .tidal_client
@@ -118,6 +118,9 @@ pub(crate) async fn fetch_video_playback(
                                 }));
                             }
                             Err(e2) => {
+                                if matches!(&e2, AppError::UpstreamError(status, _) if status.as_u16() == 401) {
+                                    crate::token_manager::TokenManager::reject_refreshed_token(&account, &fresh).await;
+                                }
                                 if matches!(e2, AppError::RateLimited(_)) {
                                     if first_rate_limit_try.is_some() {
                                         return Err(e2);

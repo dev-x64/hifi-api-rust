@@ -107,6 +107,7 @@ pub(crate) async fn fetch_widevine_license(
                 url,
             )
             .header("authorization", format!("Bearer {}", token))
+            .header("X-Tidal-Token", account.client_id.as_str())
             .header("User-Agent", state.config.user_agent.as_str())
             .body(body.to_vec())
             .header(
@@ -135,7 +136,7 @@ pub(crate) async fn fetch_widevine_license(
             }
         };
         if resp.status().as_u16() == 401 {
-            match state.token_manager.refresh_token(&account, &hc).await {
+            match state.token_manager.refresh_after_unauthorized(&account, &hc, &token_owned).await {
                 Ok(fresh) => {
                     token_owned = fresh;
                     hc = state.tidal_client.working_client_for(&account.id).await?;
@@ -179,6 +180,9 @@ pub(crate) async fn fetch_widevine_license(
         }
 
         let status = resp.status();
+        if status.as_u16() == 401 {
+            crate::token_manager::TokenManager::reject_refreshed_token(&account, &token_owned).await;
+        }
         if status.as_u16() == 429 {
             let seconds = AccountManager::pause_account(
                 &account,

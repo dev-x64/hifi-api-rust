@@ -208,7 +208,7 @@ async fn main() {
             let am = account_manager.clone();
             let pm = proxy_manager.clone();
             tokio::spawn(async move {
-                let result = match pm.working_client().await {
+                let result = match pm.working_auth_client().await {
                     Ok(client) => setup::run_setup(&am, &client).await,
                     Err(e) => Err(e),
                 };
@@ -292,18 +292,11 @@ async fn main() {
 
     state.playback.start_reaper();
 
-    // Start token pre-warming background task
-    token_manager
-        .clone()
-        .start_prewarm_loop(account_manager.clone(), proxy_manager.clone())
-        .await;
-
-    // Start auto-heal background task (recovers system-disabled accounts)
+    // Always-on proactive renewal and recovery of system-disabled accounts.
     autoheal::start_autoheal_loop(
         account_manager.clone(),
         token_manager.clone(),
         proxy_manager.clone(),
-        settings.clone(),
         notifier.clone(),
     )
     .await;
@@ -413,7 +406,7 @@ async fn import_token_file(manager: &Arc<AccountManager>, path: &str) {
         .list_accounts()
         .await
         .iter()
-        .map(|a| a.refresh_token.clone())
+        .map(|a| a.refresh_token())
         .collect();
     let mut seen = existing;
     let mut imported = 0usize;

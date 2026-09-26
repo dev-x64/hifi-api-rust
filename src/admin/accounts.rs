@@ -42,7 +42,7 @@ pub async fn list_accounts(State(state): State<AppState>) -> Result<Json<Value>,
             "label": a.label,
             "client_id": a.client_id,
             "client_secret": a.client_secret,
-            "refresh_token": a.refresh_token,
+            "refresh_token": a.refresh_token(),
             "user_id": a.user_id.read().await.clone(),
             "is_active": a.is_active.load(std::sync::atomic::Ordering::Relaxed),
             "disabled_at": a.disabled_at.load(std::sync::atomic::Ordering::Relaxed),
@@ -172,7 +172,6 @@ pub async fn toggle_account(
         .await?;
     // Owner intent wins: a manual toggle always clears the auto-disabled flag,
     // so auto-heal never overrides an explicit OFF.
-    let _ = state.account_manager.set_auto_disabled(&id, false).await;
     let status = if body.active { "active" } else { "inactive" };
     Ok(Json(
         json!({ "message": format!("Account {} set to {}", id, status) }),
@@ -193,7 +192,6 @@ pub async fn refresh_account_token(
     match state.token_manager.refresh_token(&account, &hc).await {
         Ok(_) => {
             state.account_manager.set_account_active(&id, true).await?;
-            let _ = state.account_manager.set_auto_disabled(&id, false).await;
             Ok(Json(
                 json!({"status": "ok", "message": "Token refreshed, account reactivated"}),
             ))
@@ -275,7 +273,7 @@ pub async fn test_all_accounts(State(state): State<AppState>) -> Result<Json<Val
                     );
                     match c.get(&url)
                         .header("authorization", format!("Bearer {}", token))
-                        .header("User-Agent", "okhttp/5.3.2")
+                        .header("X-Tidal-Token", acc.client_id.as_str())
                         .header("Accept", "*/*")
                         .header("Accept-Encoding", "gzip")
                         .send()
@@ -343,7 +341,7 @@ pub async fn export_accounts(State(state): State<AppState>) -> Result<Json<Value
                 "label": a.label,
                 "client_id": a.client_id,
                 "client_secret": a.client_secret,
-                "refresh_token": a.refresh_token,
+                "refresh_token": a.refresh_token(),
                 "user_id": futures::executor::block_on(async { a.user_id.read().await.clone() }),
             });
             if is_catalog {
@@ -373,7 +371,7 @@ pub async fn import_accounts(
 
     let existing = state.account_manager.list_accounts().await;
     let existing_tokens: std::collections::HashSet<String> =
-        existing.iter().map(|a| a.refresh_token.clone()).collect();
+        existing.iter().map(|a| a.refresh_token()).collect();
 
     let mut imported = 0usize;
     let mut skipped = 0usize;
@@ -481,6 +479,7 @@ pub async fn test_account(
             let resp = hc
                 .get("https://api.tidal.com/v1/tracks/1/")
                 .header("authorization", format!("Bearer {}", token))
+                .header("X-Tidal-Token", account.client_id.as_str())
                 .send()
                 .await;
             match resp {

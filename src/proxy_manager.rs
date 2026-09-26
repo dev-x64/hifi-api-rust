@@ -16,13 +16,36 @@ use crate::config::Config;
 use crate::error::AppError;
 
 fn build_client(proxy_url: Option<&str>, user_agent: &str) -> Result<Client, String> {
+    build_tidal_client(proxy_url, user_agent, false)
+}
+
+fn build_auth_client(proxy_url: Option<&str>, user_agent: &str) -> Result<Client, String> {
+    build_tidal_client(proxy_url, user_agent, true)
+}
+
+fn build_tidal_client(proxy_url: Option<&str>, user_agent: &str, auth: bool) -> Result<Client, String> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert("Accept", if auth { "application/json" } else { "*/*" }.parse().unwrap());
+    headers.insert("Accept-Encoding", "gzip".parse().unwrap());
+    if !auth {
+        headers.insert("Accept-Language", "en-US,en;q=0.9".parse().unwrap());
+        headers.insert("X-Platform", "android".parse().unwrap());
+        headers.insert("X-Tidal-Platform", "android".parse().unwrap());
+    }
     let mut builder = Client::builder()
         .gzip(true)
-        .http2_prior_knowledge()
+        .default_headers(headers)
+        .connect_timeout(Duration::from_secs(5))
+        .read_timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(25))
+        .redirect(reqwest::redirect::Policy::none())
         .http2_adaptive_window(true)
-        .pool_max_idle_per_host(500)
+        .pool_max_idle_per_host(if auth { 2 } else { 20 })
         .pool_idle_timeout(Duration::from_secs(30))
         .user_agent(user_agent);
+    if auth {
+        builder = builder.http1_only();
+    }
     if let Some(url) = proxy_url {
         let proxy =
             reqwest::Proxy::all(url).map_err(|e| format!("Invalid proxy URL: {}", e))?;
@@ -37,6 +60,7 @@ pub struct ProxyManager {
     enabled: AtomicBool,
     proxies: RwLock<Vec<String>>,
     direct_client: Client,
+    direct_auth_client: Client,
     client: ArcSwap<Client>,
     /// Proxy URL currently in use (None = direct connection).
     current: RwLock<Option<String>>,
@@ -56,6 +80,7 @@ pub struct ProxyManager {
 struct AccountProxy {
     url: String,
     client: Client,
+    auth_client: Client,
     failures: u64,
     verified: bool,
 }
@@ -78,10 +103,11 @@ impl ProxyManager {
         let direct = build_client(None, &config.user_agent).expect("Failed to build HTTP client");
         Self {
             enabled: AtomicBool::new(config.use_proxies),
-            config,
+            config: config.clone(),
             db,
             proxies: RwLock::new(proxies),
             direct_client: direct.clone(),
+            direct_auth_client: build_auth_client(None, &config.user_agent).expect("Failed to build auth client"),
             client: ArcSwap::from_pointee(direct),
             current: RwLock::new(None),
             // Direct mode is always ready; proxy mode resolves in the background.
@@ -120,6 +146,7 @@ impl ProxyManager {
             if !entries.contains(&url) { continue; }
             if let Ok(client) = build_client(Some(&url), &self.config.user_agent) {
                 routes.assignments.insert(account_id, AccountProxy {
+                    auth_client: build_auth_client(Some(&url), &self.config.user_agent).expect("valid proxy"),
                     url,
                     client,
                     failures: 0,
@@ -231,6 +258,7 @@ impl ProxyManager {
                 }
             };
             routes.assignments.insert(account_id.clone(), AccountProxy {
+                auth_client: build_auth_client(Some(target), &self.config.user_agent).expect("valid proxy"),
                 url: target.clone(), client, failures: 0, verified: true,
             });
             routes.avoided.remove(&account_id);
@@ -310,6 +338,16 @@ impl ProxyManager {
     /// A stable egress for one Tidal account. Free proxies are preferred, so
     /// accounts spread across the pool; extra proxies remain available for failover.
     pub async fn working_client_for(&self, account_id: &str) -> Result<Client, AppError> {
+        // Healthy accounts must not wait behind another account's proxy probes.
+        if !self.proxies_enabled() {
+            return Ok(self.direct_client.clone());
+        }
+        {
+            let routes = self.account_routes.lock().await;
+            if let Some(route) = routes.assignments.get(account_id).filter(|r| r.verified) {
+                return Ok(route.client.clone());
+            }
+        }
         let _switch = self.switch_lock.lock().await;
         if !self.proxies_enabled() {
             return Ok(self.direct_client.clone());
@@ -322,7 +360,10 @@ impl ProxyManager {
                     return Ok(existing.client.clone());
                 }
                 let url = existing.url.clone();
-                if self.test_proxy(&url).await {
+                drop(routes);
+                let works = self.test_proxy(&url).await;
+                routes = self.account_routes.lock().await;
+                if works {
                     let existing = routes.assignments.get_mut(account_id).unwrap();
                     existing.verified = true;
                     return Ok(existing.client.clone());
@@ -339,6 +380,7 @@ impl ProxyManager {
 
         let avoid = routes.avoided.get(account_id).map(String::as_str);
         let candidates = ordered_candidates(account_id, &entries, &routes.assignments, avoid);
+        drop(routes);
         for group in candidates.chunks(5) {
             let checks = join_all(group.iter().map(|url| self.test_proxy(url))).await;
             for (url, works) in group.iter().zip(checks) {
@@ -350,7 +392,9 @@ impl ProxyManager {
                         continue;
                     }
                 };
+                let mut routes = self.account_routes.lock().await;
                 routes.assignments.insert(account_id.to_string(), AccountProxy {
+                    auth_client: build_auth_client(Some(url), &self.config.user_agent).expect("valid proxy"),
                     url: url.clone(), client: client.clone(), failures: 0, verified: true,
                 });
                 routes.avoided.remove(account_id);
@@ -371,8 +415,42 @@ impl ProxyManager {
                 return Ok(client);
             }
         }
-        routes.last_failed.insert(account_id.to_string(), now);
+        self.account_routes.lock().await.last_failed.insert(account_id.to_string(), now);
         self.unavailable_for(account_id)
+    }
+
+    /// Device authorization has no account ID yet. Keep its auth-only client
+    /// pinned to the selected generic egress for the whole setup session.
+    pub async fn working_auth_client(&self) -> Result<Client, AppError> {
+        self.working_client().await?;
+        let _switch = self.switch_lock.lock().await;
+        if !self.proxies_enabled() {
+            return Ok(self.direct_auth_client.clone());
+        }
+        let current = self.current.read().await;
+        if let Some(url) = current.as_deref() {
+            return build_auth_client(Some(url), &self.config.user_agent)
+                .map_err(AppError::ServiceUnavailable);
+        }
+        if self.config.fallback_to_direct {
+            return Ok(self.direct_auth_client.clone());
+        }
+        Err(AppError::ServiceUnavailable("No auth proxy available".into()))
+    }
+
+    /// Auth uses HTTP/1.1 but exactly the same account-to-proxy binding as API traffic.
+    pub async fn working_auth_client_for(&self, account_id: &str) -> Result<Client, AppError> {
+        self.working_client_for(account_id).await?;
+        if !self.proxies_enabled() {
+            return Ok(self.direct_auth_client.clone());
+        }
+        if let Some(route) = self.account_routes.lock().await.assignments.get(account_id) {
+            return Ok(route.auth_client.clone());
+        }
+        if self.config.fallback_to_direct {
+            return Ok(self.direct_auth_client.clone());
+        }
+        Err(AppError::ServiceUnavailable("Account proxy changed during auth resolution".into()))
     }
 
     fn unavailable_for(&self, account_id: &str) -> Result<Client, AppError> {
@@ -714,6 +792,7 @@ mod tests {
             assignments.insert(id, AccountProxy {
                 url,
                 client: Client::new(),
+                auth_client: Client::new(),
                 failures: 0,
                 verified: true,
             });
@@ -724,6 +803,72 @@ mod tests {
         let replacement = ordered_candidates("account-0", &entries, &assignments, Some(&old));
         assert_ne!(replacement[0], old);
         assert!(!distinct.contains(&replacement[0]));
+    }
+
+    #[tokio::test]
+    async fn healthy_account_api_and_auth_do_not_wait_for_other_proxy_probes() {
+        let mut config = Config::from_env();
+        config.use_proxies = true;
+        config.fallback_to_direct = false;
+        let manager = ProxyManager::new(Arc::new(config), None);
+        manager.account_routes.lock().await.assignments.insert("healthy".into(), AccountProxy {
+            url: "http://test-proxy:8080".into(),
+            client: Client::new(),
+            auth_client: Client::new(),
+            failures: 0,
+            verified: true,
+        });
+        let _busy_resolver = manager.switch_lock.lock().await;
+        tokio::time::timeout(Duration::from_millis(100), manager.working_client_for("healthy")).await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_millis(100), manager.working_auth_client_for("healthy")).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn auth_uses_the_account_proxy_without_direct_fallback() {
+        let (proxy, task) = fake_proxy().await;
+        let mut config = Config::from_env();
+        config.use_proxies = true;
+        config.fallback_to_direct = false;
+        let manager = ProxyManager::new(Arc::new(config), None);
+        manager.configure(true, vec![proxy.clone()]).await.unwrap();
+        manager.working_client_for("account").await.unwrap();
+        let auth = manager.working_auth_client_for("account").await.unwrap();
+        // The fake proxy answers this unresolvable host; a direct client fails.
+        let response = auth.post("http://auth.invalid/token").body("dummy").send().await.unwrap();
+        assert!(response.status().is_success());
+        assert_eq!(manager.account_routes.lock().await.assignments["account"].url, proxy);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn auth_headers_are_separate_from_api_and_redirects_are_not_followed() {
+        use axum::{Router, Json, routing::get, http::StatusCode, extract::Request};
+        let app = Router::new()
+            .route("/headers", get(|request: Request| async move {
+                assert_eq!(request.version(), reqwest::Version::HTTP_11);
+                let h = request.headers();
+                Json(json!({
+                    "accept": h.get("accept").unwrap().to_str().unwrap(),
+                    "ua": h.get("user-agent").unwrap().to_str().unwrap(),
+                    "platform": h.get("x-tidal-platform").and_then(|v| v.to_str().ok()),
+                }))
+            }))
+            .route("/redirect", get(|| async { (StatusCode::FOUND, [("Location", "/headers")]) }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let auth = build_auth_client(None, "test-agent").unwrap();
+        let api = build_client(None, "test-agent").unwrap();
+        let headers: Value = auth.get(format!("{base}/headers")).send().await.unwrap().json().await.unwrap();
+        assert_eq!(headers["accept"], "application/json");
+        assert_eq!(headers["ua"], "test-agent");
+        assert!(headers["platform"].is_null());
+        let headers: Value = api.get(format!("{base}/headers")).send().await.unwrap().json().await.unwrap();
+        assert_eq!(headers["platform"], "android");
+        assert_eq!(headers["accept"], "*/*");
+        let redirected = auth.get(format!("{base}/redirect")).send().await.unwrap();
+        assert_eq!(redirected.status(), StatusCode::FOUND);
+        server.abort();
     }
 
     #[tokio::test]

@@ -10,7 +10,7 @@ use crate::error::AppError;
 const AUTH_CLIENT_ID: &str = "fX2JxdmntZWK0ixT";
 const AUTH_CLIENT_SECRET: &str = "1Nm5AfDAjxrgJFJbKNWLeAyKGVGmINuXPPLHVXAvxAg=";
 const REQUEST_CLIENT_ID: &str = "lw3vR6GE1vtNBsjv";
-const REQUEST_CLIENT_SECRET: &str = "Y8tIpqKJxs9BEIwYr0I9bSbMWDsogXJx9LaN3mCHwD4%3D";
+const REQUEST_CLIENT_SECRET: &str = "Y8tIpqKJxs9BEIwYr0I9bSbMWDsogXJx9LaN3mCHwD4=";
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -119,7 +119,10 @@ pub async fn run_setup(
                 ("device_code", device_code),
                 ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
             ])
-            .basic_auth(AUTH_CLIENT_ID, Some(AUTH_CLIENT_SECRET))
+            .basic_auth(
+                crate::token_manager::oauth_basic_component(AUTH_CLIENT_ID),
+                Some(crate::token_manager::oauth_basic_component(AUTH_CLIENT_SECRET)),
+            )
             .send()
             .await
             .map_err(|e| AppError::ServiceUnavailable(format!("Token poll failed: {}", e)))?;

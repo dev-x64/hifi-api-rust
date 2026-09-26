@@ -1,14 +1,12 @@
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{OnceLock, RwLock};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sqlx::SqlitePool;
 
 use crate::upstash::UpstashStore;
 
 /// Server preferences persisted in SQLite and optionally shared through Redis.
 pub struct AppSettings {
-    pub auto_heal: AtomicBool,
     /// off (FLAC) | prefer (Atmos) | high (AAC 320 kbps).
     /// Query param `atmos=` overrides per request.
     pub atmos_mode: RwLock<String>,
@@ -21,7 +19,6 @@ pub struct AppSettings {
 impl AppSettings {
     pub fn from_env() -> Self {
         Self {
-            auto_heal: AtomicBool::new(env_bool("AUTO_HEAL", true)),
             atmos_mode: RwLock::new(default_atmos_mode()),
             discord_webhook_url: RwLock::new(
                 std::env::var("DISCORD_WEBHOOK_URL").unwrap_or_default(),
@@ -43,7 +40,7 @@ impl AppSettings {
 
     pub fn snapshot(&self) -> Value {
         json!({
-            "auto_heal": self.auto_heal.load(Ordering::Relaxed),
+            "auto_heal": true,
             "atmos_mode": self.atmos_mode.read().map(|v| v.clone()).unwrap_or_else(|_| "prefer".to_string()),
         })
     }
@@ -83,9 +80,6 @@ impl AppSettings {
     }
 
     pub fn apply(&self, updates: &Value) -> Result<(), String> {
-        if let Some(v) = first_opt_bool(updates, &["auto_heal"])? {
-            self.auto_heal.store(v, Ordering::Relaxed);
-        }
         if let Some(v) = first_opt_string(updates, &["atmos_mode"])? {
             if let Ok(mut w) = self.atmos_mode.write() {
                 *w = normalize_atmos_mode(&v);
@@ -96,7 +90,9 @@ impl AppSettings {
 
     pub async fn load_from_db(&self, db: &SqlitePool) {
         let rows: Result<Vec<(String, String)>, sqlx::Error> =
-            sqlx::query_as("SELECT key, value FROM settings").fetch_all(db).await;
+            sqlx::query_as("SELECT key, value FROM settings")
+                .fetch_all(db)
+                .await;
         let rows = match rows {
             Ok(rows) => rows,
             Err(e) => {
@@ -120,13 +116,6 @@ impl AppSettings {
     /// Apply one persisted setting. Shared by the SQLite and Redis loaders.
     fn apply_kv(&self, key: &str, value: &str) {
         match key {
-            "auto_heal" => {
-                if value == "true" {
-                    self.auto_heal.store(true, Ordering::Relaxed);
-                } else if value == "false" {
-                    self.auto_heal.store(false, Ordering::Relaxed);
-                }
-            }
             "atmos_mode" => {
                 if let Ok(mut w) = self.atmos_mode.write() {
                     *w = normalize_atmos_mode(value);
@@ -143,16 +132,11 @@ impl AppSettings {
     }
 
     /// Setting names mirrored to Redis (same keys as the SQLite table).
-    const REDIS_SETTING_NAMES: &'static [&'static str] =
-        &["auto_heal", "atmos_mode", "discord_webhook_url"];
+    const REDIS_SETTING_NAMES: &'static [&'static str] = &["atmos_mode", "discord_webhook_url"];
 
     /// Canonical (key, value) snapshot, shared by the SQLite and Redis writers.
     fn settings_entries(&self) -> Vec<(String, String)> {
         vec![
-            (
-                "auto_heal",
-                self.auto_heal.load(Ordering::Relaxed).to_string(),
-            ),
             (
                 "atmos_mode",
                 self.atmos_mode
@@ -189,9 +173,14 @@ impl AppSettings {
             None => return,
         };
         for (key, value) in self.settings_entries() {
-            store.set(&UpstashStore::k_settings(&key), &value, None).await;
+            store
+                .set(&UpstashStore::k_settings(&key), &value, None)
+                .await;
         }
-        tracing::debug!("Synced {} settings to Redis", Self::REDIS_SETTING_NAMES.len());
+        tracing::debug!(
+            "Synced {} settings to Redis",
+            Self::REDIS_SETTING_NAMES.len()
+        );
     }
 
     /// Load shared settings into memory. Returns the number of keys applied.
@@ -200,8 +189,10 @@ impl AppSettings {
             Some(s) => s,
             None => return 0,
         };
-        let keys: Vec<String> =
-            Self::REDIS_SETTING_NAMES.iter().map(|n| UpstashStore::k_settings(n)).collect();
+        let keys: Vec<String> = Self::REDIS_SETTING_NAMES
+            .iter()
+            .map(|n| UpstashStore::k_settings(n))
+            .collect();
         let values = store.mget(&keys).await;
         let mut applied = 0;
         for (name, value) in Self::REDIS_SETTING_NAMES.iter().zip(values.iter()) {
@@ -230,7 +221,10 @@ impl AppSettings {
         let present = store.mget(&keys).await;
         let mut seeded = 0;
         for (index, (key, value)) in self.settings_entries().into_iter().enumerate() {
-            if present.get(index).and_then(|value| value.as_ref()).is_none()
+            if present
+                .get(index)
+                .and_then(|value| value.as_ref())
+                .is_none()
                 && store
                     .set_nx(&UpstashStore::k_settings(&key), &value, None)
                     .await
@@ -239,23 +233,17 @@ impl AppSettings {
             }
         }
         let applied = self.load_from_redis().await;
-        tracing::info!("Seeded {} settings to Redis, converged on {}", seeded, applied);
+        tracing::info!(
+            "Seeded {} settings to Redis, converged on {}",
+            seeded,
+            applied
+        );
     }
 
     /// Periodic pull for the 30s tick.
     pub async fn refresh_from_redis(&self) {
         self.load_from_redis().await;
     }
-}
-
-fn env_bool(key: &str, default: bool) -> bool {
-    std::env::var(key)
-        .ok()
-        .map(|v| {
-            let v = v.to_lowercase();
-            v == "true" || v == "1" || v == "yes"
-        })
-        .unwrap_or(default)
 }
 
 fn normalize_atmos_mode(s: &str) -> String {
@@ -290,25 +278,26 @@ fn first_opt_string(obj: &Value, keys: &[&str]) -> Result<Option<String>, String
     Ok(None)
 }
 
-fn first_opt_bool(obj: &Value, keys: &[&str]) -> Result<Option<bool>, String> {
-    for key in keys {
-        match obj.get(key) {
-            None => continue,
-            Some(v) if v.is_null() => return Ok(None),
-            Some(v) => {
-                return v
-                    .as_bool()
-                    .map(Some)
-                    .ok_or_else(|| format!("{} must be a boolean", key));
-            }
-        }
-    }
-    Ok(None)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{default_atmos_mode, normalize_atmos_mode, AppSettings};
+    use super::{AppSettings, default_atmos_mode, normalize_atmos_mode};
+
+    #[test]
+    fn obsolete_autoheal_switch_cannot_disable_recovery() {
+        let settings = AppSettings::from_env();
+        settings
+            .apply(&serde_json::json!({"auto_heal": false}))
+            .unwrap();
+        settings.apply_kv("auto_heal", "false");
+        assert_eq!(settings.snapshot()["auto_heal"], true);
+        assert!(!AppSettings::REDIS_SETTING_NAMES.contains(&"auto_heal"));
+        assert!(
+            !settings
+                .settings_entries()
+                .iter()
+                .any(|(name, _)| name == "auto_heal")
+        );
+    }
 
     #[tokio::test]
     async fn discord_webhook_persists_without_entering_public_snapshot() {

@@ -117,7 +117,7 @@ impl TidalClient {
         account_limit: Option<usize>,
     ) -> Result<Value, AppError> {
         let max_retries = if self.proxy_manager.proxies_enabled() {
-            self.config.max_retries
+            self.config.max_retries.max(1)
         } else {
             1
         };
@@ -182,7 +182,8 @@ impl TidalClient {
 
             let mut http = self.working_client_for(&account.id).await?;
 
-            for attempt in 0..max_retries {
+            let mut refreshed_after_401 = false;
+            for attempt in 0..(max_retries + 1) {
                 let token = match self.token_manager.get_token(&account, &http).await {
                     Ok(t) => t,
                     Err(e @ AppError::RateLimited(_)) => {
@@ -229,6 +230,7 @@ impl TidalClient {
                 let mut req = http
                     .get(url)
                     .header("authorization", format!("Bearer {}", token))
+                .header("X-Tidal-Token", account.client_id.as_str())
                     .header("User-Agent", self.config.user_agent.as_str())
                     .header("Accept", "*/*")
                     .header("Accept-Encoding", "gzip")
@@ -256,111 +258,28 @@ impl TidalClient {
 
                 match status.as_u16() {
                     401 => {
-                        if let Err(e @ AppError::RateLimited(_)) = self
-                            .token_manager
-                            .refresh_token(&account, &http)
-                            .await
-                        {
-                            schedule_rate_limit_fallback(
-                                account_try,
-                                &account.id,
-                                e,
-                                &mut first_rate_limit_try,
-                                &mut failed_ids,
-                                &mut last_account_error,
-                            )?;
-                            break;
-                        }
-                        if attempt >= max_retries - 1 {
-                            self.account_manager
-                                .mark_account_error(&account.id, "Tidal 401 unauthorized")
-                                .await;
-                        }
-                        continue;
-                    }
-                    404 => {
-                        let fresh_token = match self.token_manager.refresh_token(&account, &http).await {
-                            Ok(token) => token,
-                            Err(e @ AppError::RateLimited(_)) => {
-                                schedule_rate_limit_fallback(
-                                    account_try,
-                                    &account.id,
-                                    e,
-                                    &mut first_rate_limit_try,
-                                    &mut failed_ids,
-                                    &mut last_account_error,
-                                )?;
-                                break;
-                            }
-                            Err(e) => return Err(e),
-                        };
-
-                        let stored = account.access_token.read().await;
-                        if let Some(ref stored_token) = *stored {
-                            if stored_token != &fresh_token {
-                                drop(stored);
-                                http = self.working_client_for(&account.id).await?;
-                                let mut req2 = http
-                                    .get(url)
-                                    .header("authorization", format!("Bearer {}", fresh_token))
-                                    .header("User-Agent", self.config.user_agent.as_str())
-                                    .header("Accept", "*/*")
-                                    .header("Accept-Encoding", "gzip")
-                                    .header("Accept-Language", "en-US,en;q=0.9")
-                                    .header("X-Platform", "android")
-                                    .header("X-Tidal-Platform", "android");
-                                if let Some(ref p) = params {
-                                    req2 = req2.query(&p);
-                                }
-                                let resp2 = match req2.send().await {
-                                    Ok(r) => {
-                                        self.proxy_manager.note_success_for(&account.id).await;
-                                        r
-                                    }
-                                    Err(e) => {
-                                        if e.is_connect() || e.is_timeout() {
-                                            self.proxy_manager.note_failure_for(&account.id).await;
-                                        }
-                                        return Err(e.into());
-                                    }
-                                };
-                                let status2 = resp2.status();
-                                if status2.as_u16() == 429 {
-                                    let seconds = AccountManager::pause_account(
-                                        &account,
-                                        resp2.headers().get(reqwest::header::RETRY_AFTER).and_then(|v| v.to_str().ok()),
-                                    );
-                                    self.account_manager.mark_account_error(&account.id, "Tidal HTTP 429").await;
+                        if !refreshed_after_401 {
+                            refreshed_after_401 = true;
+                            match self.token_manager.refresh_after_unauthorized(&account, &http, &token).await {
+                                Ok(_) => continue,
+                                Err(e @ AppError::RateLimited(_)) => {
                                     schedule_rate_limit_fallback(
-                                        account_try,
-                                        &account.id,
-                                        AppError::RateLimited(seconds),
-                                        &mut first_rate_limit_try,
-                                        &mut failed_ids,
-                                        &mut last_account_error,
+                                        account_try, &account.id, e, &mut first_rate_limit_try,
+                                        &mut failed_ids, &mut last_account_error,
                                     )?;
                                     break;
                                 }
-                                if status2.is_success() {
-                                    let body2 = resp2.text().await?;
-                                    let data: Value =
-                                        serde_json::from_str(&body2).map_err(|e| {
-                                            AppError::UpstreamError(
-                                                status2,
-                                                format!(
-                                                    "Failed to parse Tidal response: {} | body: {}",
-                                                    e,
-                                                    body2.chars().take(200).collect::<String>()
-                                                ),
-                                            )
-                                        })?;
-                                    return Ok(
-                                        json!({"version": self.config.api_version, "data": data}),
-                                    );
-                                }
+                                Err(e) => last_account_error = Some(e),
                             }
+                        } else {
+                            TokenManager::reject_refreshed_token(&account, &token).await;
+                            last_account_error = Some(AppError::Unauthorized("Tidal rejected refreshed token".into()));
                         }
-
+                        self.account_manager.mark_account_error(&account.id, "Tidal 401 unauthorized").await;
+                        failed_ids.push(account.id.clone());
+                        break;
+                    }
+                    404 => {
                         return Err(AppError::NotFound("Resource not found".into()));
                     }
                     429 => {
@@ -495,6 +414,9 @@ impl TidalClient {
             .header("X-Platform", "android")
             .header("X-Tidal-Platform", "android");
 
+        if let Some(account) = &account {
+            req = req.header("X-Tidal-Token", account.client_id.as_str());
+        }
         if let Some(ref p) = params {
             req = req.query(&p);
         }
@@ -759,6 +681,7 @@ impl TidalClient {
             let mut req = http
                 .get(url)
                 .header("authorization", format!("Bearer {}", token))
+                .header("X-Tidal-Token", account.client_id.as_str())
                 .header("User-Agent", self.config.user_agent.as_str())
                 .header("Accept", "*/*")
                 .header("Accept-Encoding", "gzip")
@@ -794,8 +717,11 @@ impl TidalClient {
                 return Err(AppError::RateLimited(seconds));
             }
             if status.as_u16() == 401 && attempt == 0 {
-                token = self.token_manager.refresh_token(account, &http).await?;
+                token = self.token_manager.refresh_after_unauthorized(account, &http, &token).await?;
                 continue;
+            }
+            if status.as_u16() == 401 {
+                TokenManager::reject_refreshed_token(account, &token).await;
             }
             if !status.is_success() {
                 return Err(AppError::UpstreamError(
@@ -864,6 +790,7 @@ impl TidalClient {
                     ("assetpresentation", "FULL"),
                 ])
                 .header("authorization", format!("Bearer {}", token))
+                .header("X-Tidal-Token", account.client_id.as_str())
                 .header("User-Agent", self.config.user_agent.as_str());
             let response =
                 match tokio::time::timeout(Duration::from_secs(PROBE_REQ_SECS), request.send())
@@ -995,6 +922,62 @@ mod rate_limit_tests {
             config,
         );
         (client, manager)
+    }
+
+    #[tokio::test]
+    async fn api_401_refreshes_and_retries_even_with_one_attempt_budget() {
+        use serde_json::json;
+        use axum::{Json, http::HeaderMap, routing::post};
+        let api_hits = Arc::new(AtomicUsize::new(0));
+        let auth_hits = Arc::new(AtomicUsize::new(0));
+        let calls = api_hits.clone();
+        let refreshes = auth_hits.clone();
+        let app = Router::new()
+            .route("/token", post(move || {
+                let refreshes = refreshes.clone();
+                async move {
+                    refreshes.fetch_add(1, Ordering::Relaxed);
+                    Json(json!({"access_token":"fresh", "expires_in":3600}))
+                }
+            }))
+            .route("/track", get(move |headers: HeaderMap| {
+                let calls = calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    assert_eq!(headers["x-tidal-token"], "client");
+                    if headers["authorization"] == "Bearer fresh" {
+                        (StatusCode::OK, Json(json!({"title":"ok"})))
+                    } else {
+                        (StatusCode::UNAUTHORIZED, Json(json!({})))
+                    }
+                }
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (mut client, manager) = client_with_accounts(1).await;
+        let mut tm = TokenManager::new(None);
+        tm.token_url = format!("{base}/token");
+        tm.set_account_manager(manager);
+        tm.set_proxy_manager(client.proxy_manager.clone());
+        client.token_manager = Arc::new(tm);
+        let result = client.make_request(&format!("{base}/track"), None).await;
+        server.abort();
+        assert_eq!(result.unwrap()["data"]["title"], "ok");
+        assert_eq!(api_hits.load(Ordering::Relaxed), 2);
+        assert_eq!(auth_hits.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn resource_404_does_not_refresh_credentials() {
+        let app = Router::new().route("/missing", get(|| async { StatusCode::NOT_FOUND }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/missing", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (client, _) = client_with_accounts(1).await;
+        let result = client.make_request(&url, None).await;
+        server.abort();
+        assert!(matches!(result, Err(AppError::NotFound(_))));
     }
 
     #[tokio::test]

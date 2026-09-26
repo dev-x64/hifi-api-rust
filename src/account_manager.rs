@@ -34,7 +34,7 @@ pub struct AccountState {
     pub label: String,
     pub client_id: String,
     pub client_secret: String,
-    pub refresh_token: String,
+    refresh_token: std::sync::RwLock<String>,
     pub user_id: RwLock<Option<String>>,
     pub access_token: RwLock<Option<String>>,
     pub token_expires_at: AtomicI64,
@@ -49,6 +49,9 @@ pub struct AccountState {
     pub auto_disabled: AtomicBool,
     pub heal_failures: AtomicU64,
     pub heal_next_retry: AtomicI64,
+    /// Preferred OAuth client-authentication shape for the next attempt.
+    pub auth_use_basic: AtomicBool,
+    pub rejected_access_token: RwLock<Option<String>>,
     pub notes: RwLock<String>,
     pub last_used: AtomicI64,
     pub request_count: AtomicU64,
@@ -80,8 +83,8 @@ impl AccountState {
             id,
             label,
             client_id,
-            client_secret,
-            refresh_token,
+            client_secret: normalize_client_secret(&client_secret),
+            refresh_token: std::sync::RwLock::new(refresh_token),
             user_id: RwLock::new(user_id),
             access_token: RwLock::new(None),
             token_expires_at: AtomicI64::new(0),
@@ -91,6 +94,8 @@ impl AccountState {
             auto_disabled: AtomicBool::new(false),
             heal_failures: AtomicU64::new(0),
             heal_next_retry: AtomicI64::new(0),
+            auth_use_basic: AtomicBool::new(true),
+            rejected_access_token: RwLock::new(None),
             notes: RwLock::new(notes),
             last_used: AtomicI64::new(0),
             request_count: AtomicU64::new(0),
@@ -131,7 +136,15 @@ impl AccountState {
             old.heal_next_retry.load(Ordering::Relaxed),
             Ordering::Relaxed,
         );
-        if new.client_id == old.client_id && new.refresh_token == old.refresh_token {
+        if new.client_id == old.client_id && new.client_secret == old.client_secret
+            && new.refresh_token() == old.refresh_token() {
+            new.auth_use_basic.store(old.auth_use_basic.load(Ordering::Relaxed), Ordering::Relaxed);
+            if let (Ok(src), Ok(mut dst)) = (old.access_token.try_read(), new.access_token.try_write()) {
+                *dst = src.clone();
+            }
+            if let (Ok(src), Ok(mut dst)) = (old.rejected_access_token.try_read(), new.rejected_access_token.try_write()) {
+                *dst = src.clone();
+            }
             if let (Ok(src), Ok(mut dst)) = (
                 old.premium_status.try_read(),
                 new.premium_status.try_write(),
@@ -142,8 +155,27 @@ impl AccountState {
                 old.premium_checked_at.load(Ordering::Relaxed),
                 Ordering::Relaxed,
             );
+        } else {
+            new.token_expires_at.store(0, Ordering::Relaxed);
+            new.heal_failures.store(0, Ordering::Relaxed);
+            new.heal_next_retry.store(0, Ordering::Relaxed);
         }
     }
+
+    pub fn refresh_token(&self) -> String {
+        self.refresh_token.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub(crate) fn replace_refresh_token(&self, token: String) {
+        *self.refresh_token.write().unwrap_or_else(|e| e.into_inner()) = token;
+    }
+}
+
+/// Legacy helpers stored URL-escaped base64 secrets. Decode once; never turn
+/// a literal '+' into a space. Request builders perform their own encoding.
+pub(crate) fn normalize_client_secret(secret: &str) -> String {
+    percent_encoding::percent_decode_str(secret)
+        .decode_utf8().map(|s| s.into_owned()).unwrap_or_else(|_| secret.to_string())
 }
 
 /// UTC day number for a unix timestamp. Pure function — unit tested.
@@ -279,6 +311,11 @@ impl AccountManager {
 
         let mut accounts = self.accounts.write().await;
         for row in rows {
+            let normalized_secret = normalize_client_secret(&row.client_secret);
+            if normalized_secret != row.client_secret {
+                sqlx::query("UPDATE accounts SET client_secret = ? WHERE id = ?")
+                    .bind(&normalized_secret).bind(&row.id).execute(db).await?;
+            }
             // Backfill user_id for accounts created before it was persisted
             // (label was "Tidal Account (<id>)").
             let user_id = match row.user_id {
@@ -369,7 +406,7 @@ impl AccountManager {
             .bind(&id)
             .bind(&label)
             .bind(&client_id)
-            .bind(&client_secret)
+            .bind(&state.client_secret)
             .bind(&refresh_token)
             .bind(&user_id)
             .bind(now)
@@ -718,7 +755,7 @@ impl AccountManager {
         let new_label = label.unwrap_or_else(|| old.label.clone());
         let new_client_id = client_id.unwrap_or_else(|| old.client_id.clone());
         let new_client_secret = client_secret.unwrap_or_else(|| old.client_secret.clone());
-        let new_refresh_token = refresh_token.unwrap_or_else(|| old.refresh_token.clone());
+        let new_refresh_token = refresh_token.unwrap_or_else(|| old.refresh_token());
         let current_user_id = old.user_id.read().await.clone();
         let new_user_id = user_id.or(current_user_id);
         let new_notes = old.notes.read().await.clone();
@@ -741,18 +778,25 @@ impl AccountManager {
 
         if let Some(db) = &self.db {
             let now = Utc::now().timestamp();
+            let mut tx = db.begin().await?;
             sqlx::query(
                 "UPDATE accounts SET label = ?, client_id = ?, client_secret = ?, refresh_token = ?, user_id = ?, updated_at = ? WHERE id = ?",
             )
             .bind(&updated.label)
             .bind(&updated.client_id)
             .bind(&updated.client_secret)
-            .bind(&updated.refresh_token)
+            .bind(updated.refresh_token())
             .bind(&new_user_id)
             .bind(now)
             .bind(&old.id)
-            .execute(db)
+            .execute(&mut *tx)
             .await?;
+            if updated.client_id != old.client_id || updated.client_secret != old.client_secret
+                || updated.refresh_token() != old.refresh_token() {
+                sqlx::query("DELETE FROM tokens WHERE account_id = ?")
+                    .bind(id).execute(&mut *tx).await?;
+            }
+            tx.commit().await?;
         }
 
         accounts[idx] = updated.clone();
@@ -765,8 +809,8 @@ impl AccountManager {
     /// (owner intent / successful recovery — never auto-healed while clear).
     pub async fn set_auto_disabled(&self, id: &str, disabled: bool) -> Result<(), AppError> {
         if let Some(account) = self.get_account_by_id(id).await {
-            account.auto_disabled.store(disabled, Ordering::Relaxed);
-            if disabled {
+            let was_disabled = account.auto_disabled.swap(disabled, Ordering::Relaxed);
+            if !disabled || !was_disabled {
                 account.heal_failures.store(0, Ordering::Relaxed);
                 account.heal_next_retry.store(0, Ordering::Relaxed);
             }
@@ -788,7 +832,8 @@ impl AccountManager {
     }
 
     pub async fn set_account_active(&self, id: &str, active: bool) -> Result<(), AppError> {
-        if let Some(account) = self.get_account_by_id(id).await {
+        let accounts = self.accounts.write().await;
+        if let Some(account) = accounts.iter().find(|account| account.id == id) {
             let now = Utc::now().timestamp();
             let disabled_at = if active {
                 0
@@ -800,10 +845,13 @@ impl AccountManager {
             // A rejected credential must stop serving requests immediately,
             // even if persisting the transition later fails.
             account.is_active.store(active, Ordering::Relaxed);
+            account.auto_disabled.store(false, Ordering::Relaxed);
+            account.heal_failures.store(0, Ordering::Relaxed);
+            account.heal_next_retry.store(0, Ordering::Relaxed);
             account.disabled_at.store(disabled_at, Ordering::Relaxed);
             account.updated_at.store(now, Ordering::Relaxed);
             if let Some(db) = &self.db {
-                sqlx::query("UPDATE accounts SET is_active = ?, disabled_at = ?, updated_at = ? WHERE id = ?")
+                sqlx::query("UPDATE accounts SET is_active = ?, auto_disabled = 0, disabled_at = ?, updated_at = ? WHERE id = ?")
                     .bind(active as i32)
                     .bind(disabled_at)
                     .bind(now)
@@ -820,6 +868,55 @@ impl AccountManager {
 
     // --- Redis credential sync ---
 
+    /// Conditional background transition; an explicit owner OFF always wins.
+    pub(crate) async fn set_system_disabled(&self, expected: &AccountState, disabled: bool) -> Result<bool, AppError> {
+        let accounts = self.accounts.write().await;
+        let Some(account) = accounts.iter().find(|a| std::ptr::eq(a.as_ref(), expected)) else {
+            return Ok(false);
+        };
+        if disabled {
+            if !account.is_active.load(Ordering::Relaxed) && !account.auto_disabled.load(Ordering::Relaxed) {
+                return Ok(false);
+            }
+        } else if !account.auto_disabled.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
+        let now = Utc::now().timestamp();
+        account.auto_disabled.store(disabled, Ordering::Relaxed);
+        account.is_active.store(!disabled, Ordering::Relaxed);
+        let disabled_at = if disabled { account.disabled_at.load(Ordering::Relaxed).max(1) } else { 0 };
+        let disabled_at = if disabled_at == 1 { now } else { disabled_at };
+        account.disabled_at.store(disabled_at, Ordering::Relaxed);
+        account.updated_at.store(now, Ordering::Relaxed);
+        if let Some(db) = &self.db {
+            sqlx::query("UPDATE accounts SET is_active = ?, auto_disabled = ?, disabled_at = ?, updated_at = ? WHERE id = ?")
+                .bind(!disabled as i32).bind(disabled as i32).bind(disabled_at).bind(now).bind(&account.id)
+                .execute(db).await?;
+        }
+        self.push_account_to_redis(account).await;
+        Ok(true)
+    }
+
+    pub(crate) async fn store_refreshed_credentials(
+        &self, expected: &AccountState, old_refresh: &str, rotated: Option<&str>, token: &str, expires_at: i64,
+    ) -> Result<(), AppError> {
+        let accounts = self.accounts.write().await;
+        let account = accounts.iter().find(|a| std::ptr::eq(a.as_ref(), expected))
+            .ok_or_else(|| AppError::ServiceUnavailable("Account changed during refresh".into()))?;
+        if account.refresh_token() != old_refresh {
+            return Err(AppError::ServiceUnavailable("Credentials changed during refresh".into()));
+        }
+        if let Some(db) = &self.db {
+            crate::token_manager::persist_token(db, account, old_refresh, rotated, token, expires_at).await?;
+        }
+        if let Some(rotated) = rotated { account.replace_refresh_token(rotated.into()); }
+        *account.access_token.write().await = Some(token.into());
+        account.token_expires_at.store(expires_at, Ordering::Relaxed);
+        account.updated_at.store(Utc::now().timestamp(), Ordering::Relaxed);
+        self.push_account_to_redis(account).await;
+        Ok(())
+    }
+
     /// Serialize one account for Redis. Contains Tidal secrets — the
     /// payload is never logged, only key names at debug level.
     async fn account_to_json(acc: &AccountState) -> String {
@@ -828,7 +925,7 @@ impl AccountManager {
             "label": acc.label,
             "client_id": acc.client_id,
             "client_secret": acc.client_secret,
-            "refresh_token": acc.refresh_token,
+            "refresh_token": acc.refresh_token(),
             "user_id": acc.user_id.read().await.clone(),
             "is_active": acc.is_active.load(Ordering::Relaxed),
             "disabled_at": acc.disabled_at.load(Ordering::Relaxed),
@@ -842,7 +939,7 @@ impl AccountManager {
 
     /// Publish one account record + index entry (no expiry: backup
     /// semantics). Best-effort; called after every local mutation.
-    async fn push_account_to_redis(&self, acc: &AccountState) {
+    pub(crate) async fn push_account_to_redis(&self, acc: &AccountState) {
         let store = match self.upstash() {
             Some(s) => s,
             None => return,
@@ -925,12 +1022,8 @@ impl AccountManager {
                     ));
                     AccountState::carry_over(&rebuilt, old);
                     rebuilt.disabled_at.store(disabled_at, Ordering::Relaxed);
-                    if auto_disabled {
-                        rebuilt.auto_disabled.store(true, Ordering::Relaxed);
-                    }
-                    if is_catalog {
-                        rebuilt.is_catalog.store(true, Ordering::Relaxed);
-                    }
+                    rebuilt.auto_disabled.store(auto_disabled, Ordering::Relaxed);
+                    rebuilt.is_catalog.store(is_catalog, Ordering::Relaxed);
                     rebuilt.updated_at.store(remote_updated, Ordering::Relaxed);
                     if let Some(db) = &self.db {
                         let _ = sqlx::query(
@@ -941,7 +1034,7 @@ impl AccountManager {
                         .bind(&rebuilt.label)
                         .bind(&rebuilt.client_id)
                         .bind(&rebuilt.client_secret)
-                        .bind(&rebuilt.refresh_token)
+                        .bind(rebuilt.refresh_token())
                         .bind(&user_id)
                         .bind(is_active as i32)
                         .bind(auto_disabled as i32)
@@ -988,7 +1081,7 @@ impl AccountManager {
                         .bind(&state.label)
                         .bind(&state.client_id)
                         .bind(&state.client_secret)
-                        .bind(&state.refresh_token)
+                        .bind(state.refresh_token())
                         .bind(&user_id)
                         .bind(is_active as i32)
                         .bind(auto_disabled as i32)
@@ -1192,7 +1285,7 @@ mod tests {
     }
 
     #[test]
-    fn carry_over_preserves_live_state() {
+    fn carry_over_preserves_metrics_but_invalidates_changed_credentials() {
         let old = AccountState::new(
             "id-1".into(),
             "Old".into(),
@@ -1220,9 +1313,35 @@ mod tests {
         AccountState::carry_over(&new, &old);
         assert_eq!(new.label, "New");
         assert_eq!(new.request_count.load(Ordering::Relaxed), 500);
-        assert_eq!(new.token_expires_at.load(Ordering::Relaxed), 8_888_888);
+        assert_eq!(new.token_expires_at.load(Ordering::Relaxed), 0);
         assert!(new.is_catalog.load(Ordering::Relaxed));
         assert_eq!(new.rate_limited_until.load(Ordering::Relaxed), 8_888_999);
+    }
+
+    #[tokio::test]
+    async fn label_edit_preserves_tokens_but_credential_edit_invalidates_db_cache() {
+        let db = crate::db::init_pool("sqlite::memory:").await.unwrap();
+        let am = AccountManager::new(Some(db.clone()), SwitchingWeights::default());
+        let original = am.add_account("old".into(), "c".into(), "s%3D".into(), "r".into(), None).await.unwrap();
+        let expiry = chrono::Utc::now().timestamp() + 3600;
+        am.store_refreshed_credentials(&original, "r", None, "cached", expiry).await.unwrap();
+        am.update_account(&original.id, Some("new".into()), None, None, None, None).await.unwrap();
+        let renamed = am.get_account_by_id(&original.id).await.unwrap();
+        assert_eq!(renamed.access_token.read().await.as_deref(), Some("cached"));
+        assert_eq!(renamed.token_expires_at.load(Ordering::Relaxed), expiry);
+        am.update_account(&original.id, None, None, None, Some("replacement".into()), None).await.unwrap();
+        let reloaded = AccountManager::new(Some(db), SwitchingWeights::default());
+        reloaded.load_from_db().await.unwrap();
+        let changed = reloaded.get_account_by_id(&original.id).await.unwrap();
+        assert!(changed.access_token.read().await.is_none());
+        assert_eq!(changed.token_expires_at.load(Ordering::Relaxed), 0);
+        assert!(am.store_refreshed_credentials(&original, "r", Some("stale"), "stale", expiry).await.is_err());
+    }
+
+    #[test]
+    fn legacy_secret_is_decoded_without_treating_plus_as_space() {
+        assert_eq!(super::normalize_client_secret("abc+def%3D"), "abc+def=");
+        assert_eq!(super::normalize_client_secret("abc+def="), "abc+def=");
     }
 
     #[tokio::test]
