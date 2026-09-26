@@ -6,6 +6,17 @@ This repository is a fork of [itsmeadarsh2008/hifi-api](https://github.com/itsme
 
 Use your own valid Tidal account. Catalog availability and playback formats depend on the account, track, and client credentials.
 
+## What this fork adds
+
+Compared with [itsmeadarsh2008/hifi-api](https://github.com/itsmeadarsh2008/hifi-api), this fork adds:
+
+- **Bounded playback queue:** concurrent work is limited by the active account pool. Waiting requests can be polled or cancelled, abandoned jobs are removed, and a full queue returns `503`.
+- **Account-aware rate limiting:** a Tidal `429` pauses the affected account for `Retry-After` and tries at most one other eligible account. If none succeeds, the caller receives `429` with `Retry-After`.
+- **Per-account proxy routing:** each account keeps a working proxy assignment across restarts. Accounts spread over spare proxies; repeated connection failures move only the affected account. Direct connection fallback and rotation on token refresh are opt-in.
+- **Access protection:** repeated failed admin authentication and requests to common scanner paths trigger temporary, per-IP lockouts.
+
+The fork also retains upstream features useful for operating the service: a metadata cache with request coalescing, separate error and latency metrics, manual `FULL`/`PREVIEW` account checks, API keys, and optional Redis sharing across instances. The queue, cache, proxy bindings, and rate-limit pauses remain local to each instance.
+
 ## Quick start
 
 ### Docker Compose
@@ -99,6 +110,8 @@ The admin panel is at `/admin`. With `ADMIN_KEY` set, sign-in creates an HttpOnl
 
 The panel manages OAuth accounts, catalog flags, credentials import/export, API keys, proxy settings, Atmos and auto-heal settings, alerts, cache, backups, and request statistics. Its interface defaults to English; choose English or Russian in System → Panel settings. The choice is saved in the current browser. Overview shows completed API requests per second averaged over the last 60 seconds and p95 response time from up to 5000 recent logged requests. These are observed per-instance metrics, not the server's maximum capacity. The existing total request and error cards count account selections and account errors. The live log records recent API requests with status, latency, client IP, endpoint counts, and top tracks; admin, health, and favicon requests are excluded. Three requests to scanner paths such as `wp-includes`, `.env`, or `.git/config` within one minute temporarily block the client IP from all routes for 15 minutes (`403` with `Retry-After`). The ban is local to each instance and resets on restart.
 
+The request log also separates 4xx responses (except 429) from 429/5xx, shows slow routes, and labels cache hits, stale responses, and negative-cache responses. In Accounts, **Check FULL** manually probes up to four Tidal tracks for `FULL` or `PREVIEW`; unknown results do not change account availability. A subscription flag alone is not used as a playback verdict. The System page shows cache counters and can clear queued playback jobs. These diagnostics are local to the running instance and do not guarantee that Tidal will keep an account active.
+
 Public API routes are open until you create the first API key. After that, send `X-API-Key` with requests, or use `X-Admin-Key` as the owner. `/`, `/health`, and `/admin` are exempt from API key checks. API keys can have usage quotas.
 
 ## API
@@ -140,7 +153,11 @@ Add `-H 'X-API-Key: YOUR_KEY'` to the `curl` commands after enabling API keys.
 
 ### Playback queue and formats
 
-`/track/`, `/trackManifests`, `/dash`, `/widevine`, and `/video/` use playback accounts. Each account handles at most one playback request at a time. If all slots are busy, the API returns `202 Accepted` with a `Location` header pointing to `/playback/requests/{request_id}` and a `Retry-After` header. Poll that URL with `GET` until it returns the original result; `DELETE` cancels the job. Finished jobs expire after five minutes. Catalog accounts do not serve playback.
+`/track/`, `/trackManifests`, `/dash`, `/widevine`, and `/video/` use playback accounts. The queue allows up to the number of active playback accounts to run simultaneously. If all slots are busy, the API returns `202 Accepted` with a `Location` header pointing to `/playback/requests/{request_id}` and a `Retry-After` header. Poll that URL with `GET` until it returns the original result; `DELETE` cancels the job. Finished jobs expire after five minutes. Catalog accounts do not serve playback.
+
+The pending queue is capped at the playback pool size. Once full, new requests receive `503` with `Retry-After: 5` instead of accumulating. Pending jobs without a poll for 60 seconds are cancelled, and a background reaper removes finished jobs after five minutes. Each playback operation times out after 120 seconds. Metadata GET responses use a one-hour fresh cache plus a one-hour stale window with background refresh; repeatable 404/429/5xx responses have short negative-cache lifetimes. Playback and Widevine responses are excluded from this shared cache.
+
+When Tidal responds with `429`, the API pauses that credential for the upstream `Retry-After` interval (seconds or HTTP date; 30 seconds when absent) and tries one other eligible credential for user-facing playback, Widevine, video, or catalog requests. If that backup also receives `429` or none is available, the caller receives `429` with `Retry-After`. Token refreshes and manual account probes also pause the affected credential; account-specific probes do not switch accounts. The pause is held in memory on each server instance and resets on restart; instances do not share it through Redis.
 
 `/trackManifests` accepts `formats=FLAC_HIRES,FLAC,AACLC` or repeated `formats` parameters. It also accepts `atmos=prefer`, `atmos=only`, or `atmos=off`. Explicit formats take precedence except when `atmos=prefer` adds Atmos first or `atmos=only` selects only Atmos. `/dash/{id}` supports the same Atmos preference, but uses its own fixed format list. In the admin panel, `HIGH · AAC 320 kbps` makes `/dash/{id}` redirect to a direct AAC file from v1 without calling v2; `atmos=prefer` or `atmos=only` still requests v2. `/trackManifests` always exposes the raw v2 endpoint. `atmos=off` requests non-Atmos formats for a conventional DASH player when the FLAC or Atmos preference is selected. Atmos playback requires a compatible player and may require Widevine.
 
