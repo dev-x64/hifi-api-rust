@@ -127,6 +127,10 @@ var ruToEn = {
     'Статичный токен': 'Static token',
     'Каталог': 'Catalog',
     'Общий пул': 'Shared pool',
+    'Метаданные через токен': 'Metadata via token',
+    'Метаданные через пул воспроизведения': 'Metadata via playback pool',
+    'Аккаунты каталога неактивны; используется пул воспроизведения': 'Catalog accounts are inactive; using the playback pool',
+    'Без названия': 'Untitled',
     'Синхронизация Redis': 'Redis sync',
     'Один сервер': 'Single server',
     'Работает': 'Connected',
@@ -250,7 +254,13 @@ function localizedCore(source) {
     var dictionary = adminLanguage === 'ru' ? enToRu : ruToEn;
     if (Object.prototype.hasOwnProperty.call(dictionary, source)) return dictionary[source];
     if (adminLanguage === 'en') {
-        var match = source.match(/^(\d+) (?:аккаунт|аккаунта|аккаунтов)$/);
+        var match = source.match(/^(\d+) (?:активный аккаунт|активных аккаунта|активных аккаунтов)$/);
+        if (match) return match[1] + ' active ' + (Number(match[1]) === 1 ? 'account' : 'accounts');
+        match = source.match(/^Циклически \(round-robin\): (.+)$/);
+        if (match) return 'Round-robin: ' + match[1];
+        match = source.match(/^Резерв: (\d+) (?:аккаунт каталога|аккаунта каталога|аккаунтов каталога)$/);
+        if (match) return 'Fallback: ' + match[1] + ' catalog ' + (Number(match[1]) === 1 ? 'account' : 'accounts');
+        match = source.match(/^(\d+) (?:аккаунт|аккаунта|аккаунтов)$/);
         if (match) return match[1] + (Number(match[1]) === 1 ? ' account' : ' accounts');
         match = source.match(/^истёк (\d+) мин назад$/);
         if (match) return 'expired ' + match[1] + ' min ago';

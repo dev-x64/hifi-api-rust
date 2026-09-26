@@ -626,9 +626,9 @@ function catalogCard(cat, accounts) {
     var label = mode === 'static_token' ? 'Статичный токен' :
         (active.length ? active.length + ' ' + plural(active.length, 'активный аккаунт', 'активных аккаунта', 'активных аккаунтов') : 'Общий пул');
     var detail = mode === 'static_token'
-        ? (active.length ? 'Резерв: ' + active.length + ' ' + plural(active.length, 'Catalog аккаунт', 'Catalog аккаунта', 'Catalog аккаунтов') : 'Метаданные через токен')
-        : (active.length ? (active.length > 1 ? 'По очереди: ' : '') + active.map(function(a) { return a.label || 'Без названия'; }).join(' · ') :
-            (catalog.length ? 'Catalog аккаунты неактивны; используется пул воспроизведения' : 'Метаданные через пул воспроизведения'));
+        ? (active.length ? 'Резерв: ' + active.length + ' ' + plural(active.length, 'аккаунт каталога', 'аккаунта каталога', 'аккаунтов каталога') : 'Метаданные через токен')
+        : (active.length ? (active.length > 1 ? 'Циклически (round-robin): ' : '') + active.map(function(a) { return a.label || 'Без названия'; }).join(' · ') :
+            (catalog.length ? 'Аккаунты каталога неактивны; используется пул воспроизведения' : 'Метаданные через пул воспроизведения'));
     var color = mode === 'pool' || (mode !== 'static_token' && !active.length) ? '#8b949e' : '#d2a8ff';
     return '<div class="stat-card"><div class="label">Каталог</div><div class="value" style="font-size:18px;color:' + color + '">' + esc(label) + '</div>' +
         '<div style="font-size:11px;color:var(--muted);margin-top:5px;overflow-wrap:anywhere">' + esc(detail) + '</div></div>';
