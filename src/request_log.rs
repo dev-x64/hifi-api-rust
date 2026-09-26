@@ -2,25 +2,24 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::time::Instant;
 
+use axum::Json;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, State};
-use axum::http::{header::RETRY_AFTER, HeaderMap, HeaderValue, Request, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, Request, StatusCode, header::RETRY_AFTER};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::net::{IpAddr, SocketAddr};
 
 use crate::AppState;
 
 const MAX_ENTRIES: usize = 5000;
 const RATE_WINDOW_SECONDS: i64 = 60;
+const SLOW_MS: u64 = 3000;
+const STUCK_MS: u64 = 10_000;
 
 fn should_log_path(path: &str) -> bool {
-    path != "/admin"
-        && !path.starts_with("/admin/")
-        && path != "/health"
-        && path != "/favicon.ico"
+    path != "/admin" && !path.starts_with("/admin/") && path != "/health" && path != "/favicon.ico"
 }
 
 #[derive(Clone)]
@@ -35,6 +34,8 @@ pub struct LogEntry {
     pub status: u16,
     pub latency_ms: u64,
     pub client_ip: String,
+    /// Cache verdict from the response, if this was a cacheable route.
+    pub cache: String,
 }
 
 pub struct RequestLog {
@@ -117,6 +118,8 @@ impl RequestLog {
         let mut by_track: HashMap<String, usize> = HashMap::new();
         let mut latencies: Vec<u64> = Vec::with_capacity(total);
         let mut errors: u64 = 0;
+        let mut user_errors: u64 = 0;
+        let mut upstream_errors: u64 = 0;
 
         for e in &entries {
             *by_endpoint.entry(e.path.clone()).or_default() += 1;
@@ -128,6 +131,11 @@ impl RequestLog {
             latencies.push(e.latency_ms);
             if e.status >= 400 {
                 errors += 1;
+                if e.status == 429 || e.status >= 500 {
+                    upstream_errors += 1;
+                } else {
+                    user_errors += 1;
+                }
             }
         }
 
@@ -146,6 +154,15 @@ impl RequestLog {
         top_ips.sort_by(|a, b| b.1.cmp(&a.1));
         let mut top_tracks: Vec<(String, usize)> = by_track.into_iter().collect();
         top_tracks.sort_by(|a, b| b.1.cmp(&a.1));
+        let mut seen = std::collections::HashSet::new();
+        let mut by_latency: Vec<&LogEntry> = entries.iter().collect();
+        by_latency.sort_by(|a, b| b.latency_ms.cmp(&a.latency_ms));
+        let slowest: Vec<Value> = by_latency
+            .into_iter()
+            .filter(|e| seen.insert((e.path.clone(), e.detail.clone())))
+            .take(5)
+            .map(|e| json!({"endpoint": e.path, "detail": e.detail, "latency_ms": e.latency_ms}))
+            .collect();
 
         let recent: Vec<Value> = entries
             .iter()
@@ -160,6 +177,8 @@ impl RequestLog {
                     "status": e.status,
                     "latency_ms": e.latency_ms,
                     "client_ip": e.client_ip,
+                    "cache": e.cache,
+                    "slow": e.latency_ms >= SLOW_MS,
                 })
             })
             .collect();
@@ -167,6 +186,9 @@ impl RequestLog {
         json!({
             "total": total,
             "errors": errors,
+            "user_errors": user_errors,
+            "upstream_errors": upstream_errors,
+            "slowest": slowest,
             "p50_ms": pct(0.5),
             "p95_ms": pct(0.95),
             "by_endpoint": top_endpoints.into_iter().take(20).map(|(k, v)| json!({"endpoint": k, "hits": v})).collect::<Vec<_>>(),
@@ -202,9 +224,7 @@ pub fn normalize_path(path: &str) -> String {
 /// the `id=` query value or search text (`s=`). Truncated to 64 chars.
 fn extract_detail(path: &str, query: Option<&str>) -> String {
     let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    if segs.len() >= 2
-        && (segs[0] == "track" || segs[0] == "trackManifests" || segs[0] == "dash")
-    {
+    if segs.len() >= 2 && (segs[0] == "track" || segs[0] == "trackManifests" || segs[0] == "dash") {
         return segs[1].chars().take(64).collect();
     }
     if let Some(q) = query {
@@ -259,6 +279,22 @@ pub async fn log_requests(
         return resp;
     }
     let status = resp.status().as_u16();
+    let latency_ms = start.elapsed().as_millis() as u64;
+    let cache = resp
+        .headers()
+        .get("X-Cache")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    if latency_ms >= STUCK_MS {
+        tracing::warn!(
+            "Slow response: {} {} → {} in {}ms",
+            method,
+            path,
+            status,
+            latency_ms
+        );
+    }
 
     state.request_log.record(LogEntry {
         ts: chrono::Utc::now().timestamp(),
@@ -266,8 +302,9 @@ pub async fn log_requests(
         path,
         detail,
         status,
-        latency_ms: start.elapsed().as_millis() as u64,
+        latency_ms,
         client_ip: ip.to_string(),
+        cache,
     });
 
     resp
@@ -286,6 +323,7 @@ mod tests {
             status: 200,
             latency_ms,
             client_ip: "127.0.0.1".into(),
+            cache: String::new(),
         }
     }
 
@@ -303,7 +341,12 @@ mod tests {
             assert!(!should_log_path(path), "{path}");
         }
 
-        for path in ["/trackManifests/123", "/search/", "/administrator", "/healthcheck"] {
+        for path in [
+            "/trackManifests/123",
+            "/search/",
+            "/administrator",
+            "/healthcheck",
+        ] {
             assert!(should_log_path(path), "{path}");
         }
     }
@@ -331,6 +374,33 @@ mod tests {
         }
         assert_eq!(log.recent_p95_ms(), Some(95));
     }
+
+    #[test]
+    fn summary_separates_error_classes_and_marks_slow_cache_hits() {
+        let log = RequestLog::new();
+        let now = chrono::Utc::now().timestamp();
+        let mut ok = entry(now, 3500);
+        ok.path = "/search/".into();
+        ok.cache = "STALE".into();
+        log.record(ok);
+        let mut user = entry(now, 10);
+        user.status = 404;
+        log.record(user);
+        let mut throttle = entry(now, 20);
+        throttle.status = 429;
+        log.record(throttle);
+        let mut server = entry(now, 30);
+        server.status = 503;
+        log.record(server);
+
+        let summary = log.summary(4);
+        assert_eq!(summary["errors"], 3);
+        assert_eq!(summary["user_errors"], 1);
+        assert_eq!(summary["upstream_errors"], 2);
+        assert_eq!(summary["slowest"][0]["endpoint"], "/search/");
+        assert_eq!(summary["recent"][3]["cache"], "STALE");
+        assert_eq!(summary["recent"][3]["slow"], true);
+    }
 }
 
 pub(crate) fn client_ip(state: &AppState, req: &Request<Body>, fallback: SocketAddr) -> IpAddr {
@@ -343,20 +413,14 @@ pub(crate) fn client_ip_from_headers(
     fallback: SocketAddr,
 ) -> IpAddr {
     if state.config.trust_proxy {
-        if let Some(xff) = headers
-            .get("x-forwarded-for")
-            .and_then(|v| v.to_str().ok())
-        {
+        if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
             if let Some(first) = xff.split(',').next().map(|s| s.trim()) {
                 if let Ok(ip) = first.parse::<IpAddr>() {
                     return ip.to_canonical();
                 }
             }
         }
-        if let Some(real) = headers
-            .get("x-real-ip")
-            .and_then(|v| v.to_str().ok())
-        {
+        if let Some(real) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
             if let Ok(ip) = real.trim().parse::<IpAddr>() {
                 return ip.to_canonical();
             }
