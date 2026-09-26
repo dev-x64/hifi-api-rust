@@ -10,12 +10,8 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::error::AppError;
+use crate::setup::{AUTH_CLIENT_ID, AUTH_CLIENT_SECRET, issued_token_expires_at};
 use crate::AppState;
-
-const AUTH_CLIENT_ID: &str = "fX2JxdmntZWK0ixT";
-const AUTH_CLIENT_SECRET: &str = "1Nm5AfDAjxrgJFJbKNWLeAyKGVGmINuXPPLHVXAvxAg=";
-const REQUEST_CLIENT_ID: &str = "lw3vR6GE1vtNBsjv";
-const REQUEST_CLIENT_SECRET: &str = "Y8tIpqKJxs9BEIwYr0I9bSbMWDsogXJx9LaN3mCHwD4=";
 
 #[derive(Clone)]
 pub enum SetupStatus {
@@ -229,18 +225,39 @@ pub async fn start_setup(
             let label = live_label
                 .or(custom_label.clone())
                 .unwrap_or_else(|| format!("Tidal Account ({})", user_id));
+            let access_token = token_resp.access_token;
+            let refresh_token = token_resp.refresh_token;
+            let expires_at = issued_token_expires_at(token_resp.expires_in);
 
             match am
                 .add_account(
                     label.clone(),
-                    REQUEST_CLIENT_ID.to_string(),
-                    REQUEST_CLIENT_SECRET.to_string(),
-                    token_resp.refresh_token,
+                    AUTH_CLIENT_ID.to_string(),
+                    AUTH_CLIENT_SECRET.to_string(),
+                    refresh_token.clone(),
                     Some(user_id.clone()),
                 )
                 .await
             {
                 Ok(acc) => {
+                    if let Err(e) = am
+                        .store_refreshed_credentials(
+                            &acc,
+                            &refresh_token,
+                            None,
+                            &access_token,
+                            expires_at,
+                        )
+                        .await
+                    {
+                        // The refresh token is already persisted. Auto-heal can
+                        // mint a new access token if this cache write failed.
+                        tracing::warn!(
+                            "Could not cache issued access token for {}: {}",
+                            user_id,
+                            e
+                        );
+                    }
                     let mut sessions = sessions.write().await;
                     if let Some(session) = sessions.get_mut(&sid) {
                         session.status = SetupStatus::Complete {

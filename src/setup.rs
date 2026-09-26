@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use chrono::Utc;
 use reqwest::Client;
 use serde::Deserialize;
 use tracing::info;
@@ -7,10 +8,17 @@ use tracing::info;
 use crate::account_manager::AccountManager;
 use crate::error::AppError;
 
-const AUTH_CLIENT_ID: &str = "fX2JxdmntZWK0ixT";
-const AUTH_CLIENT_SECRET: &str = "1Nm5AfDAjxrgJFJbKNWLeAyKGVGmINuXPPLHVXAvxAg=";
-const REQUEST_CLIENT_ID: &str = "lw3vR6GE1vtNBsjv";
-const REQUEST_CLIENT_SECRET: &str = "Y8tIpqKJxs9BEIwYr0I9bSbMWDsogXJx9LaN3mCHwD4=";
+pub(crate) const AUTH_CLIENT_ID: &str = "fX2JxdmntZWK0ixT";
+pub(crate) const AUTH_CLIENT_SECRET: &str =
+    "1Nm5AfDAjxrgJFJbKNWLeAyKGVGmINuXPPLHVXAvxAg=";
+
+pub(crate) fn issued_token_expires_at(expires_in: i64) -> i64 {
+    let expires_in = expires_in.max(60);
+    Utc::now()
+        .timestamp()
+        .saturating_add(expires_in)
+        .saturating_sub(60.min(expires_in / 10))
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -135,21 +143,37 @@ pub async fn run_setup(
         }
     };
 
+    let access_token = token_resp.access_token;
     let refresh_token = token_resp.refresh_token;
+    let expires_at = issued_token_expires_at(token_resp.expires_in);
     let user_id = token_resp
         .user
         .map(|u| u.user_id)
         .unwrap_or_else(|| "unknown".into());
 
-    account_manager
+    let account = account_manager
         .add_account(
             format!("Tidal Account ({})", user_id),
-            REQUEST_CLIENT_ID.to_string(),
-            REQUEST_CLIENT_SECRET.to_string(),
-            refresh_token,
+            AUTH_CLIENT_ID.to_string(),
+            AUTH_CLIENT_SECRET.to_string(),
+            refresh_token.clone(),
             Some(user_id.to_string()),
         )
         .await?;
+    if let Err(e) = account_manager
+        .store_refreshed_credentials(
+            &account,
+            &refresh_token,
+            None,
+            &access_token,
+            expires_at,
+        )
+        .await
+    {
+        // The account and refresh token are already safely stored. A failed
+        // access-token cache write is recoverable by the always-on refresher.
+        tracing::warn!("Could not cache issued access token for {}: {}", user_id, e);
+    }
 
     info!("Tidal account {} added successfully", user_id);
     Ok(())

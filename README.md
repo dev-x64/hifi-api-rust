@@ -73,6 +73,8 @@ Refresh uses the account's assigned proxy and a separate HTTP/1.1 auth client. A
 
 Legacy URL-encoded client secrets are normalized when loaded/imported. Store raw secrets (`=` rather than `%3D`); request builders perform the required wire encoding. Rotated refresh tokens are persisted. After an auth 403 or `invalid_client`, the next scheduled attempt can try the alternate Basic/form authentication shape without an immediate retry burst.
 
+New device-authorized accounts keep the same client ID and secret that issued their refresh token. The access token returned by device authorization is cached immediately. Existing accounts are not rewritten automatically because imported credentials may legitimately belong to another client; reauthorize an old setup-created account to adopt the corrected pairing.
+
 Copy [`.env.example`](.env.example) for the full list. Values saved in the admin panel can override initial environment defaults where noted.
 
 | Variable | Default | Purpose |
