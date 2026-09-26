@@ -11,20 +11,38 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
-use serde_json::{json, Value};
-use tokio::sync::{Mutex, RwLock};
-use tokio::task::JoinHandle;
+use serde_json::{Value, json};
+use tokio::sync::RwLock;
 
+use crate::AppState;
 use crate::error::AppError;
 use crate::routes::track::TrackManifestsParams;
-use crate::AppState;
 
 const JOB_TTL_SECS: i64 = 300;
+
+/// Backpressure: cap queued (pending, unpolled-or-live) jobs at
+/// POOL × this. Beyond it dispatch returns 503 + Retry-After instead of
+/// growing the queue. Factor 1 keeps the queue near-zero: every request
+/// either runs instantly on a free slot, waits at most ~one op behind,
+/// or is shed for immediate retry — never parked thousands deep.
+const MAX_QUEUE_FACTOR: usize = 1;
+/// Pending jobs no client has polled within this long are dead weight —
+/// live clients poll every ~1s (Retry-After), so 60 missed polls means
+/// the waiter is gone. Expire corpses fast to keep slots serving live
+/// requests. Pure threshold, unit tested.
+const PENDING_TIMEOUT_SECS: i64 = 60;
+/// Upper bound for one playback op holding a slot. Normal ops take seconds;
+/// failover storms must not wedge a slot forever.
+const OP_TIMEOUT_SECS: u64 = 120;
+/// Fallback wakeup for slot waiters. Releases broadcast via Notify; the
+/// timeout covers pool-size changes with no completions in flight.
+const SLOT_WAIT_SECS: u64 = 2;
 
 /// A queued playback operation. All data owned so jobs can outlive the request.
 #[derive(Clone)]
@@ -70,7 +88,7 @@ pub enum JobResult {
     },
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum JobState {
     Pending,
     Processing,
@@ -97,14 +115,20 @@ struct Job {
     result: Option<JobResult>,
     error: Option<String>,
     error_status: u16,
+    error_retry_after: Option<u64>,
     created_at: i64,
     finished_at: Option<i64>,
+    /// Last poll by the waiting client (or creation). Jobs nobody polls
+    /// for PENDING_TIMEOUT_SECS are expired as abandoned.
+    last_polled_at: i64,
 }
 
 pub struct PlaybackQueue {
     inflight: AtomicUsize,
     jobs: RwLock<HashMap<String, Job>>,
-    handles: Mutex<HashMap<String, JoinHandle<()>>>,
+    /// Broadcast on slot release so waiters wake immediately instead of
+    /// polling on a timer.
+    wakeup: tokio::sync::Notify,
 }
 
 impl PlaybackQueue {
@@ -112,7 +136,7 @@ impl PlaybackQueue {
         Self {
             inflight: AtomicUsize::new(0),
             jobs: RwLock::new(HashMap::new()),
-            handles: Mutex::new(HashMap::new()),
+            wakeup: tokio::sync::Notify::new(),
         }
     }
 
@@ -135,19 +159,55 @@ impl PlaybackQueue {
     }
 
     fn release(&self) {
-        self.inflight.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
-            Some(v.saturating_sub(1))
-        }).ok();
+        self.inflight
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
+                Some(v.saturating_sub(1))
+            })
+            .ok();
+        // Wake one waiter: a freed slot should be re-leased immediately,
+        // not discovered on the next timer tick.
+        self.wakeup.notify_one();
     }
 
-    fn prune_sync(jobs: &mut HashMap<String, Job>) {
-        let cutoff = chrono::Utc::now().timestamp() - JOB_TTL_SECS;
+    /// True when the queue is past the shed threshold. Pure function —
+    /// unit tested.
+    fn over_capacity(pending: usize, pool: usize) -> bool {
+        pending >= pool.max(1).saturating_mul(MAX_QUEUE_FACTOR)
+    }
+
+    fn prune_sync(jobs: &mut HashMap<String, Job>, now: i64) {
+        let cutoff = now - JOB_TTL_SECS;
         jobs.retain(|_, j| j.finished_at.map(|f| f >= cutoff).unwrap_or(true));
+        // Expire abandoned queue entries: a pending job nobody polled for
+        // PENDING_TIMEOUT_SECS has no waiter left — cancel it so it never
+        // burns an upstream slot. The worker exits cooperatively on its
+        // next state check (it holds no slot while pending).
+        for j in jobs.values_mut() {
+            if j.state == JobState::Pending && now - j.last_polled_at > PENDING_TIMEOUT_SECS {
+                j.state = JobState::Cancelled;
+                j.error = Some("Playback request expired in queue (client stopped polling)".into());
+                j.finished_at = Some(now);
+            }
+        }
     }
 
     async fn prune(&self) {
         let mut jobs = self.jobs.write().await;
-        Self::prune_sync(&mut jobs);
+        Self::prune_sync(&mut jobs, chrono::Utc::now().timestamp());
+    }
+
+    /// Reap abandoned and completed jobs even when nobody makes another
+    /// request or opens the admin panel.
+    pub fn start_reaper(self: &std::sync::Arc<Self>) {
+        let queue = std::sync::Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                ticker.tick().await;
+                let Some(queue) = queue.upgrade() else { break };
+                queue.prune().await;
+            }
+        });
     }
 
     /// Pool size for payloads (mirrors upstream playbackAccounts).
@@ -155,13 +215,7 @@ impl PlaybackQueue {
         state.account_manager.playback_slots().await
     }
 
-    fn payload(
-        id: &str,
-        state_str: &str,
-        position: usize,
-        pool: usize,
-        active: usize,
-    ) -> Value {
+    fn payload(id: &str, state_str: &str, position: usize, pool: usize, active: usize) -> Value {
         let url = format!("/playback/requests/{}", id);
         json!({
             "status": state_str,
@@ -197,11 +251,17 @@ impl PlaybackQueue {
     fn pending_response(id: &str, position: usize, pool: usize, active: usize) -> Response {
         let body = Self::payload(id, "pending", position, pool, active);
         let mut headers = HeaderMap::new();
-        headers.insert("Location", format!("/playback/requests/{}", id).parse().unwrap());
+        headers.insert(
+            "Location",
+            format!("/playback/requests/{}", id).parse().unwrap(),
+        );
         headers.insert("Retry-After", HeaderValue::from_static("1"));
         headers.insert(
             "X-Playback-Queue-Position",
-            position.to_string().parse().unwrap_or(HeaderValue::from_static("0")),
+            position
+                .to_string()
+                .parse()
+                .unwrap_or(HeaderValue::from_static("0")),
         );
         headers.insert(
             "X-Playback-Request-Id",
@@ -212,20 +272,21 @@ impl PlaybackQueue {
 
     /// Run immediately when a slot is free, else enqueue as a pollable job.
     /// Immediate errors propagate as normal HTTP errors (upstream parity:
-    /// only saturated-pool requests become 202 jobs).
-    pub async fn dispatch(
-        &self,
-        state: &AppState,
-        op: PlaybackOp,
-    ) -> Result<Response, AppError> {
+    /// only saturated-pool requests become 202 jobs). Past the queue cap
+    /// the request is shed with 503 + Retry-After instead of queueing
+    /// forever behind a backlog nobody will wait out.
+    pub async fn dispatch(&self, state: &AppState, op: PlaybackOp) -> Result<Response, AppError> {
         self.prune().await;
         let pool = Self::pool_size(state).await;
         if self.try_acquire(pool) {
-            let out = run_op(state, &op).await;
-            self.release();
+            let _slot = SlotGuard(self);
+            let out =
+                tokio::time::timeout(Duration::from_secs(OP_TIMEOUT_SECS), run_op(state, &op))
+                    .await;
             return match out {
-                Ok(result) => Ok(job_result_response(&result)),
-                Err(e) => Err(e),
+                Ok(Ok(result)) => Ok(job_result_response(&result)),
+                Ok(Err(e)) => Err(e),
+                Err(_) => Err(AppError::Timeout),
             };
         }
 
@@ -233,6 +294,20 @@ impl PlaybackQueue {
         let now = chrono::Utc::now().timestamp();
         {
             let mut jobs = self.jobs.write().await;
+            let pending = jobs
+                .values()
+                .filter(|j| j.state == JobState::Pending)
+                .count();
+            if Self::over_capacity(pending, pool) {
+                return Err(AppError::ServiceUnavailableRetry(
+                    format!(
+                        "Playback queue full ({}/{}); retry shortly",
+                        pending,
+                        pool.max(1).saturating_mul(MAX_QUEUE_FACTOR)
+                    ),
+                    5,
+                ));
+            }
             jobs.insert(
                 id.clone(),
                 Job {
@@ -241,8 +316,10 @@ impl PlaybackQueue {
                     result: None,
                     error: None,
                     error_status: 500,
+                    error_retry_after: None,
                     created_at: now,
                     finished_at: None,
+                    last_polled_at: now,
                 },
             );
         }
@@ -250,12 +327,12 @@ impl PlaybackQueue {
         let position = self.pending_position(&id).await;
 
         // Background worker: wait for a slot, then run. Cancellation is
-        // cooperative at slot-wait plus JoinHandle abort on DELETE.
+        // cooperative so a slot can never be leaked by an abort race.
         let queue = state.playback.clone();
         let op_owned = op.clone();
         let app = state.clone();
         let job_id = id.clone();
-        let handle = tokio::spawn(async move {
+        tokio::spawn(async move {
             loop {
                 // Stop waiting if cancelled while queued.
                 {
@@ -271,67 +348,105 @@ impl PlaybackQueue {
                 if queue.try_acquire(pool_now) {
                     break;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                // Sleep until a release broadcast (or a timeout covering
+                // pool-size changes with no completions in flight).
+                tokio::select! {
+                    _ = queue.wakeup.notified() => {},
+                    _ = tokio::time::sleep(Duration::from_secs(SLOT_WAIT_SECS)) => {},
+                }
             }
+            let _slot = SlotGuard(&queue);
             {
                 let mut jobs = queue.jobs.write().await;
                 if let Some(j) = jobs.get_mut(&job_id) {
                     if j.state == JobState::Cancelled {
-                        queue.release();
                         return;
                     }
                     j.state = JobState::Processing;
+                } else {
+                    return;
                 }
             }
-            let out = run_op(&app, &op_owned).await;
+            let out = tokio::time::timeout(
+                Duration::from_secs(OP_TIMEOUT_SECS),
+                run_op(&app, &op_owned),
+            )
+            .await;
             {
                 let mut jobs = queue.jobs.write().await;
                 if let Some(j) = jobs.get_mut(&job_id) {
-                    match out {
-                        Ok(result) => {
-                            j.state = JobState::Completed;
-                            j.result = Some(result);
+                    // A cancelled waiter is gone: drop the result instead of
+                    // caching an answer nobody will poll for.
+                    if j.state == JobState::Cancelled {
+                        // finished_at already stamped by the canceller.
+                    } else {
+                        match out {
+                            Ok(Ok(result)) => {
+                                j.state = JobState::Completed;
+                                j.result = Some(result);
+                            }
+                            Ok(Err(e)) => {
+                                let (status, detail) = app_error_parts(&e);
+                                j.state = JobState::Failed;
+                                j.error = Some(detail);
+                                j.error_status = status;
+                                j.error_retry_after = match e {
+                                    AppError::RateLimited(secs) => Some(secs),
+                                    _ => None,
+                                };
+                            }
+                            Err(_) => {
+                                let (status, detail) = app_error_parts(&AppError::Timeout);
+                                j.state = JobState::Failed;
+                                j.error = Some(detail);
+                                j.error_status = status;
+                            }
                         }
-                        Err(e) => {
-                            let (status, detail) = app_error_parts(&e);
-                            j.state = JobState::Failed;
-                            j.error = Some(detail);
-                            j.error_status = status;
-                        }
+                        j.finished_at = Some(chrono::Utc::now().timestamp());
                     }
-                    j.finished_at = Some(chrono::Utc::now().timestamp());
                 }
             }
-            queue.release();
-            let mut handles = queue.handles.lock().await;
-            handles.remove(&job_id);
         });
-        {
-            let mut handles = self.handles.lock().await;
-            handles.insert(id.clone(), handle);
-        }
 
         Ok(Self::pending_response(&id, position, pool, active))
     }
 
-    async fn snapshot(&self, pool: usize) -> (usize, usize, usize) {
+    async fn snapshot(&self, pool: usize) -> (usize, usize, usize, i64) {
         let jobs = self.jobs.read().await;
-        let pending = jobs.values().filter(|j| j.state == JobState::Pending).count();
+        let now = chrono::Utc::now().timestamp();
+        let mut pending = 0usize;
+        let mut oldest = 0i64;
+        for j in jobs.values() {
+            if j.state == JobState::Pending {
+                pending += 1;
+                oldest = oldest.max(now - j.created_at);
+            }
+        }
         let total = jobs.len();
         let active = self.inflight.load(Ordering::Relaxed);
         let _ = pool;
-        (active, pending, total)
+        (active, pending, total, oldest)
     }
 
     /// Queue counters for /admin/stats.
     pub async fn stats(&self, pool: usize) -> Value {
-        let (active, pending, total) = self.snapshot(pool).await;
+        let (active, pending, total, oldest) = self.snapshot(pool).await;
         json!({
             "pool_size": pool,
             "active": active,
             "pending": pending,
             "jobs": total,
+            "oldest_pending_secs": oldest,
         })
+    }
+}
+
+/// Return a playback slot even if its task is cancelled or panics.
+struct SlotGuard<'a>(&'a PlaybackQueue);
+
+impl Drop for SlotGuard<'_> {
+    fn drop(&mut self) {
+        self.0.release();
     }
 }
 
@@ -347,6 +462,7 @@ fn app_error_parts(e: &AppError) -> (u16, String) {
         AppError::BadRequest(d) => (400, d.clone()),
         AppError::Unauthorized(d) => (401, d.clone()),
         AppError::UpstreamError(s, d) => (s.as_u16(), d.clone()),
+        AppError::RateLimited(_) => (429, "Tidal rate limited the account".into()),
         AppError::Timeout => (429, "Upstream timeout".into()),
         AppError::ServiceUnavailable(d) => (503, d.clone()),
         AppError::ServiceUnavailableRetry(d, _) => (503, d.clone()),
@@ -381,8 +497,8 @@ async fn run_op(state: &AppState, op: &PlaybackOp) -> Result<JobResult, AppError
             quality,
             immersive,
         } => {
-            let v = crate::routes::track::fetch_track_playback(state, *id, quality, *immersive)
-                .await?;
+            let v =
+                crate::routes::track::fetch_track_playback(state, *id, quality, *immersive).await?;
             Ok(JobResult::Json(v))
         }
         PlaybackOp::Manifest {
@@ -402,8 +518,8 @@ async fn run_op(state: &AppState, op: &PlaybackOp) -> Result<JobResult, AppError
             Ok(JobResult::Json(v))
         }
         PlaybackOp::Dash { track_id, atmos } => {
-            let uri = crate::routes::track::fetch_dash_uri(state, track_id, atmos.as_deref())
-                .await?;
+            let uri =
+                crate::routes::track::fetch_dash_uri(state, track_id, atmos.as_deref()).await?;
             Ok(JobResult::Redirect(uri))
         }
         PlaybackOp::Video {
@@ -412,14 +528,9 @@ async fn run_op(state: &AppState, op: &PlaybackOp) -> Result<JobResult, AppError
             mode,
             presentation,
         } => {
-            let v = crate::routes::video::fetch_video_playback(
-                state,
-                *id,
-                quality,
-                mode,
-                presentation,
-            )
-            .await?;
+            let v =
+                crate::routes::video::fetch_video_playback(state, *id, quality, mode, presentation)
+                    .await?;
             Ok(JobResult::Json(v))
         }
         PlaybackOp::Widevine {
@@ -451,6 +562,16 @@ pub async fn get_playback_request(
     state.playback.prune().await;
     let pool = PlaybackQueue::pool_size(&state).await;
     let active = state.playback.inflight.load(Ordering::Relaxed);
+    // Presence heartbeat: a polled job has a live waiter. Unpolled pending
+    // jobs expire via prune instead of burning slots on corpses.
+    {
+        let mut jobs = state.playback.jobs.write().await;
+        if let Some(job) = jobs.get_mut(&request_id) {
+            if matches!(job.state, JobState::Pending | JobState::Processing) {
+                job.last_polled_at = chrono::Utc::now().timestamp();
+            }
+        }
+    }
     let jobs = state.playback.jobs.read().await;
     let Some(job) = jobs.get(&request_id) else {
         return (
@@ -479,25 +600,31 @@ pub async fn get_playback_request(
             (StatusCode::GONE, Json(body)).into_response()
         }
         JobState::Failed => {
-            let mut body = PlaybackQueue::payload(
-                &request_id,
-                "failed",
-                0,
-                pool,
-                active,
+            let mut body = PlaybackQueue::payload(&request_id, "failed", 0, pool, active);
+            body["detail"] = json!(
+                job.error
+                    .clone()
+                    .unwrap_or_else(|| "Playback request failed".into())
             );
-            body["detail"] =
-                json!(job.error.clone().unwrap_or_else(|| "Playback request failed".into()));
-            (
+            let mut response = (
                 StatusCode::from_u16(job.error_status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
                 Json(body),
             )
-                .into_response()
+                .into_response();
+            if let Some(seconds) = job.error_retry_after {
+                response.headers_mut().insert(
+                    axum::http::header::RETRY_AFTER,
+                    seconds.to_string().parse().unwrap(),
+                );
+            }
+            response
         }
     }
 }
 
 /// Cancel a playback job (upstream: DELETE /playback/requests/{request_id}).
+///
+/// Workers check the cancelled flag before starting and discard late results.
 pub async fn cancel_playback_request(
     State(state): State<AppState>,
     Path(request_id): Path<String>,
@@ -505,11 +632,6 @@ pub async fn cancel_playback_request(
     state.playback.prune().await;
     let pool = PlaybackQueue::pool_size(&state).await;
     let active = state.playback.inflight.load(Ordering::Relaxed);
-    // Abort the worker first so a queued job never starts after cancel.
-    let aborted = {
-        let mut handles = state.playback.handles.lock().await;
-        handles.remove(&request_id).map(|h| h.abort()).is_some()
-    };
     {
         let mut jobs = state.playback.jobs.write().await;
         if let Some(job) = jobs.get_mut(&request_id) {
@@ -518,7 +640,6 @@ pub async fn cancel_playback_request(
                 job.finished_at = Some(chrono::Utc::now().timestamp());
             }
             let body = PlaybackQueue::payload(&request_id, job.state.as_str(), 0, pool, active);
-            let _ = aborted;
             return Json(body).into_response();
         }
     }
@@ -529,9 +650,42 @@ pub async fn cancel_playback_request(
         .into_response()
 }
 
+/// Admin emergency drain: cancel every queued (pending) job at once.
+/// Processing jobs are marked cancelled and finish harmlessly (their
+/// results are discarded, slots released normally). Returns counts.
+pub async fn clear_playback_queue(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    state.playback.prune().await;
+    let now = chrono::Utc::now().timestamp();
+    let mut cancelled = 0usize;
+    let mut marked_processing = 0usize;
+    {
+        let mut jobs = state.playback.jobs.write().await;
+        for job in jobs.values_mut() {
+            if job.state == JobState::Pending {
+                job.state = JobState::Cancelled;
+                job.error = Some("Playback queue cleared by admin".into());
+                job.finished_at = Some(now);
+                cancelled += 1;
+            } else if job.state == JobState::Processing {
+                job.state = JobState::Cancelled;
+                job.error = Some("Playback queue cleared by admin".into());
+                job.finished_at = Some(now);
+                marked_processing += 1;
+            }
+        }
+    }
+    // Wake waiters so any stragglers re-check state promptly.
+    state.playback.wakeup.notify_waiters();
+    Ok(Json(json!({
+        "cancelled_queued": cancelled,
+        "marked_processing": marked_processing,
+    })))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::PlaybackQueue;
+    use super::{Job, JobState, PENDING_TIMEOUT_SECS, PlaybackQueue};
+    use std::collections::HashMap;
 
     #[test]
     fn payload_shape_matches_upstream() {
@@ -557,5 +711,77 @@ mod tests {
         let q2 = PlaybackQueue::new();
         assert!(q2.try_acquire(0));
         assert!(!q2.try_acquire(0));
+    }
+
+    #[test]
+    fn shed_threshold_scales_with_pool() {
+        // 20 accounts → cap 20: only ~one op of waiting, then shed.
+        assert!(!PlaybackQueue::over_capacity(19, 20));
+        assert!(PlaybackQueue::over_capacity(20, 20));
+        assert!(PlaybackQueue::over_capacity(8495, 20));
+        // Degenerate pools still gate at >= 1.
+        assert!(!PlaybackQueue::over_capacity(0, 0));
+        assert!(PlaybackQueue::over_capacity(1, 0));
+        assert!(!PlaybackQueue::over_capacity(0, 3));
+    }
+
+    fn test_job(id: &str, state: JobState, created_at: i64, last_polled_at: i64) -> Job {
+        Job {
+            id: id.into(),
+            state,
+            result: None,
+            error: None,
+            error_status: 500,
+            error_retry_after: None,
+            created_at,
+            finished_at: None,
+            last_polled_at,
+        }
+    }
+
+    #[test]
+    fn prune_expires_only_abandoned_pending() {
+        let now = 1_700_000_000i64;
+        let mut jobs = HashMap::new();
+        jobs.insert(
+            "live".into(),
+            test_job("live", JobState::Pending, now - 10, now - 5),
+        );
+        jobs.insert(
+            "corpse".into(),
+            test_job(
+                "corpse",
+                JobState::Pending,
+                now - 900,
+                now - PENDING_TIMEOUT_SECS - 1,
+            ),
+        );
+        jobs.insert(
+            "busy".into(),
+            test_job(
+                "busy",
+                JobState::Processing,
+                now - 900,
+                now - PENDING_TIMEOUT_SECS - 100,
+            ),
+        );
+        let mut done = test_job("done", JobState::Completed, now - 900, now - 900);
+        done.finished_at = Some(now - 200);
+        jobs.insert("done".into(), done);
+        let mut old = test_job("old", JobState::Failed, now - 900, now - 900);
+        old.finished_at = Some(now - 301);
+        jobs.insert("old".into(), old);
+
+        PlaybackQueue::prune_sync(&mut jobs, now);
+
+        // Live waiter kept, corpse cancelled, processing untouched (its
+        // op still holds a slot and finishes on its own).
+        assert_eq!(jobs["live"].state, JobState::Pending);
+        assert_eq!(jobs["corpse"].state, JobState::Cancelled);
+        assert!(jobs["corpse"].finished_at.is_some());
+        assert_eq!(jobs["busy"].state, JobState::Processing);
+        // Finished within TTL kept; finished past TTL evicted.
+        assert!(jobs.contains_key("done"));
+        assert!(!jobs.contains_key("old"));
     }
 }

@@ -11,6 +11,7 @@ pub enum AppError {
     BadRequest(String),
     Unauthorized(String),
     UpstreamError(StatusCode, String),
+    RateLimited(u64),
     Timeout,
     ServiceUnavailable(String),
     ServiceUnavailableRetry(String, u64),
@@ -24,6 +25,18 @@ impl IntoResponse for AppError {
             AppError::BadRequest(d) => (StatusCode::BAD_REQUEST, d),
             AppError::Unauthorized(d) => (StatusCode::UNAUTHORIZED, d),
             AppError::UpstreamError(s, d) => (s, d),
+            AppError::RateLimited(secs) => {
+                let mut resp = (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(json!({"detail": "Tidal rate limited the account"})),
+                )
+                    .into_response();
+                resp.headers_mut().insert(
+                    axum::http::header::RETRY_AFTER,
+                    secs.to_string().parse().unwrap(),
+                );
+                return resp;
+            }
             AppError::Timeout => (StatusCode::TOO_MANY_REQUESTS, "Upstream timeout".into()),
             AppError::ServiceUnavailable(d) => (StatusCode::SERVICE_UNAVAILABLE, d),
             AppError::ServiceUnavailableRetry(d, secs) => {
@@ -58,6 +71,7 @@ impl fmt::Display for AppError {
             AppError::BadRequest(d) => write!(f, "Bad request: {}", d),
             AppError::Unauthorized(d) => write!(f, "Unauthorized: {}", d),
             AppError::UpstreamError(s, d) => write!(f, "Upstream {}: {}", s, d),
+            AppError::RateLimited(s) => write!(f, "Tidal rate limited the account; retry in {}s", s),
             AppError::Timeout => write!(f, "Timeout"),
             AppError::ServiceUnavailable(d) => write!(f, "Service unavailable: {}", d),
             AppError::ServiceUnavailableRetry(d, s) => {
@@ -87,6 +101,13 @@ mod tests {
         let resp = AppError::ServiceUnavailableRetry("busy".into(), 0).into_response();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(resp.headers().get("retry-after").is_none());
+    }
+
+    #[tokio::test]
+    async fn upstream_rate_limit_is_429_with_retry_after() {
+        let resp = AppError::RateLimited(42).into_response();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(resp.headers().get("retry-after").unwrap(), "42");
     }
 }
 
