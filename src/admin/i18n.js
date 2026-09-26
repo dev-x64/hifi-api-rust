@@ -27,6 +27,7 @@ var ruToEn = {
     'Последняя активность обновляется автоматически каждые 15 секунд.': 'Recent activity refreshes automatically every 15 seconds.',
     'Обновить журнал': 'Refresh log',
     'Показать ещё': 'Show more',
+    'Доп. поля': 'More fields',
     'Всего': 'Total',
     'Показано': 'Shown',
     'Ошибок': 'Errors',

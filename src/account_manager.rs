@@ -433,6 +433,15 @@ impl AccountManager {
         let now = Utc::now().timestamp();
         account.last_used.store(now, Ordering::Relaxed);
         account.request_count.fetch_add(1, Ordering::Relaxed);
+        crate::request_log::note_account(
+            &account.id,
+            &account.label,
+            if account.is_catalog.load(Ordering::Relaxed) {
+                "catalog"
+            } else {
+                "playback"
+            },
+        );
     }
 
     /// Pure weighted score for one candidate. Unit tested.

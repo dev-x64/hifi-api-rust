@@ -121,6 +121,9 @@ struct Job {
     /// Last poll by the waiting client (or creation). Jobs nobody polls
     /// for PENDING_TIMEOUT_SECS are expired as abandoned.
     last_polled_at: i64,
+    /// Account attempts made by the background worker. Copied into the log
+    /// entry for the poll that returns the completed or failed result.
+    accounts: Vec<crate::request_log::LoggedAccount>,
 }
 
 pub struct PlaybackQueue {
@@ -320,6 +323,7 @@ impl PlaybackQueue {
                     created_at: now,
                     finished_at: None,
                     last_polled_at: now,
+                    accounts: Vec::new(),
                 },
             );
         }
@@ -367,14 +371,15 @@ impl PlaybackQueue {
                     return;
                 }
             }
-            let out = tokio::time::timeout(
+            let (out, accounts) = crate::request_log::capture_accounts(tokio::time::timeout(
                 Duration::from_secs(OP_TIMEOUT_SECS),
                 run_op(&app, &op_owned),
-            )
+            ))
             .await;
             {
                 let mut jobs = queue.jobs.write().await;
                 if let Some(j) = jobs.get_mut(&job_id) {
+                    j.accounts = accounts;
                     // A cancelled waiter is gone: drop the result instead of
                     // caching an answer nobody will poll for.
                     if j.state == JobState::Cancelled {
@@ -580,6 +585,11 @@ pub async fn get_playback_request(
         )
             .into_response();
     };
+    if matches!(job.state, JobState::Completed | JobState::Failed) {
+        for account in &job.accounts {
+            crate::request_log::note_account(&account.id, &account.label, &account.role);
+        }
+    }
     match job.state {
         JobState::Pending | JobState::Processing => {
             let position = if job.state == JobState::Pending {
@@ -736,6 +746,7 @@ mod tests {
             created_at,
             finished_at: None,
             last_polled_at,
+            accounts: Vec::new(),
         }
     }
 

@@ -676,6 +676,7 @@ impl TidalClient {
         url: &str,
         params: Vec<(&str, &str)>,
     ) -> Result<Value, AppError> {
+        crate::request_log::note_account("catalog-token", "CATALOG_TOKEN", "catalog");
         let remaining = self
             .catalog_rate_limited_until
             .load(Ordering::Relaxed)

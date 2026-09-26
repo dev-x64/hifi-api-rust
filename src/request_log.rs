@@ -1,4 +1,6 @@
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -18,6 +20,51 @@ const RATE_WINDOW_SECONDS: i64 = 60;
 const SLOW_MS: u64 = 3000;
 const STUCK_MS: u64 = 10_000;
 
+#[derive(Clone)]
+pub(crate) struct LoggedAccount {
+    pub id: String,
+    pub label: String,
+    pub role: String,
+}
+
+type AccountTrace = Arc<Mutex<Vec<LoggedAccount>>>;
+
+tokio::task_local! {
+    static REQUEST_ACCOUNTS: AccountTrace;
+}
+
+/// Attach an account selection to the request currently being served. The
+/// task-local scope keeps concurrent requests isolated without exposing any
+/// credentials in response headers.
+pub(crate) fn note_account(id: &str, label: &str, role: &str) {
+    let _ = REQUEST_ACCOUNTS.try_with(|trace| {
+        if let Ok(mut accounts) = trace.lock() {
+            let duplicate = accounts
+                .last()
+                .is_some_and(|account| account.id == id && account.role == role);
+            if !duplicate {
+                accounts.push(LoggedAccount {
+                    id: id.to_string(),
+                    label: label.to_string(),
+                    role: role.to_string(),
+                });
+            }
+        }
+    });
+}
+
+/// Run work with an isolated account trace and return every account selected
+/// during it. Used by HTTP requests and by queued playback workers.
+pub(crate) async fn capture_accounts<F, T>(future: F) -> (T, Vec<LoggedAccount>)
+where
+    F: Future<Output = T>,
+{
+    let trace = Arc::new(Mutex::new(Vec::new()));
+    let output = REQUEST_ACCOUNTS.scope(trace.clone(), future).await;
+    let accounts = trace.lock().map(|items| items.clone()).unwrap_or_default();
+    (output, accounts)
+}
+
 fn should_log_path(path: &str) -> bool {
     path != "/admin" && !path.starts_with("/admin/") && path != "/health" && path != "/favicon.ico"
 }
@@ -36,6 +83,8 @@ pub struct LogEntry {
     pub client_ip: String,
     /// Cache verdict from the response, if this was a cacheable route.
     pub cache: String,
+    /// Accounts selected while serving this request, in attempt order.
+    pub(crate) accounts: Vec<LoggedAccount>,
 }
 
 pub struct RequestLog {
@@ -178,6 +227,11 @@ impl RequestLog {
                     "latency_ms": e.latency_ms,
                     "client_ip": e.client_ip,
                     "cache": e.cache,
+                    "accounts": e.accounts.iter().map(|account| json!({
+                        "id": account.id,
+                        "label": account.label,
+                        "role": account.role,
+                    })).collect::<Vec<_>>(),
                     "slow": e.latency_ms >= SLOW_MS,
                 })
             })
@@ -261,7 +315,7 @@ pub async fn log_requests(
     let ip = client_ip(&state, &req, addr);
     let start = Instant::now();
 
-    let resp = if let Some(retry_after) = state.scanner_guard.check(ip, &raw_path, start) {
+    let (resp, accounts) = if let Some(retry_after) = state.scanner_guard.check(ip, &raw_path, start) {
         let mut response = (
             StatusCode::FORBIDDEN,
             Json(json!({ "detail": "IP temporarily blocked after repeated scanner requests" })),
@@ -271,9 +325,9 @@ pub async fn log_requests(
             RETRY_AFTER,
             HeaderValue::from_str(&retry_after.to_string()).expect("valid retry interval"),
         );
-        response
+        (response, Vec::new())
     } else {
-        next.run(req).await
+        capture_accounts(next.run(req)).await
     };
     if !log_path {
         return resp;
@@ -305,6 +359,7 @@ pub async fn log_requests(
         latency_ms,
         client_ip: ip.to_string(),
         cache,
+        accounts,
     });
 
     resp
@@ -324,6 +379,7 @@ mod tests {
             latency_ms,
             client_ip: "127.0.0.1".into(),
             cache: String::new(),
+            accounts: Vec::new(),
         }
     }
 

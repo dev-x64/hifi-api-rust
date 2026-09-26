@@ -183,6 +183,9 @@ body { font-family:'SF Mono','Fira Code','Cascadia Code','JetBrains Mono',Menlo,
 .term-path { color:#e6f5ea; }
 .term-id { color:#d2a8ff; }
 .term-dim { color:#5f6f60; }
+.term-extra { display:none; }
+.terminal.show-extra .term-extra { display:inline; }
+.term-account { color:#79c0ff; }
 .term-cursor { display:inline-block; width:8px; height:14px; background:#3fb950; vertical-align:-2px; animation:termBlink 1.1s infinite; }
 @media (max-width:768px) { .term-body { height:300px; font-size:11px; } }
 
@@ -348,8 +351,8 @@ button:focus-visible,input:focus-visible,select:focus-visible { outline:2px soli
   <section id="view-overview" class="view active">
     <div id="stats" class="stats"></div>
     <div id="overviewProxy" class="overview-proxy"><span>Прокси</span><span class="separator">·</span><span>—</span></div>
-    <div class="section-head"><div><h2>Журнал запросов</h2><p>Последняя активность обновляется автоматически каждые 15 секунд.</p></div><div class="section-actions"><button class="btn" id="requestLogMore" onclick="showMoreRequests()">Показать ещё</button><button class="btn" onclick="loadRequestLog()">Обновить журнал</button></div></div>
-    <div class="terminal">
+    <div class="section-head"><div><h2>Журнал запросов</h2><p>Последняя активность обновляется автоматически каждые 15 секунд.</p></div><div class="section-actions"><button class="btn" id="requestLogDetails" aria-pressed="false" onclick="toggleRequestLogDetails()">Доп. поля</button><button class="btn" id="requestLogMore" onclick="showMoreRequests()">Показать ещё</button><button class="btn" onclick="loadRequestLog()">Обновить журнал</button></div></div>
+    <div class="terminal" id="requestLogTerminal">
       <div class="term-bar"><span class="term-dots"><i></i><i></i><i></i></span><span class="term-title">hifi-api — live request log</span><span class="term-live" id="term-live">● LIVE</span></div>
       <div class="term-meta"><span>Всего <strong id="rq-total">—</strong></span><span>Показано <strong id="rq-shown">—</strong></span><span>Ошибок <strong id="rq-errors">—</strong></span><span>4xx без 429 <strong id="rq-user-errors">—</strong></span><span>429/5xx <strong id="rq-upstream-errors">—</strong></span><span>p50 <strong id="rq-p50">—</strong></span><span>p95 <strong id="rq-p95">—</strong></span><span id="rq-endpoints"></span><span id="rq-tracks" style="color:#d2a8ff"></span></div>
       <div class="term-meta" id="rq-slowest"></div>
@@ -1415,6 +1418,14 @@ async function loadCacheStats() {
 var requestLogLimit = 100;
 var renderedRequestLogLimit = 0;
 
+function toggleRequestLogDetails() {
+    var terminal = document.getElementById('requestLogTerminal');
+    var button = document.getElementById('requestLogDetails');
+    var visible = terminal.classList.toggle('show-extra');
+    button.classList.toggle('btn-active', visible);
+    button.setAttribute('aria-pressed', visible ? 'true' : 'false');
+}
+
 function showMoreRequests() {
     requestLogLimit = Math.min(requestLogLimit * 2, 5000);
     loadRequestLog();
@@ -1460,6 +1471,15 @@ async function loadRequestLog() {
                 var d = new Date(q.ts * 1000);
                 t = ('0' + d.getHours()).slice(-2) + ':' + ('0' + d.getMinutes()).slice(-2) + ':' + ('0' + d.getSeconds()).slice(-2);
             }
+            var accountItems = (q.accounts || []).map(function(account) {
+                var label = account.label || account.id || '—';
+                var shortId = account.id && account.id !== 'catalog-token' ? ' [' + account.id.slice(0, 8) + ']' : '';
+                var role = account.role === 'catalog' ? ' · catalog' : '';
+                return esc(label) + esc(shortId + role);
+            });
+            var accountInfo = accountItems.length
+                ? ' <span class="term-extra term-account">ACCOUNT ' + accountItems.join(' → ') + '</span>'
+                : '';
             rows += '<div class="term-line"><span class="term-time">' + t + '</span> ' +
                 '<span class="term-method m-' + q.method + '">' + q.method + '</span> ' +
                 '<span class="term-path">' + esc(q.path) + '</span>' +
@@ -1467,7 +1487,7 @@ async function loadRequestLog() {
                 '<span class="' + cls + '">' + q.status + '</span> ' +
                 '<span class="term-dim">' + q.latency_ms + 'ms ' + esc(q.client_ip) + '</span>' +
                 (q.cache ? ' <span class="term-id">CACHE ' + esc(q.cache) + '</span>' : '') +
-                (q.slow ? ' <span class="test-pending">SLOW</span>' : '') + '</div>';
+                (q.slow ? ' <span class="test-pending">SLOW</span>' : '') + accountInfo + '</div>';
         }
         var box = document.getElementById('rq-recent');
         var previousHeight = box.scrollHeight;
