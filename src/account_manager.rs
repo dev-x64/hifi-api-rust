@@ -38,6 +38,8 @@ pub struct AccountState {
     pub access_token: RwLock<Option<String>>,
     pub token_expires_at: AtomicI64,
     pub is_active: AtomicBool,
+    /// Unix time when the account last became inactive; zero means unknown or active.
+    pub disabled_at: AtomicI64,
     /// Dedicated metadata credential (upstream CATALOG_* / token.json role).
     /// Never leased to playback: excluded from selection and pool counts.
     pub is_catalog: AtomicBool,
@@ -83,6 +85,7 @@ impl AccountState {
             access_token: RwLock::new(None),
             token_expires_at: AtomicI64::new(0),
             is_active: AtomicBool::new(is_active),
+            disabled_at: AtomicI64::new(0),
             is_catalog: AtomicBool::new(false),
             auto_disabled: AtomicBool::new(false),
             heal_failures: AtomicU64::new(0),
@@ -119,6 +122,8 @@ impl AccountState {
             .store(old.is_catalog.load(Ordering::Relaxed), Ordering::Relaxed);
         new.auto_disabled
             .store(old.auto_disabled.load(Ordering::Relaxed), Ordering::Relaxed);
+        new.disabled_at
+            .store(old.disabled_at.load(Ordering::Relaxed), Ordering::Relaxed);
         new.heal_failures
             .store(old.heal_failures.load(Ordering::Relaxed), Ordering::Relaxed);
         new.heal_next_retry.store(
@@ -156,6 +161,7 @@ pub struct DbAccountRow {
     pub user_id: Option<String>,
     pub is_active: i32,
     pub auto_disabled: Option<i32>,
+    pub disabled_at: Option<i64>,
     pub is_catalog: Option<i32>,
     pub notes: String,
     pub access_token: Option<String>,
@@ -255,7 +261,7 @@ impl AccountManager {
 
         let rows: Vec<DbAccountRow> = sqlx::query_as::<_, DbAccountRow>(
             "SELECT a.id, a.label, a.client_id, a.client_secret, a.refresh_token,
-             a.user_id, a.is_active, a.auto_disabled, a.is_catalog, a.notes,
+             a.user_id, a.is_active, a.auto_disabled, a.disabled_at, a.is_catalog, a.notes,
              t.access_token, t.expires_at, a.updated_at
              FROM accounts a
              LEFT JOIN tokens t ON t.account_id = a.id
@@ -295,6 +301,9 @@ impl AccountManager {
             ));
             if row.auto_disabled.unwrap_or(0) != 0 {
                 state.auto_disabled.store(true, Ordering::Relaxed);
+            }
+            if row.is_active == 0 {
+                state.disabled_at.store(row.disabled_at.unwrap_or(0), Ordering::Relaxed);
             }
             if row.is_catalog.unwrap_or(0) != 0 {
                 state.is_catalog.store(true, Ordering::Relaxed);
@@ -754,12 +763,23 @@ impl AccountManager {
 
     pub async fn set_account_active(&self, id: &str, active: bool) -> Result<(), AppError> {
         if let Some(account) = self.get_account_by_id(id).await {
-            account.is_active.store(active, Ordering::Relaxed);
             let now = Utc::now().timestamp();
+            let disabled_at = if active {
+                0
+            } else if account.is_active.load(Ordering::Relaxed) {
+                now
+            } else {
+                account.disabled_at.load(Ordering::Relaxed)
+            };
+            // A rejected credential must stop serving requests immediately,
+            // even if persisting the transition later fails.
+            account.is_active.store(active, Ordering::Relaxed);
+            account.disabled_at.store(disabled_at, Ordering::Relaxed);
             account.updated_at.store(now, Ordering::Relaxed);
             if let Some(db) = &self.db {
-                sqlx::query("UPDATE accounts SET is_active = ?, updated_at = ? WHERE id = ?")
+                sqlx::query("UPDATE accounts SET is_active = ?, disabled_at = ?, updated_at = ? WHERE id = ?")
                     .bind(active as i32)
+                    .bind(disabled_at)
                     .bind(now)
                     .bind(id)
                     .execute(db)
@@ -785,6 +805,7 @@ impl AccountManager {
             "refresh_token": acc.refresh_token,
             "user_id": acc.user_id.read().await.clone(),
             "is_active": acc.is_active.load(Ordering::Relaxed),
+            "disabled_at": acc.disabled_at.load(Ordering::Relaxed),
             "auto_disabled": acc.auto_disabled.load(Ordering::Relaxed),
             "is_catalog": acc.is_catalog.load(Ordering::Relaxed),
             "notes": acc.notes.read().await.clone(),
@@ -846,6 +867,11 @@ impl AccountManager {
                     .and_then(|x| x.as_str())
                     .map(|s| s.to_string());
                 let is_active = v.get("is_active").and_then(|x| x.as_bool()).unwrap_or(true);
+                let disabled_at = if is_active {
+                    0
+                } else {
+                    v.get("disabled_at").and_then(|x| x.as_i64()).unwrap_or(0)
+                };
                 let auto_disabled = v
                     .get("auto_disabled")
                     .and_then(|x| x.as_bool())
@@ -871,6 +897,7 @@ impl AccountManager {
                         notes.clone(),
                     ));
                     AccountState::carry_over(&rebuilt, old);
+                    rebuilt.disabled_at.store(disabled_at, Ordering::Relaxed);
                     if auto_disabled {
                         rebuilt.auto_disabled.store(true, Ordering::Relaxed);
                     }
@@ -881,7 +908,7 @@ impl AccountManager {
                     if let Some(db) = &self.db {
                         let _ = sqlx::query(
                             "UPDATE accounts SET label = ?, client_id = ?, client_secret = ?,
-                             refresh_token = ?, user_id = ?, is_active = ?, auto_disabled = ?,
+                             refresh_token = ?, user_id = ?, is_active = ?, auto_disabled = ?, disabled_at = ?,
                              is_catalog = ?, notes = ?, updated_at = ? WHERE id = ?",
                         )
                         .bind(&rebuilt.label)
@@ -891,6 +918,7 @@ impl AccountManager {
                         .bind(&user_id)
                         .bind(is_active as i32)
                         .bind(auto_disabled as i32)
+                        .bind(disabled_at)
                         .bind(is_catalog as i32)
                         .bind(&notes)
                         .bind(remote_updated)
@@ -916,6 +944,7 @@ impl AccountManager {
                     if auto_disabled {
                         state.auto_disabled.store(true, Ordering::Relaxed);
                     }
+                    state.disabled_at.store(disabled_at, Ordering::Relaxed);
                     if is_catalog {
                         state.is_catalog.store(true, Ordering::Relaxed);
                     }
@@ -924,8 +953,8 @@ impl AccountManager {
                         let now = Utc::now().timestamp();
                         let _ = sqlx::query(
                             "INSERT INTO accounts (id, label, client_id, client_secret, refresh_token,
-                             user_id, is_active, auto_disabled, is_catalog, notes, created_at, updated_at)
-                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                             user_id, is_active, auto_disabled, disabled_at, is_catalog, notes, created_at, updated_at)
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                              ON CONFLICT(id) DO NOTHING",
                         )
                         .bind(id)
@@ -936,6 +965,7 @@ impl AccountManager {
                         .bind(&user_id)
                         .bind(is_active as i32)
                         .bind(auto_disabled as i32)
+                        .bind(disabled_at)
                         .bind(is_catalog as i32)
                         .bind(&notes)
                         .bind(now)
@@ -1345,6 +1375,39 @@ mod tests {
             let picked = am.select_account_excluding(&[]).await.unwrap();
             assert_eq!(picked.id, a.id);
         }
+    }
+
+    #[tokio::test]
+    async fn disabled_at_tracks_transition_and_survives_reload() {
+        let path = std::env::temp_dir().join(format!(
+            "hifi-disabled-at-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let db = crate::db::init_pool(&format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        let am = AccountManager::new(Some(db.clone()), SwitchingWeights::default());
+        let account = am
+            .add_account("a".into(), "c".into(), "s".into(), "rt".into(), None)
+            .await
+            .unwrap();
+        assert_eq!(account.disabled_at.load(Ordering::Relaxed), 0);
+
+        am.set_account_active(&account.id, false).await.unwrap();
+        let disabled_at = account.disabled_at.load(Ordering::Relaxed);
+        assert!(disabled_at > 0);
+        am.set_account_active(&account.id, false).await.unwrap();
+        assert_eq!(account.disabled_at.load(Ordering::Relaxed), disabled_at);
+
+        let reloaded = AccountManager::new(Some(db.clone()), SwitchingWeights::default());
+        reloaded.load_from_db().await.unwrap();
+        let restored = reloaded.get_account_by_id(&account.id).await.unwrap();
+        assert_eq!(restored.disabled_at.load(Ordering::Relaxed), disabled_at);
+        reloaded.set_account_active(&account.id, true).await.unwrap();
+        assert_eq!(restored.disabled_at.load(Ordering::Relaxed), 0);
+
+        db.close().await;
+        std::fs::remove_file(path).unwrap();
     }
 
     #[tokio::test]

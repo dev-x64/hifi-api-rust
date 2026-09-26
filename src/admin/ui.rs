@@ -593,6 +593,17 @@ function timeStr(ts) {
     return Math.floor(mins / 60) + ' ч ' + (mins % 60) + ' мин';
 }
 
+function sleepDuration(ts) {
+    var minutes = Math.floor(Math.max(0, Date.now() / 1000 - ts) / 60);
+    if (minutes < 1) return 'меньше минуты';
+    var days = Math.floor(minutes / 1440);
+    var hours = Math.floor((minutes % 1440) / 60);
+    var remainingMinutes = minutes % 60;
+    if (days) return days + ' д ' + hours + ' ч';
+    if (hours) return hours + ' ч ' + remainingMinutes + ' мин';
+    return minutes + ' мин';
+}
+
 function playbackCard(pb) {
     pb = pb || {};
     var active = pb.active != null ? pb.active : '—';
@@ -868,6 +879,10 @@ async function fetchData() {
                 var activeCls = a.is_active ? ' btn-active' : '';
                 var toggleText = a.is_active ? 'Включён' : 'Включить';
                 var tokenStr = timeStr(a.token_expires_at);
+                var disabledAt = !a.is_active && Number(a.disabled_at) > 0 ? Number(a.disabled_at) : 0;
+                var disabledSince = disabledAt
+                    ? new Date(disabledAt * 1000).toLocaleString(adminLanguage === 'ru' ? 'ru-RU' : 'en-GB', { day:'2-digit', month:'2-digit', year:'numeric', hour:'2-digit', minute:'2-digit' })
+                    : 'время неизвестно';
                 var uid = a.user_id || '-';
                 var catalogBadge = a.is_catalog ? '<span class="status-label" style="color:#d2a8ff;background:rgba(210,168,255,0.1)">Каталог</span>' : '';
                 var premiumLabel = a.premium_status === 'premium' ? 'FULL' : (a.premium_status === 'preview-only' ? 'PREVIEW' : 'Неизвестно');
@@ -899,6 +914,8 @@ async function fetchData() {
                             '<span class="card-stat">Запросов <strong>' + a.request_count + '</strong></span>' +
                             '<span class="card-stat">Ошибок <strong>' + a.error_count + '</strong></span>' +
                             (a.auto_disabled ? '<span class="card-stat">Автовосстановление <strong>повтор</strong></span>' : '') +
+                            (!a.is_active ? '<span class="card-stat">' + (a.auto_disabled ? 'Упал' : 'Отключён с') + ' <strong>' + disabledSince + '</strong></span>' +
+                                '<span class="card-stat">Спит <strong>' + (disabledAt ? sleepDuration(disabledAt) : '—') + '</strong></span>' : '') +
                             '<span class="card-stat">Токен <strong>' + tokenStr + '</strong></span>' +
                             (a.premium_checked_at ? '<span class="card-stat">FULL/PREVIEW <strong>' + new Date(a.premium_checked_at * 1000).toLocaleString() + '</strong></span>' : '') +
                             '<span class="card-stat test-badge" id="test-' + a.id + '" onclick="showTestDetails(\'' + a.id + '\')">Проверка <strong>—</strong></span>' +

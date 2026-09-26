@@ -220,6 +220,7 @@ pub async fn restore_backup(
                 ("user_id", NullableText),
                 ("is_active", Int),
                 ("auto_disabled", Int),
+                ("disabled_at", Int),
                 ("is_catalog", Int),
                 ("notes", Text),
                 ("created_at", Int),

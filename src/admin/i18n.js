@@ -146,6 +146,11 @@ var ruToEn = {
     'Добавить аккаунт': 'Add account',
     'Активен': 'Active',
     'Отключён': 'Disabled',
+    'Отключён с': 'Disabled since',
+    'Упал': 'Failed at',
+    'Спит': 'Inactive for',
+    'время неизвестно': 'time unknown',
+    'меньше минуты': 'less than a minute',
     'Включён': 'Enabled',
     'Включить': 'Enable',
     'Отключить': 'Disable',
@@ -248,6 +253,8 @@ function localizedCore(source) {
         if (match) return match[1] + ' min';
         match = source.match(/^(\d+) ч (\d+) мин$/);
         if (match) return match[1] + ' hr ' + match[2] + ' min';
+        match = source.match(/^(\d+) д (\d+) ч$/);
+        if (match) return match[1] + ' d ' + match[2] + ' hr';
         match = source.match(/^Воспроизведение · (.+)$/);
         if (match) return 'Playback · ' + match[1];
         match = source.match(/^Аккаунт (.+): (FULL|PREVIEW|Не удалось определить)(.*)$/);

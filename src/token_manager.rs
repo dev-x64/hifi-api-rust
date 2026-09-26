@@ -212,12 +212,13 @@ impl TokenManager {
                 status_code,
                 err_msg
             );
-            account
-                .is_active
-                .store(false, std::sync::atomic::Ordering::Relaxed);
             if let Some(am) = self.account_manager.get() {
                 let _ = am.set_account_active(&account.id, false).await;
                 let _ = am.set_auto_disabled(&account.id, true).await;
+            } else {
+                if account.is_active.swap(false, Ordering::Relaxed) {
+                    account.disabled_at.store(Utc::now().timestamp(), Ordering::Relaxed);
+                }
             }
             return Err(AppError::Unauthorized(format!(
                 "Tidal Auth Error: {}",

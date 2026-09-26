@@ -6,6 +6,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     refresh_token TEXT NOT NULL,
     user_id TEXT,
     is_active INTEGER NOT NULL DEFAULT 1,
+    disabled_at INTEGER NOT NULL DEFAULT 0,
     notes TEXT NOT NULL DEFAULT '',
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
