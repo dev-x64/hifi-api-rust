@@ -1,13 +1,11 @@
-use axum::extract::State;
 use axum::Json;
-use serde_json::{json, Value};
+use axum::extract::State;
+use serde_json::{Value, json};
 
-use crate::error::AppError;
 use crate::AppState;
+use crate::error::AppError;
 
-pub async fn get_stats(
-    State(state): State<AppState>,
-) -> Result<Json<Value>, AppError> {
+pub async fn get_stats(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     let accounts = state.account_manager.list_accounts().await;
     let total_requests: u64 = accounts
         .iter()
@@ -23,6 +21,14 @@ pub async fn get_stats(
         .iter()
         .filter(|a| a.is_active.load(std::sync::atomic::Ordering::Relaxed))
         .count();
+    let mut premium_count = 0;
+    for account in &accounts {
+        if account.is_active.load(std::sync::atomic::Ordering::Relaxed)
+            && account.premium_status.read().await.as_str() == "premium"
+        {
+            premium_count += 1;
+        }
+    }
     let playback_count = state.account_manager.playback_count().await;
     let pool = state.account_manager.playback_slots().await;
     let playback = state.playback.stats(pool).await;
@@ -62,6 +68,7 @@ pub async fn get_stats(
         "recent_p95_ms": recent_p95_ms,
         "total_accounts": accounts.len(),
         "active_accounts": active_count,
+        "premium_accounts": premium_count,
         "healthy_accounts": active_count,
         "playback_accounts": playback_count,
         "playback": playback,

@@ -1,6 +1,6 @@
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::sync::OnceLock;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use chrono::Utc;
@@ -17,9 +17,7 @@ use crate::upstash::UpstashStore;
 
 pub struct TokenManager {
     db: Option<SqlitePool>,
-    #[allow(dead_code)]
-    token_cache: Cache<String, (String, i64)>,
-    refresh_lock: Mutex<String>,
+    refresh_locks: Cache<String, Arc<Mutex<()>>>,
     account_manager: OnceLock<Arc<AccountManager>>,
     proxy_manager: OnceLock<Arc<ProxyManager>>,
     /// Shared cross-instance state (None = single-host mode, skip sync).
@@ -30,11 +28,10 @@ impl TokenManager {
     pub fn new(db: Option<SqlitePool>) -> Self {
         Self {
             db,
-            token_cache: Cache::builder()
+            refresh_locks: Cache::builder()
                 .time_to_live(Duration::from_secs(3600))
-                .max_capacity(100)
+                .max_capacity(500)
                 .build(),
-            refresh_lock: Mutex::new(String::new()),
             account_manager: OnceLock::new(),
             proxy_manager: OnceLock::new(),
             upstash: OnceLock::new(),
@@ -78,8 +75,7 @@ impl TokenManager {
             Some(s) => s.clone(),
             None => return,
         };
-        let payload =
-            serde_json::json!({"t": token, "e": expires_at}).to_string();
+        let payload = serde_json::json!({"t": token, "e": expires_at}).to_string();
         let key = UpstashStore::k_token(&account.id);
         let ttl = expires_in.max(120) as u64;
         // Fire-and-forget: the local token is already usable; siblings will
@@ -94,9 +90,14 @@ impl TokenManager {
         account: &AccountState,
         http_client: &Client,
     ) -> Result<String, AppError> {
+        if let Some(seconds) = AccountManager::rate_limit_remaining(account) {
+            return Err(AppError::RateLimited(seconds));
+        }
         {
             let access_token = account.access_token.read().await;
-            let expires_at = account.token_expires_at.load(std::sync::atomic::Ordering::Relaxed);
+            let expires_at = account
+                .token_expires_at
+                .load(std::sync::atomic::Ordering::Relaxed);
             if let Some(token) = access_token.as_ref() {
                 if Utc::now().timestamp() < expires_at && !token.is_empty() {
                     return Ok(token.clone());
@@ -112,11 +113,23 @@ impl TokenManager {
         account: &AccountState,
         http_client: &Client,
     ) -> Result<String, AppError> {
-        let _guard = self.refresh_lock.lock().await;
+        if let Some(seconds) = AccountManager::rate_limit_remaining(account) {
+            return Err(AppError::RateLimited(seconds));
+        }
+        let guard = self
+            .refresh_locks
+            .get_with(account.id.clone(), async { Arc::new(Mutex::new(())) })
+            .await;
+        let _guard = guard.lock().await;
+        if let Some(seconds) = AccountManager::rate_limit_remaining(account) {
+            return Err(AppError::RateLimited(seconds));
+        }
 
         {
             let access_token = account.access_token.read().await;
-            let expires_at = account.token_expires_at.load(std::sync::atomic::Ordering::Relaxed);
+            let expires_at = account
+                .token_expires_at
+                .load(std::sync::atomic::Ordering::Relaxed);
             if let Some(token) = access_token.as_ref() {
                 if Utc::now().timestamp() < expires_at && !token.is_empty() {
                     return Ok(token.clone());
@@ -164,13 +177,29 @@ impl TokenManager {
             }
             Err(e) => {
                 if (e.is_connect() || e.is_timeout()) && self.proxy_manager.get().is_some() {
-                    self.proxy_manager.get().unwrap().note_failure_for(&account.id).await;
+                    self.proxy_manager
+                        .get()
+                        .unwrap()
+                        .note_failure_for(&account.id)
+                        .await;
                 }
                 return Err(e.into());
             }
         };
 
         let status_code = res.status().as_u16();
+        if status_code == 429 {
+            let seconds = AccountManager::pause_account(
+                account,
+                res.headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok()),
+            );
+            if let Some(am) = self.account_manager.get() {
+                am.mark_account_error(&account.id, "Tidal auth HTTP 429").await;
+            }
+            return Err(AppError::RateLimited(seconds));
+        }
         if status_code == 400 || status_code == 401 || status_code == 403 {
             let error_data: Value = res.json().await.unwrap_or_default();
             let err_msg = error_data
@@ -179,14 +208,21 @@ impl TokenManager {
                 .unwrap_or("Unknown auth error");
             tracing::warn!(
                 "Refresh token rejected for account {} ({}): {} — deactivating",
-                account.label, status_code, err_msg
+                account.label,
+                status_code,
+                err_msg
             );
-            account.is_active.store(false, std::sync::atomic::Ordering::Relaxed);
+            account
+                .is_active
+                .store(false, std::sync::atomic::Ordering::Relaxed);
             if let Some(am) = self.account_manager.get() {
                 let _ = am.set_account_active(&account.id, false).await;
                 let _ = am.set_auto_disabled(&account.id, true).await;
             }
-            return Err(AppError::Unauthorized(format!("Tidal Auth Error: {}", err_msg)));
+            return Err(AppError::Unauthorized(format!(
+                "Tidal Auth Error: {}",
+                err_msg
+            )));
         }
 
         let status = res.status();
@@ -239,21 +275,20 @@ impl TokenManager {
 
         for account in &accounts {
             let is_active = account.is_active.load(std::sync::atomic::Ordering::Relaxed);
-            if !is_active {
+            if !is_active || AccountManager::rate_limit_remaining(account).is_some() {
                 continue;
             }
 
-            let expires_at = account.token_expires_at.load(std::sync::atomic::Ordering::Relaxed);
+            let expires_at = account
+                .token_expires_at
+                .load(std::sync::atomic::Ordering::Relaxed);
             let now = Utc::now().timestamp();
 
             if expires_at > now + 120 {
                 continue;
             }
 
-            tokio::time::sleep(Duration::from_millis(
-                rand::random::<u64>() % 3000 + 500,
-            ))
-            .await;
+            tokio::time::sleep(Duration::from_millis(rand::random::<u64>() % 3000 + 500)).await;
 
             let client = match proxy_manager.working_client_for(&account.id).await {
                 Ok(client) => client,

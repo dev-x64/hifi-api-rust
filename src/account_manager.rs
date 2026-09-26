@@ -50,6 +50,12 @@ pub struct AccountState {
     pub last_used: AtomicI64,
     pub request_count: AtomicU64,
     pub error_count: AtomicU64,
+    /// Temporary upstream 429 pause. Kept separate from account health so
+    /// rate limiting never disables a valid credential.
+    pub rate_limited_until: AtomicI64,
+    /// Result of the last manual FULL/PREVIEW probe; informational only.
+    pub premium_status: RwLock<String>,
+    pub premium_checked_at: AtomicI64,
     /// Last mutation unix timestamp (local admin ops AND Redis merges).
     /// Drives newest-wins convergence across instances.
     pub updated_at: AtomicI64,
@@ -85,6 +91,9 @@ impl AccountState {
             last_used: AtomicI64::new(0),
             request_count: AtomicU64::new(0),
             error_count: AtomicU64::new(0),
+            rate_limited_until: AtomicI64::new(0),
+            premium_status: RwLock::new("unknown".to_string()),
+            premium_checked_at: AtomicI64::new(0),
             updated_at: AtomicI64::new(0),
         }
     }
@@ -92,14 +101,42 @@ impl AccountState {
     /// Copy live counters from `old` into a rebuilt state, so admin
     /// edits and cross-instance merges never wipe stats or tokens.
     pub fn carry_over(new: &AccountState, old: &AccountState) {
-        new.last_used.store(old.last_used.load(Ordering::Relaxed), Ordering::Relaxed);
-        new.request_count.store(old.request_count.load(Ordering::Relaxed), Ordering::Relaxed);
-        new.error_count.store(old.error_count.load(Ordering::Relaxed), Ordering::Relaxed);
-        new.token_expires_at.store(old.token_expires_at.load(Ordering::Relaxed), Ordering::Relaxed);
-        new.is_catalog.store(old.is_catalog.load(Ordering::Relaxed), Ordering::Relaxed);
-        new.auto_disabled.store(old.auto_disabled.load(Ordering::Relaxed), Ordering::Relaxed);
-        new.heal_failures.store(old.heal_failures.load(Ordering::Relaxed), Ordering::Relaxed);
-        new.heal_next_retry.store(old.heal_next_retry.load(Ordering::Relaxed), Ordering::Relaxed);
+        new.last_used
+            .store(old.last_used.load(Ordering::Relaxed), Ordering::Relaxed);
+        new.request_count
+            .store(old.request_count.load(Ordering::Relaxed), Ordering::Relaxed);
+        new.error_count
+            .store(old.error_count.load(Ordering::Relaxed), Ordering::Relaxed);
+        new.rate_limited_until.store(
+            old.rate_limited_until.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        new.token_expires_at.store(
+            old.token_expires_at.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        new.is_catalog
+            .store(old.is_catalog.load(Ordering::Relaxed), Ordering::Relaxed);
+        new.auto_disabled
+            .store(old.auto_disabled.load(Ordering::Relaxed), Ordering::Relaxed);
+        new.heal_failures
+            .store(old.heal_failures.load(Ordering::Relaxed), Ordering::Relaxed);
+        new.heal_next_retry.store(
+            old.heal_next_retry.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        if new.client_id == old.client_id && new.refresh_token == old.refresh_token {
+            if let (Ok(src), Ok(mut dst)) = (
+                old.premium_status.try_read(),
+                new.premium_status.try_write(),
+            ) {
+                *dst = src.clone();
+            }
+            new.premium_checked_at.store(
+                old.premium_checked_at.load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
+        }
     }
 }
 
@@ -128,9 +165,7 @@ pub struct DbAccountRow {
 
 /// Extract a numeric user id from an auto-generated "Tidal Account (<id>)" label.
 fn user_id_from_label(label: &str) -> Option<&str> {
-    let inner = label
-        .strip_prefix("Tidal Account (")?
-        .strip_suffix(')')?;
+    let inner = label.strip_prefix("Tidal Account (")?.strip_suffix(')')?;
     if !inner.is_empty() && inner.chars().all(|c| c.is_ascii_digit()) {
         Some(inner)
     } else {
@@ -157,6 +192,38 @@ pub struct AccountManager {
 }
 
 impl AccountManager {
+    const DEFAULT_RATE_LIMIT_SECS: u64 = 30;
+
+    /// Retry-After may be seconds or an HTTP date. An absent/malformed value
+    /// still gets a conservative pause rather than another immediate request.
+    pub(crate) fn retry_after_secs(value: Option<&str>) -> u64 {
+        let now = Utc::now().timestamp();
+        let parsed = value.and_then(|raw| {
+            raw.trim().parse::<u64>().ok().or_else(|| {
+                chrono::DateTime::parse_from_rfc2822(raw.trim())
+                    .ok()
+                    .map(|date| date.timestamp().saturating_sub(now).max(0) as u64)
+            })
+        });
+        parsed.unwrap_or(Self::DEFAULT_RATE_LIMIT_SECS).max(1)
+    }
+
+    pub(crate) fn rate_limit_remaining(account: &AccountState) -> Option<u64> {
+        let remaining = account
+            .rate_limited_until
+            .load(Ordering::Relaxed)
+            .saturating_sub(Utc::now().timestamp());
+        (remaining > 0).then_some(remaining as u64)
+    }
+
+    pub(crate) fn pause_account(account: &AccountState, retry_after: Option<&str>) -> u64 {
+        let now = Utc::now().timestamp();
+        let seconds = Self::retry_after_secs(retry_after);
+        let until = now.saturating_add(i64::try_from(seconds).unwrap_or(i64::MAX));
+        account.rate_limited_until.fetch_max(until, Ordering::Relaxed);
+        Self::rate_limit_remaining(account).unwrap_or(seconds)
+    }
+
     pub fn new(db: Option<SqlitePool>, weights: SwitchingWeights) -> Self {
         Self {
             accounts: RwLock::new(Vec::new()),
@@ -207,11 +274,13 @@ impl AccountManager {
             };
             if user_id.is_some() && self.db.is_some() {
                 if let Some(db) = &self.db {
-                    let _ = sqlx::query("UPDATE accounts SET user_id = ? WHERE id = ? AND user_id IS NULL")
-                        .bind(&user_id)
-                        .bind(&row.id)
-                        .execute(db)
-                        .await;
+                    let _ = sqlx::query(
+                        "UPDATE accounts SET user_id = ? WHERE id = ? AND user_id IS NULL",
+                    )
+                    .bind(&user_id)
+                    .bind(&row.id)
+                    .execute(db)
+                    .await;
                 }
             }
             let state = Arc::new(AccountState::new(
@@ -236,7 +305,9 @@ impl AccountManager {
                     state.token_expires_at.store(expires, Ordering::Relaxed);
                 }
             }
-            state.updated_at.store(row.updated_at.unwrap_or(0), Ordering::Relaxed);
+            state
+                .updated_at
+                .store(row.updated_at.unwrap_or(0), Ordering::Relaxed);
             accounts.push(state);
         }
 
@@ -316,10 +387,9 @@ impl AccountManager {
         }
         // Remove from the shared backup too (or the next merge resurrects it).
         if let Some(store) = self.upstash() {
-            store.del_many(&[
-                UpstashStore::k_account(id),
-                UpstashStore::k_token(id),
-            ]).await;
+            store
+                .del_many(&[UpstashStore::k_account(id), UpstashStore::k_token(id)])
+                .await;
             store.srem(&UpstashStore::k_accounts_set(), id).await;
         }
         Ok(())
@@ -361,14 +431,16 @@ impl AccountManager {
         } else {
             0.0
         };
-        let usage_score =
-            weights.balance * (1.0 - usage as f64 / (max_usage as f64 + 1.0));
+        let usage_score = weights.balance * (1.0 - usage as f64 / (max_usage as f64 + 1.0));
         let recency_score = weights.recency * (recency_secs / 3600.0).clamp(0.0, 1.0);
         let error_score = weights.error * (1.0 - error_rate);
         usage_score + recency_score + error_score
     }
 
-    pub async fn select_account_excluding(&self, exclude_ids: &[String]) -> Result<Arc<AccountState>, AppError> {
+    pub async fn select_account_excluding(
+        &self,
+        exclude_ids: &[String],
+    ) -> Result<Arc<AccountState>, AppError> {
         // Serialize select+account: without this, N concurrent requests read
         // the same counters and all pick the same (currently-best) account,
         // leaving the rest idle under load.
@@ -382,6 +454,7 @@ impl AccountManager {
 
         let now = Utc::now().timestamp();
         let mut eligible: Vec<usize> = Vec::new();
+        let mut shortest_pause: Option<u64> = None;
         for (i, account) in accounts.iter().enumerate() {
             if exclude_ids.contains(&account.id) {
                 continue;
@@ -393,10 +466,17 @@ impl AccountManager {
             if account.is_catalog.load(Ordering::Relaxed) {
                 continue;
             }
+            if let Some(seconds) = Self::rate_limit_remaining(account) {
+                shortest_pause = Some(shortest_pause.map_or(seconds, |old| old.min(seconds)));
+                continue;
+            }
             eligible.push(i);
         }
 
         if eligible.is_empty() {
+            if let Some(seconds) = shortest_pause {
+                return Err(AppError::RateLimited(seconds));
+            }
             return Err(AppError::ServiceUnavailable(
                 "All accounts are inactive or have expired tokens".into(),
             ));
@@ -421,14 +501,8 @@ impl AccountManager {
                 };
                 let errors = account.error_count.load(Ordering::Relaxed);
                 let total = account.request_count.load(Ordering::Relaxed);
-                let score = Self::score_candidate(
-                    &self.weights,
-                    usage,
-                    max_usage,
-                    recency,
-                    errors,
-                    total,
-                );
+                let score =
+                    Self::score_candidate(&self.weights, usage, max_usage, recency, errors, total);
                 (score, i)
             })
             .collect();
@@ -485,9 +559,7 @@ impl AccountManager {
         let accounts = self.accounts.read().await;
         accounts
             .iter()
-            .find(|a| {
-                a.is_catalog.load(Ordering::Relaxed) && a.is_active.load(Ordering::Relaxed)
-            })
+            .find(|a| a.is_catalog.load(Ordering::Relaxed) && a.is_active.load(Ordering::Relaxed))
             .cloned()
             .or_else(|| {
                 accounts
@@ -505,7 +577,9 @@ impl AccountManager {
         let catalog: Vec<Arc<AccountState>> = accounts
             .iter()
             .filter(|a| {
-                a.is_catalog.load(Ordering::Relaxed) && a.is_active.load(Ordering::Relaxed)
+                a.is_catalog.load(Ordering::Relaxed)
+                    && a.is_active.load(Ordering::Relaxed)
+                    && Self::rate_limit_remaining(a).is_none()
             })
             .cloned()
             .collect();
@@ -525,7 +599,22 @@ impl AccountManager {
         if let Some(acc) = self.next_active_catalog().await {
             return Ok(acc);
         }
+        if let Some(seconds) = self.catalog_rate_limit_remaining().await {
+            return Err(AppError::RateLimited(seconds));
+        }
         self.select_account_excluding(&[]).await
+    }
+
+    pub(crate) async fn catalog_rate_limit_remaining(&self) -> Option<u64> {
+        self.accounts
+            .read()
+            .await
+            .iter()
+            .filter(|a| {
+                a.is_catalog.load(Ordering::Relaxed) && a.is_active.load(Ordering::Relaxed)
+            })
+            .filter_map(|a| Self::rate_limit_remaining(a))
+            .min()
     }
 
     /// Flag or unflag an account as catalog-only (kept out of playback).
@@ -535,14 +624,12 @@ impl AccountManager {
             let now = Utc::now().timestamp();
             account.updated_at.store(now, Ordering::Relaxed);
             if let Some(db) = &self.db {
-                sqlx::query(
-                    "UPDATE accounts SET is_catalog = ?, updated_at = ? WHERE id = ?",
-                )
-                .bind(catalog as i32)
-                .bind(now)
-                .bind(id)
-                .execute(db)
-                .await?;
+                sqlx::query("UPDATE accounts SET is_catalog = ?, updated_at = ? WHERE id = ?")
+                    .bind(catalog as i32)
+                    .bind(now)
+                    .bind(id)
+                    .execute(db)
+                    .await?;
             }
             self.push_account_to_redis(&account).await;
             Ok(())
@@ -568,6 +655,15 @@ impl AccountManager {
         }
     }
 
+    pub async fn set_premium(&self, id: &str, status: &str) {
+        if let Some(account) = self.get_account_by_id(id).await {
+            *account.premium_status.write().await = status.to_string();
+            account
+                .premium_checked_at
+                .store(Utc::now().timestamp(), Ordering::Relaxed);
+        }
+    }
+
     pub async fn update_account(
         &self,
         id: &str,
@@ -578,9 +674,10 @@ impl AccountManager {
         user_id: Option<String>,
     ) -> Result<(), AppError> {
         let mut accounts = self.accounts.write().await;
-        let idx = accounts.iter().position(|a| a.id == id).ok_or_else(|| {
-            AppError::NotFound(format!("Account {} not found", id))
-        })?;
+        let idx = accounts
+            .iter()
+            .position(|a| a.id == id)
+            .ok_or_else(|| AppError::NotFound(format!("Account {} not found", id)))?;
 
         let old = &accounts[idx];
         let new_label = label.unwrap_or_else(|| old.label.clone());
@@ -641,14 +738,12 @@ impl AccountManager {
             let now = Utc::now().timestamp();
             account.updated_at.store(now, Ordering::Relaxed);
             if let Some(db) = &self.db {
-                sqlx::query(
-                    "UPDATE accounts SET auto_disabled = ?, updated_at = ? WHERE id = ?",
-                )
-                .bind(disabled as i32)
-                .bind(now)
-                .bind(id)
-                .execute(db)
-                .await?;
+                sqlx::query("UPDATE accounts SET auto_disabled = ?, updated_at = ? WHERE id = ?")
+                    .bind(disabled as i32)
+                    .bind(now)
+                    .bind(id)
+                    .execute(db)
+                    .await?;
             }
             self.push_account_to_redis(&account).await;
             Ok(())
@@ -663,14 +758,12 @@ impl AccountManager {
             let now = Utc::now().timestamp();
             account.updated_at.store(now, Ordering::Relaxed);
             if let Some(db) = &self.db {
-                sqlx::query(
-                    "UPDATE accounts SET is_active = ?, updated_at = ? WHERE id = ?",
-                )
-                .bind(active as i32)
-                .bind(now)
-                .bind(id)
-                .execute(db)
-                .await?;
+                sqlx::query("UPDATE accounts SET is_active = ?, updated_at = ? WHERE id = ?")
+                    .bind(active as i32)
+                    .bind(now)
+                    .bind(id)
+                    .execute(db)
+                    .await?;
             }
             self.push_account_to_redis(&account).await;
             Ok(())
@@ -708,7 +801,9 @@ impl AccountManager {
             None => return,
         };
         let payload = Self::account_to_json(acc).await;
-        store.set(&UpstashStore::k_account(&acc.id), &payload, None).await;
+        store
+            .set(&UpstashStore::k_account(&acc.id), &payload, None)
+            .await;
         store.sadd(&UpstashStore::k_accounts_set(), &acc.id).await;
     }
 
@@ -728,8 +823,10 @@ impl AccountManager {
             None => return,
         };
         if !remote_ids.is_empty() {
-            let keys: Vec<String> =
-                remote_ids.iter().map(|id| UpstashStore::k_account(id)).collect();
+            let keys: Vec<String> = remote_ids
+                .iter()
+                .map(|id| UpstashStore::k_account(id))
+                .collect();
             let values = store.mget(&keys).await;
             let mut accounts = self.accounts.write().await;
             for (id, payload) in remote_ids.iter().zip(values.iter()) {
@@ -741,17 +838,22 @@ impl AccountManager {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-                let str_field = |k: &str| {
-                    v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string()
-                };
+                let str_field =
+                    |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
                 let remote_updated = v.get("updated_at").and_then(|x| x.as_i64()).unwrap_or(0);
-                let user_id =
-                    v.get("user_id").and_then(|x| x.as_str()).map(|s| s.to_string());
+                let user_id = v
+                    .get("user_id")
+                    .and_then(|x| x.as_str())
+                    .map(|s| s.to_string());
                 let is_active = v.get("is_active").and_then(|x| x.as_bool()).unwrap_or(true);
-                let auto_disabled =
-                    v.get("auto_disabled").and_then(|x| x.as_bool()).unwrap_or(false);
-                let is_catalog =
-                    v.get("is_catalog").and_then(|x| x.as_bool()).unwrap_or(false);
+                let auto_disabled = v
+                    .get("auto_disabled")
+                    .and_then(|x| x.as_bool())
+                    .unwrap_or(false);
+                let is_catalog = v
+                    .get("is_catalog")
+                    .and_then(|x| x.as_bool())
+                    .unwrap_or(false);
                 if let Some(pos) = accounts.iter().position(|a| &a.id == id) {
                     if remote_updated <= accounts[pos].updated_at.load(Ordering::Relaxed) {
                         continue;
@@ -922,7 +1024,8 @@ impl AccountManager {
 
 #[cfg(test)]
 mod tests {
-    use super::{utc_day, AccountState};
+    use super::{AccountManager, AccountState, SwitchingWeights, utc_day};
+    use crate::error::AppError;
     use std::sync::atomic::Ordering;
 
     #[test]
@@ -941,6 +1044,55 @@ mod tests {
         let monday_2359 = 86400 * 100 + 86399;
         let tuesday_0001 = 86400 * 101 + 60;
         assert_ne!(utc_day(monday_2359), utc_day(tuesday_0001));
+    }
+
+    #[test]
+    fn retry_after_parses_seconds_and_http_date() {
+        assert_eq!(AccountManager::retry_after_secs(Some("45")), 45);
+        assert_eq!(AccountManager::retry_after_secs(Some("0")), 1);
+        assert_eq!(AccountManager::retry_after_secs(None), 30);
+        assert_eq!(AccountManager::retry_after_secs(Some("invalid")), 30);
+        let date = (chrono::Utc::now() + chrono::Duration::seconds(90))
+            .format("%a, %d %b %Y %H:%M:%S GMT")
+            .to_string();
+        let parsed = AccountManager::retry_after_secs(Some(&date));
+        assert!((89..=90).contains(&parsed), "HTTP date gave {parsed}s");
+    }
+
+    #[tokio::test]
+    async fn rate_limited_accounts_are_not_selected_until_pause_expires() {
+        let am = AccountManager::new(None, SwitchingWeights::default());
+        let a = am
+            .add_account("a".into(), "c".into(), "s".into(), "rt-a".into(), None)
+            .await
+            .unwrap();
+        let b = am
+            .add_account("b".into(), "c".into(), "s".into(), "rt-b".into(), None)
+            .await
+            .unwrap();
+        AccountManager::pause_account(&a, Some("120"));
+        AccountManager::pause_account(&a, Some("5"));
+        assert!(AccountManager::rate_limit_remaining(&a).unwrap() >= 119);
+        assert_eq!(am.select_account().await.unwrap().id, b.id);
+        AccountManager::pause_account(&b, Some("60"));
+        assert!(matches!(am.select_account().await, Err(AppError::RateLimited(1..=60))));
+        a.rate_limited_until.store(0, Ordering::Relaxed);
+        assert_eq!(am.select_account().await.unwrap().id, a.id);
+    }
+
+    #[tokio::test]
+    async fn paused_catalog_account_does_not_fall_back_to_playback() {
+        let am = AccountManager::new(None, SwitchingWeights::default());
+        am.add_account("play".into(), "c".into(), "s".into(), "rt-play".into(), None)
+            .await
+            .unwrap();
+        let catalog = am
+            .add_account("catalog".into(), "c".into(), "s".into(), "rt-cat".into(), None)
+            .await
+            .unwrap();
+        am.set_account_catalog(&catalog.id, true).await.unwrap();
+        AccountManager::pause_account(&catalog, Some("90"));
+        assert!(matches!(am.select_catalog_account().await, Err(AppError::RateLimited(_))));
     }
 
     #[tokio::test]
@@ -984,6 +1136,7 @@ mod tests {
         old.request_count.store(500, Ordering::Relaxed);
         old.token_expires_at.store(8_888_888, Ordering::Relaxed);
         old.is_catalog.store(true, Ordering::Relaxed);
+        old.rate_limited_until.store(8_888_999, Ordering::Relaxed);
         let new = AccountState::new(
             "id-1".into(),
             "New".into(),
@@ -999,6 +1152,7 @@ mod tests {
         assert_eq!(new.request_count.load(Ordering::Relaxed), 500);
         assert_eq!(new.token_expires_at.load(Ordering::Relaxed), 8_888_888);
         assert!(new.is_catalog.load(Ordering::Relaxed));
+        assert_eq!(new.rate_limited_until.load(Ordering::Relaxed), 8_888_999);
     }
 
     #[tokio::test]
@@ -1007,7 +1161,13 @@ mod tests {
         use std::sync::Arc;
         let am = Arc::new(AccountManager::new(None, SwitchingWeights::default()));
         let playback = am
-            .add_account("play".into(), "c".into(), "s".into(), "rt-play".into(), None)
+            .add_account(
+                "play".into(),
+                "c".into(),
+                "s".into(),
+                "rt-play".into(),
+                None,
+            )
             .await
             .unwrap();
         let catalog = am
@@ -1035,7 +1195,13 @@ mod tests {
         use std::sync::Arc;
         let am = Arc::new(AccountManager::new(None, SwitchingWeights::default()));
         let playback = am
-            .add_account("play".into(), "c".into(), "s".into(), "rt-play".into(), None)
+            .add_account(
+                "play".into(),
+                "c".into(),
+                "s".into(),
+                "rt-play".into(),
+                None,
+            )
             .await
             .unwrap();
         assert!(am.find_catalog_account().await.is_none());
@@ -1062,7 +1228,10 @@ mod tests {
         // wins when recency/errors tie, even at 6-digit counts.
         let ahead = AccountManager::score_candidate(&w, 100_001, 100_001, 0.0, 0, 100_001);
         let behind = AccountManager::score_candidate(&w, 100_000, 100_001, 0.0, 0, 100_000);
-        assert!(behind > ahead, "usage lead must not become invisible at scale");
+        assert!(
+            behind > ahead,
+            "usage lead must not become invisible at scale"
+        );
     }
 
     #[tokio::test]
@@ -1132,7 +1301,12 @@ mod tests {
             t.await.unwrap();
         }
         let hits = hits.lock().unwrap();
-        assert_eq!(hits.len(), 4, "concurrent load must reach every account: {:?}", hits);
+        assert_eq!(
+            hits.len(),
+            4,
+            "concurrent load must reach every account: {:?}",
+            hits
+        );
         for (id, n) in hits.iter() {
             assert!(
                 *n >= 5,
@@ -1192,7 +1366,10 @@ mod tests {
         for _ in 0..4 {
             order.push(am.select_catalog_account().await.unwrap().id.clone());
         }
-        assert_eq!(order, vec![c1.id.clone(), c2.id.clone(), c1.id.clone(), c2.id.clone()]);
+        assert_eq!(
+            order,
+            vec![c1.id.clone(), c2.id.clone(), c1.id.clone(), c2.id.clone()]
+        );
         assert!(am.next_active_catalog().await.is_some());
     }
 }

@@ -1,14 +1,15 @@
 use std::sync::Mutex;
 use std::time::Instant;
 
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::Json;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use crate::error::AppError;
 use crate::AppState;
+use crate::account_manager::AccountManager;
+use crate::error::AppError;
 
 static TEST_CACHE: Mutex<Option<(i64, Value)>> = Mutex::new(None);
 
@@ -32,9 +33,7 @@ pub struct ToggleAccountRequest {
     pub active: bool,
 }
 
-pub async fn list_accounts(
-    State(state): State<AppState>,
-) -> Result<Json<Value>, AppError> {
+pub async fn list_accounts(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     let accounts = state.account_manager.list_accounts().await;
     let mut list: Vec<Value> = Vec::with_capacity(accounts.len());
     for a in &accounts {
@@ -51,9 +50,12 @@ pub async fn list_accounts(
             "heal_next_retry": a.heal_next_retry.load(std::sync::atomic::Ordering::Relaxed),
             "request_count": a.request_count.load(std::sync::atomic::Ordering::Relaxed),
             "error_count": a.error_count.load(std::sync::atomic::Ordering::Relaxed),
+            "rate_limited_until": a.rate_limited_until.load(std::sync::atomic::Ordering::Relaxed),
             "is_catalog": a.is_catalog.load(std::sync::atomic::Ordering::Relaxed),
             "token_expires_at": a.token_expires_at.load(std::sync::atomic::Ordering::Relaxed),
             "last_used": a.last_used.load(std::sync::atomic::Ordering::Relaxed),
+            "premium_status": a.premium_status.read().await.clone(),
+            "premium_checked_at": a.premium_checked_at.load(std::sync::atomic::Ordering::Relaxed),
             "notes": a.notes.read().await.clone(),
         }));
     }
@@ -76,9 +78,16 @@ pub async fn add_account(
         )
         .await?;
     let is_catalog = body.catalog.unwrap_or(false)
-        || body.role.as_deref().map(|r| r.eq_ignore_ascii_case("catalog")).unwrap_or(false);
+        || body
+            .role
+            .as_deref()
+            .map(|r| r.eq_ignore_ascii_case("catalog"))
+            .unwrap_or(false);
     if is_catalog {
-        state.account_manager.set_account_catalog(&account.id, true).await?;
+        state
+            .account_manager
+            .set_account_catalog(&account.id, true)
+            .await?;
     }
 
     Ok(Json(json!({
@@ -101,9 +110,18 @@ pub async fn set_account_catalog(
     Path(id): Path<String>,
     Json(body): Json<CatalogAccountRequest>,
 ) -> Result<Json<Value>, AppError> {
-    state.account_manager.set_account_catalog(&id, body.catalog).await?;
-    let status = if body.catalog { "catalog-only" } else { "playback" };
-    Ok(Json(json!({ "message": format!("Account {} set to {}", id, status) })))
+    state
+        .account_manager
+        .set_account_catalog(&id, body.catalog)
+        .await?;
+    let status = if body.catalog {
+        "catalog-only"
+    } else {
+        "playback"
+    };
+    Ok(Json(
+        json!({ "message": format!("Account {} set to {}", id, status) }),
+    ))
 }
 
 pub async fn remove_account(
@@ -156,7 +174,9 @@ pub async fn toggle_account(
     // so auto-heal never overrides an explicit OFF.
     let _ = state.account_manager.set_auto_disabled(&id, false).await;
     let status = if body.active { "active" } else { "inactive" };
-    Ok(Json(json!({ "message": format!("Account {} set to {}", id, status) })))
+    Ok(Json(
+        json!({ "message": format!("Account {} set to {}", id, status) }),
+    ))
 }
 
 pub async fn refresh_account_token(
@@ -170,15 +190,13 @@ pub async fn refresh_account_token(
         .ok_or_else(|| AppError::NotFound(format!("Account {} not found", id)))?;
 
     let hc = state.tidal_client.working_client_for(&account.id).await?;
-    match state
-        .token_manager
-        .refresh_token(&account, &hc)
-        .await
-    {
+    match state.token_manager.refresh_token(&account, &hc).await {
         Ok(_) => {
             state.account_manager.set_account_active(&id, true).await?;
             let _ = state.account_manager.set_auto_disabled(&id, false).await;
-            Ok(Json(json!({"status": "ok", "message": "Token refreshed, account reactivated"})))
+            Ok(Json(
+                json!({"status": "ok", "message": "Token refreshed, account reactivated"}),
+            ))
         }
         Err(e) => {
             state
@@ -193,9 +211,27 @@ pub async fn refresh_account_token(
     }
 }
 
-pub async fn test_all_accounts(
+/// Manual, read-only probe of FULL versus PREVIEW for one account.
+pub async fn check_account_premium(
     State(state): State<AppState>,
+    Path(id): Path<String>,
 ) -> Result<Json<Value>, AppError> {
+    let account = state
+        .account_manager
+        .get_account_by_id(&id)
+        .await
+        .ok_or_else(|| AppError::NotFound(format!("Account {} not found", id)))?;
+    let (status, reason) = state.tidal_client.probe_account_premium(&account).await;
+    state.account_manager.set_premium(&id, &status).await;
+    Ok(Json(json!({
+        "account_id": id,
+        "premium": status,
+        "reason": reason,
+        "checked_at": account.premium_checked_at.load(std::sync::atomic::Ordering::Relaxed),
+    })))
+}
+
+pub async fn test_all_accounts(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     let now = chrono::Utc::now().timestamp();
     if let Ok(cache) = TEST_CACHE.lock() {
         if let Some((ts, ref results)) = *cache {
@@ -208,12 +244,14 @@ pub async fn test_all_accounts(
     let accounts = state.account_manager.list_accounts().await;
     let country = &state.config.country_code;
     let token_manager = state.token_manager.clone();
+    let account_manager = state.account_manager.clone();
 
     let mut handles = Vec::new();
     for account in &accounts {
         let acc = account.clone();
         let c = state.tidal_client.working_client_for(&account.id).await?;
         let tm = token_manager.clone();
+        let am = account_manager.clone();
         let pm = state.proxy_manager.clone();
         let cc = country.clone();
         handles.push(tokio::spawn(async move {
@@ -224,6 +262,9 @@ pub async fn test_all_accounts(
             let start = Instant::now();
             match tm.get_token(&acc, &c).await {
                 Ok(token) => {
+                    if let Some(seconds) = AccountManager::rate_limit_remaining(&acc) {
+                        return json!({"id": id, "label": label, "ok": false, "status_code": 429, "retry_after": seconds, "error": "Account is rate limited"});
+                    }
                     let c = match pm.working_client_for(&id).await {
                         Ok(client) => client,
                         Err(e) => return json!({"id": id, "label": label, "ok": false, "error": e.to_string()}),
@@ -243,6 +284,13 @@ pub async fn test_all_accounts(
                         Ok(resp) => {
                             let elapsed = start.elapsed().as_millis() as u64;
                             let status_code = resp.status().as_u16();
+                            if status_code == 429 {
+                                AccountManager::pause_account(
+                                    &acc,
+                                    resp.headers().get(reqwest::header::RETRY_AFTER).and_then(|v| v.to_str().ok()),
+                                );
+                                am.mark_account_error(&id, "Tidal admin test HTTP 429").await;
+                            }
                             let body = resp.text().await.unwrap_or_default();
                             let response_preview = if body.len() > 500 {
                                 format!("{}...", &body[..500])
@@ -285,9 +333,7 @@ pub async fn test_all_accounts(
     Ok(Json(payload))
 }
 
-pub async fn export_accounts(
-    State(state): State<AppState>,
-) -> Result<Json<Value>, AppError> {
+pub async fn export_accounts(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     let accounts = state.account_manager.list_accounts().await;
     let exported: Vec<Value> = accounts
         .iter()
@@ -351,7 +397,9 @@ pub async fn import_accounts(
             .to_string();
 
         if client_id.is_empty() || client_secret.is_empty() || refresh_token.is_empty() {
-            errors.push(json!({"index": i, "error": "missing client_id/client_secret/refresh_token"}));
+            errors.push(
+                json!({"index": i, "error": "missing client_id/client_secret/refresh_token"}),
+            );
             skipped += 1;
             continue;
         }
@@ -373,7 +421,10 @@ pub async fn import_accounts(
             .and_then(|v| v.as_str())
             .map(|r| r.eq_ignore_ascii_case("catalog"))
             .unwrap_or(false)
-            || val.get("catalog").and_then(|v| v.as_bool()).unwrap_or(false);
+            || val
+                .get("catalog")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
 
         match state
             .account_manager
@@ -382,7 +433,10 @@ pub async fn import_accounts(
         {
             Ok(acc) => {
                 if is_catalog {
-                    let _ = state.account_manager.set_account_catalog(&acc.id, true).await;
+                    let _ = state
+                        .account_manager
+                        .set_account_catalog(&acc.id, true)
+                        .await;
                 }
                 imported += 1;
             }
@@ -410,17 +464,18 @@ pub async fn test_account(
         .await
         .ok_or_else(|| AppError::NotFound(format!("Account {} not found", id)))?;
 
-    let token_expires_at = account.token_expires_at.load(std::sync::atomic::Ordering::Relaxed);
+    let token_expires_at = account
+        .token_expires_at
+        .load(std::sync::atomic::Ordering::Relaxed);
     let is_active = account.is_active.load(std::sync::atomic::Ordering::Relaxed);
     let start = Instant::now();
 
     let hc = state.tidal_client.working_client_for(&account.id).await?;
-    match state
-        .token_manager
-        .get_token(&account, &hc)
-        .await
-    {
+    match state.token_manager.get_token(&account, &hc).await {
         Ok(token) => {
+            if let Some(seconds) = AccountManager::rate_limit_remaining(&account) {
+                return Err(AppError::RateLimited(seconds));
+            }
             let token_ms = start.elapsed().as_millis() as u64;
             let hc = state.tidal_client.working_client_for(&account.id).await?;
             let resp = hc
@@ -431,10 +486,17 @@ pub async fn test_account(
             match resp {
                 Ok(r) => {
                     let status_code = r.status().as_u16();
+                    if status_code == 429 {
+                        AccountManager::pause_account(
+                            &account,
+                            r.headers().get(reqwest::header::RETRY_AFTER).and_then(|v| v.to_str().ok()),
+                        );
+                        state.account_manager.mark_account_error(&account.id, "Tidal admin test HTTP 429").await;
+                    }
                     let body_text = r.text().await.unwrap_or_default();
                     let total_ms = start.elapsed().as_millis() as u64;
-                    let response_json: Value = serde_json::from_str(&body_text)
-                        .unwrap_or(json!({"raw": body_text}));
+                    let response_json: Value =
+                        serde_json::from_str(&body_text).unwrap_or(json!({"raw": body_text}));
                     Ok(Json(json!({
                         "status": if status_code == 200 { "ok" } else { "error" },
                         "ms": total_ms,

@@ -4,6 +4,7 @@ use axum::http::{HeaderMap, Method};
 use axum::response::Response;
 
 use crate::error::AppError;
+use crate::account_manager::AccountManager;
 use crate::AppState;
 
 pub async fn widevine_proxy(
@@ -40,10 +41,14 @@ pub(crate) async fn fetch_widevine_license(
     let pool = state.account_manager.playback_count().await.max(1);
     let mut failed_ids: Vec<String> = Vec::new();
     let mut last_err: Option<AppError> = None;
+    let mut first_rate_limit_try: Option<usize> = None;
     // Last retryable HTTP response, returned when every account fails over.
     let mut last_http: Option<(u16, String, Vec<u8>)> = None;
 
-    for _ in 0..pool {
+    for account_try in 0..pool {
+        if first_rate_limit_try.is_some_and(|first| account_try > first + 1) {
+            break;
+        }
         let account = match state
             .account_manager
             .select_account_excluding(&failed_ids)
@@ -51,6 +56,9 @@ pub(crate) async fn fetch_widevine_license(
         {
             Ok(a) => a,
             Err(e) => {
+                if matches!(last_err, Some(AppError::RateLimited(_))) {
+                    return Err(last_err.unwrap());
+                }
                 return match last_http {
                     Some(r) => Ok(r),
                     None => Err(last_err.unwrap_or(e)),
@@ -60,6 +68,15 @@ pub(crate) async fn fetch_widevine_license(
         let mut hc = state.tidal_client.working_client_for(&account.id).await?;
         let token = match state.token_manager.get_token(&account, &hc).await {
             Ok(t) => t,
+            Err(e @ AppError::RateLimited(_)) => {
+                if first_rate_limit_try.is_some() {
+                    return Err(e);
+                }
+                first_rate_limit_try = Some(account_try);
+                failed_ids.push(account.id.clone());
+                last_err = Some(e);
+                continue;
+            }
             Err(e) => {
                 state
                     .account_manager
@@ -70,6 +87,16 @@ pub(crate) async fn fetch_widevine_license(
                 continue;
             }
         };
+        if let Some(seconds) = AccountManager::rate_limit_remaining(&account) {
+            let e = AppError::RateLimited(seconds);
+            if first_rate_limit_try.is_some() {
+                return Err(e);
+            }
+            first_rate_limit_try = Some(account_try);
+            failed_ids.push(account.id.clone());
+            last_err = Some(e);
+            continue;
+        }
         hc = state.tidal_client.working_client_for(&account.id).await?;
 
         let url = "https://api.tidal.com/v2/widevine";
@@ -128,6 +155,15 @@ pub(crate) async fn fetch_widevine_license(
                     }
                 }
                 Err(e) => {
+                    if matches!(e, AppError::RateLimited(_)) {
+                        if first_rate_limit_try.is_some() {
+                            return Err(e);
+                        }
+                        first_rate_limit_try = Some(account_try);
+                        failed_ids.push(account.id.clone());
+                        last_err = Some(e);
+                        continue;
+                    }
                     state
                         .account_manager
                         .mark_account_error(
@@ -143,6 +179,26 @@ pub(crate) async fn fetch_widevine_license(
         }
 
         let status = resp.status();
+        if status.as_u16() == 429 {
+            let seconds = AccountManager::pause_account(
+                &account,
+                resp.headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok()),
+            );
+            state
+                .account_manager
+                .mark_account_error(&account.id, "Tidal HTTP 429")
+                .await;
+            let e = AppError::RateLimited(seconds);
+            if first_rate_limit_try.is_some() {
+                return Err(e);
+            }
+            first_rate_limit_try = Some(account_try);
+            failed_ids.push(account.id.clone());
+            last_err = Some(e);
+            continue;
+        }
         if state.config.dev_mode {
             tracing::info!("[DEV] {} {} → {}", method, url, status.as_u16());
         }
@@ -155,7 +211,7 @@ pub(crate) async fn fetch_widevine_license(
         let content = resp.bytes().await.unwrap_or_default().to_vec();
 
         let code = status.as_u16();
-        if code == 429 || code == 403 || code >= 500 {
+        if code == 403 || code >= 500 {
             state
                 .account_manager
                 .mark_account_error(&account.id, &format!("Tidal HTTP {}", code))
@@ -169,6 +225,9 @@ pub(crate) async fn fetch_widevine_license(
         return Ok((code, resp_content_type, content));
     }
 
+    if matches!(last_err, Some(AppError::RateLimited(_))) {
+        return Err(last_err.unwrap());
+    }
     match last_http {
         Some(r) => Ok(r),
         None => Err(last_err.unwrap_or(AppError::ServiceUnavailable(
