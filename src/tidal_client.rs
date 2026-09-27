@@ -749,8 +749,18 @@ impl TidalClient {
         body.get("assetPresentation").and_then(Value::as_str)
     }
 
-    /// Manual diagnostic only. Never changes the account's availability.
+    /// FULL/PREVIEW diagnostic used by both the admin action and maintenance loop.
+    /// It never changes the account's availability.
     pub async fn probe_account_premium(&self, account: &Arc<AccountState>) -> (String, String) {
+        self.probe_account_premium_at(account, "https://api.tidal.com/v1")
+            .await
+    }
+
+    async fn probe_account_premium_at(
+        &self,
+        account: &Arc<AccountState>,
+        api_base: &str,
+    ) -> (String, String) {
         if AccountManager::rate_limit_remaining(account).is_some() {
             return ("unknown".into(), "Account is rate limited".into());
         }
@@ -763,88 +773,132 @@ impl TidalClient {
                 );
             }
         };
-        let token = match self.token_manager.get_token(account, &client).await {
+        let mut token = match self.token_manager.get_token(account, &client).await {
             Ok(token) => token,
             Err(_) => return ("error".into(), "Token unavailable".into()),
         };
         let mut previews = 0;
         for track_id in PROBE_TRACK_IDS {
-            if AccountManager::rate_limit_remaining(account).is_some() {
-                return ("unknown".into(), "Account is rate limited".into());
-            }
-            let client = match self.working_client_for(&account.id).await {
-                Ok(client) => client,
-                Err(_) => {
-                    return (
-                        "unknown".into(),
-                        "No working egress for this account".into(),
-                    );
+            let mut retried_unauthorized = false;
+            loop {
+                if AccountManager::rate_limit_remaining(account).is_some() {
+                    return ("unknown".into(), "Account is rate limited".into());
                 }
-            };
-            let url = format!("https://api.tidal.com/v1/tracks/{}/playbackinfo", track_id);
-            let request = client
-                .get(&url)
-                .query(&[
-                    ("audioquality", "HI_RES_LOSSLESS"),
-                    ("playbackmode", "STREAM"),
-                    ("assetpresentation", "FULL"),
-                ])
-                .header("authorization", format!("Bearer {}", token))
-                .header("X-Tidal-Token", account.client_id.as_str())
-                .header("User-Agent", self.config.user_agent.as_str());
-            let response =
-                match tokio::time::timeout(Duration::from_secs(PROBE_REQ_SECS), request.send())
-                    .await
-                {
-                    Ok(Ok(response)) => response,
-                    _ => return ("unknown".into(), "Network error reaching Tidal".into()),
+                let client = match self.working_client_for(&account.id).await {
+                    Ok(client) => client,
+                    Err(_) => {
+                        return (
+                            "unknown".into(),
+                            "No working egress for this account".into(),
+                        );
+                    }
                 };
-            match response.status().as_u16() {
-                200 => {
-                    let body = match response.json::<Value>().await {
-                        Ok(body) => body,
-                        Err(_) => return ("unknown".into(), "Invalid playback response".into()),
-                    };
-                    match Self::playback_presentation(&body) {
-                        Some("FULL") => return ("premium".into(), String::new()),
-                        Some("PREVIEW") => previews += 1,
-                        _ => {
-                            return (
-                                "unknown".into(),
-                                "Playback response has no clear presentation".into(),
-                            );
+                let url = format!("{}/tracks/{}/playbackinfo", api_base, track_id);
+                let request = client
+                    .get(&url)
+                    .query(&[
+                        ("audioquality", "HI_RES_LOSSLESS"),
+                        ("playbackmode", "STREAM"),
+                        ("assetpresentation", "FULL"),
+                    ])
+                    .header("authorization", format!("Bearer {}", token))
+                    .header("X-Tidal-Token", account.client_id.as_str())
+                    .header("User-Agent", self.config.user_agent.as_str());
+                let response = match tokio::time::timeout(
+                    Duration::from_secs(PROBE_REQ_SECS),
+                    request.send(),
+                )
+                .await
+                {
+                    Ok(Ok(response)) => {
+                        self.proxy_manager.note_success_for(&account.id).await;
+                        response
+                    }
+                    Ok(Err(error)) => {
+                        if error.is_connect() || error.is_timeout() {
+                            self.proxy_manager.note_failure_for(&account.id).await;
+                        }
+                        return ("unknown".into(), "Network error reaching Tidal".into());
+                    }
+                    Err(_) => {
+                        self.proxy_manager.note_failure_for(&account.id).await;
+                        return ("unknown".into(), "Network error reaching Tidal".into());
+                    }
+                };
+                match response.status().as_u16() {
+                    200 => {
+                        let body = match response.json::<Value>().await {
+                            Ok(body) => body,
+                            Err(_) => {
+                                return ("unknown".into(), "Invalid playback response".into());
+                            }
+                        };
+                        match Self::playback_presentation(&body) {
+                            Some("FULL") => return ("premium".into(), String::new()),
+                            Some("PREVIEW") => {
+                                previews += 1;
+                                break;
+                            }
+                            _ => {
+                                return (
+                                    "unknown".into(),
+                                    "Playback response has no clear presentation".into(),
+                                );
+                            }
                         }
                     }
+                    401 if !retried_unauthorized => {
+                        retried_unauthorized = true;
+                        match self
+                            .token_manager
+                            .refresh_after_unauthorized(account, &client, &token)
+                            .await
+                        {
+                            Ok(fresh) => {
+                                token = fresh;
+                                continue;
+                            }
+                            Err(_) => {
+                                return (
+                                    "unknown".into(),
+                                    "Tidal returned 401 and token refresh failed".into(),
+                                );
+                            }
+                        }
+                    }
+                    401 => {
+                        TokenManager::reject_refreshed_token(account, &token).await;
+                        return (
+                            "unknown".into(),
+                            "Tidal returned 401 after token refresh".into(),
+                        );
+                    }
+                    403 => {
+                        return (
+                            "unknown".into(),
+                            "Tidal returned 403; account may be restricted".into(),
+                        );
+                    }
+                    429 => {
+                        AccountManager::pause_account(
+                            account,
+                            response
+                                .headers()
+                                .get(reqwest::header::RETRY_AFTER)
+                                .and_then(|v| v.to_str().ok()),
+                        );
+                        self.account_manager
+                            .mark_account_error(&account.id, "Tidal probe HTTP 429")
+                            .await;
+                        return ("unknown".into(), "Tidal throttled the probe".into());
+                    }
+                    status if status >= 500 => {
+                        return ("unknown".into(), format!("Tidal HTTP {}", status));
+                    }
+                    status => {
+                        return ("unknown".into(), format!("Tidal HTTP {}", status));
+                    }
                 }
-                401 => {
-                    return (
-                        "unknown".into(),
-                        "Tidal returned 401; token may need refresh".into(),
-                    );
-                }
-                403 => {
-                    return (
-                        "unknown".into(),
-                        "Tidal returned 403; account may be restricted".into(),
-                    );
-                }
-                429 => {
-                    AccountManager::pause_account(
-                        account,
-                        response
-                            .headers()
-                            .get(reqwest::header::RETRY_AFTER)
-                            .and_then(|v| v.to_str().ok()),
-                    );
-                    self.account_manager
-                        .mark_account_error(&account.id, "Tidal probe HTTP 429")
-                        .await;
-                    return ("unknown".into(), "Tidal throttled the probe".into());
-                }
-                status if status >= 500 => {
-                    return ("unknown".into(), format!("Tidal HTTP {}", status));
-                }
-                status => return ("unknown".into(), format!("Tidal HTTP {}", status)),
             }
         }
         if previews == PROBE_TRACK_IDS.len() {
@@ -964,6 +1018,62 @@ mod rate_limit_tests {
         let result = client.make_request(&format!("{base}/track"), None).await;
         server.abort();
         assert_eq!(result.unwrap()["data"]["title"], "ok");
+        assert_eq!(api_hits.load(Ordering::Relaxed), 2);
+        assert_eq!(auth_hits.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn full_probe_refreshes_once_after_401() {
+        use axum::{Json, http::HeaderMap, routing::post};
+        use serde_json::json;
+
+        let api_hits = Arc::new(AtomicUsize::new(0));
+        let auth_hits = Arc::new(AtomicUsize::new(0));
+        let calls = api_hits.clone();
+        let refreshes = auth_hits.clone();
+        let app = Router::new()
+            .route(
+                "/token",
+                post(move || {
+                    let refreshes = refreshes.clone();
+                    async move {
+                        refreshes.fetch_add(1, Ordering::Relaxed);
+                        Json(json!({"access_token":"fresh", "expires_in":3600}))
+                    }
+                }),
+            )
+            .route(
+                "/tracks/{id}/playbackinfo",
+                get(move |headers: HeaderMap| {
+                    let calls = calls.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::Relaxed);
+                        assert_eq!(headers["x-tidal-token"], "client");
+                        if headers["authorization"] == "Bearer fresh" {
+                            (StatusCode::OK, Json(json!({"assetPresentation":"FULL"})))
+                        } else {
+                            (StatusCode::UNAUTHORIZED, Json(json!({})))
+                        }
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (mut client, manager) = client_with_accounts(1).await;
+        let account = manager.list_accounts().await.remove(0);
+        let mut tm = TokenManager::new(None);
+        tm.token_url = format!("{base}/token");
+        tm.set_account_manager(manager);
+        tm.set_proxy_manager(client.proxy_manager.clone());
+        client.token_manager = Arc::new(tm);
+
+        let (status, reason) = client.probe_account_premium_at(&account, &base).await;
+        server.abort();
+        assert_eq!(status, "premium");
+        assert!(reason.is_empty());
         assert_eq!(api_hits.load(Ordering::Relaxed), 2);
         assert_eq!(auth_hits.load(Ordering::Relaxed), 1);
     }

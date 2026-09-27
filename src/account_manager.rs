@@ -59,7 +59,7 @@ pub struct AccountState {
     /// Temporary upstream 429 pause. Kept separate from account health so
     /// rate limiting never disables a valid credential.
     pub rate_limited_until: AtomicI64,
-    /// Result of the last manual FULL/PREVIEW probe; informational only.
+    /// Result of the latest automatic or manual FULL/PREVIEW probe; informational only.
     pub premium_status: RwLock<String>,
     pub premium_checked_at: AtomicI64,
     /// Last mutation unix timestamp (local admin ops AND Redis merges).

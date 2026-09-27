@@ -36,7 +36,7 @@ body { font-family:'SF Mono','Fira Code','Cascadia Code','JetBrains Mono',Menlo,
 .account-card:hover { border-color:#484f58; box-shadow:0 4px 24px rgba(0,0,0,0.3); }
 
 .card-header { display:flex; align-items:center; justify-content:space-between; padding:14px 20px; background:#1c2128; border-bottom:1px solid #30363d; flex-wrap:wrap; gap:10px; }
-.card-header .left { display:flex; align-items:center; gap:10px; min-width:0; }
+.card-header .left { display:flex; align-items:center; gap:10px; min-width:0; flex-wrap:wrap; }
 .acc-num { display:inline-flex; align-items:center; justify-content:center; min-width:22px; height:22px; padding:0 6px; border-radius:11px; background:#21262d; border:1px solid #30363d; color:#8b949e; font-size:11px; font-weight:700; flex-shrink:0; }
 .card-header .label { font-weight:600; font-size:14px; color:#f0f6fc; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 
@@ -109,6 +109,14 @@ body { font-family:'SF Mono','Fira Code','Cascadia Code','JetBrains Mono',Menlo,
 .status-label { font-size:11px; margin-left:6px; padding:2px 8px; border-radius:4px; font-weight:500; }
 .status-label.status-ok { color:#3fb950; background:rgba(63,185,80,0.1); }
 .status-label.status-err { color:#f85149; background:rgba(248,81,73,0.1); }
+.playback-access { display:inline-flex; align-items:center; gap:7px; min-height:28px; margin-left:4px; padding:4px 9px; border:1px solid; border-radius:7px; font-family:Inter,sans-serif; line-height:1; white-space:nowrap; }
+.playback-access .access-caption { font-size:9px; font-weight:700; letter-spacing:.55px; text-transform:uppercase; opacity:.72; }
+.playback-access strong { font-size:12px; letter-spacing:.25px; }
+.playback-access.access-full { color:#64df9b; background:rgba(46,160,103,.13); border-color:rgba(65,204,130,.38); box-shadow:inset 0 0 18px rgba(46,160,103,.04); }
+.playback-access.access-preview { color:#ffc766; background:rgba(210,153,34,.13); border-color:rgba(240,173,78,.4); box-shadow:inset 0 0 18px rgba(210,153,34,.04); }
+.playback-access.access-unknown { color:#9ba8b7; background:rgba(139,148,158,.08); border-color:rgba(139,148,158,.24); }
+.playback-access.access-catalog { color:#d2a8ff; background:rgba(210,168,255,.08); border-color:rgba(210,168,255,.25); }
+.access-check-time strong { font-weight:650; }
 
 .test-results-section { background:#161b22; border:1px solid #30363d; border-radius:10px; margin:24px 0; overflow:hidden; transition:border-color 0.2s, box-shadow 0.2s; }
 .test-results-section:hover { border-color:#484f58; box-shadow:0 4px 24px rgba(0,0,0,0.3); }
@@ -901,9 +909,34 @@ async function fetchData() {
                     : 'время неизвестно';
                 var uid = a.user_id || '-';
                 var catalogBadge = a.is_catalog ? '<span class="status-label" style="color:#d2a8ff;background:rgba(210,168,255,0.1)">Каталог</span>' : '';
-                var premiumLabel = a.premium_status === 'premium' ? 'FULL' : (a.premium_status === 'preview-only' ? 'PREVIEW' : 'Неизвестно');
-                var premiumColor = a.premium_status === 'premium' ? 'var(--green)' : (a.premium_status === 'preview-only' ? '#f0ad4e' : 'var(--muted)');
-                var premiumBadge = '<span class="status-label" style="color:' + premiumColor + '">' + premiumLabel + '</span>';
+                var premiumLabel, premiumClass, premiumDescription;
+                if (a.is_catalog) {
+                    premiumLabel = 'НЕ ПРИМЕНЯЕТСЯ';
+                    premiumClass = 'access-catalog';
+                    premiumDescription = 'Аккаунт используется только для каталога';
+                } else if (a.premium_status === 'premium') {
+                    premiumLabel = 'FULL';
+                    premiumClass = 'access-full';
+                    premiumDescription = 'Полное воспроизведение подтверждено';
+                } else if (a.premium_status === 'preview-only') {
+                    premiumLabel = 'PREVIEW';
+                    premiumClass = 'access-preview';
+                    premiumDescription = 'Доступны только фрагменты';
+                } else if (a.premium_checked_at) {
+                    premiumLabel = 'НЕ ОПРЕДЕЛЕНО';
+                    premiumClass = 'access-unknown';
+                    premiumDescription = 'Последняя проверка не дала точного результата';
+                } else {
+                    premiumLabel = 'НЕ ПРОВЕРЕНО';
+                    premiumClass = 'access-unknown';
+                    premiumDescription = 'Автоматическая проверка ещё не выполнялась';
+                }
+                var premiumBadge = '<span class="playback-access ' + premiumClass + '" title="' + esc(premiumDescription) + '"><span class="access-caption">Доступ к трекам</span><strong>' + premiumLabel + '</strong></span>';
+                var premiumCheckStat = a.is_catalog
+                    ? '<span class="card-stat access-check-time">FULL/PREVIEW <strong>для каталога не проверяется</strong></span>'
+                    : (a.premium_checked_at
+                        ? '<span class="card-stat access-check-time">Последняя FULL/PREVIEW проверка <strong>' + new Date(a.premium_checked_at * 1000).toLocaleString(adminLanguage === 'ru' ? 'ru-RU' : 'en-GB') + '</strong></span>'
+                        : '<span class="card-stat access-check-time">Автопроверка FULL/PREVIEW <strong>в течение 5 минут</strong></span>');
                 var catalogBtn = a.is_catalog
                     ? '<button class="btn" onclick="setCatalog(\'' + a.id + '\',false)" title="Вернуть в пул воспроизведения">Из каталога</button>'
                     : '<button class="btn" onclick="setCatalog(\'' + a.id + '\',true)" title="Использовать только для метаданных">В каталог</button>';
@@ -933,7 +966,7 @@ async function fetchData() {
                             (!a.is_active ? '<span class="card-stat">' + (a.auto_disabled ? 'Упал' : 'Отключён с') + ' <strong>' + disabledSince + '</strong></span>' +
                                 '<span class="card-stat">Спит <strong>' + (disabledAt ? sleepDuration(disabledAt) : '—') + '</strong></span>' : '') +
                             '<span class="card-stat">Токен <strong>' + tokenStr + '</strong></span>' +
-                            (a.premium_checked_at ? '<span class="card-stat">FULL/PREVIEW <strong>' + new Date(a.premium_checked_at * 1000).toLocaleString() + '</strong></span>' : '') +
+                            premiumCheckStat +
                             '<span class="card-stat test-badge" id="test-' + a.id + '" onclick="showTestDetails(\'' + a.id + '\')">Проверка <strong>—</strong></span>' +
                         '</div>' +
                     '</div>' +

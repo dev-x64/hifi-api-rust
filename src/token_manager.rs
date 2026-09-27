@@ -670,6 +670,11 @@ mod tests {
         active
             .token_expires_at
             .store(Utc::now().timestamp() + 100, Ordering::Relaxed);
+        for account in [&auto, &manual, &active] {
+            account
+                .premium_checked_at
+                .store(Utc::now().timestamp(), Ordering::Relaxed);
+        }
         let mut config = Config::from_env();
         config.use_proxies = false;
         let pm = Arc::new(ProxyManager::new(Arc::new(config), None));
@@ -682,7 +687,22 @@ mod tests {
             .set_discord_webhook_url(String::new(), None)
             .await
             .unwrap();
-        crate::autoheal::start_autoheal_loop(am, Arc::new(tm), pm, Notifier::new(settings)).await;
+        let tm = Arc::new(tm);
+        let tidal = Arc::new(crate::tidal_client::TidalClient::new(
+            pm.clone(),
+            tm.clone(),
+            am.clone(),
+            Notifier::new(settings.clone()),
+            Arc::new(Config::from_env()),
+        ));
+        crate::autoheal::start_autoheal_loop(
+            am,
+            tm,
+            pm,
+            tidal,
+            Notifier::new(settings),
+        )
+        .await;
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
                 if auto.is_active.load(Ordering::Relaxed)

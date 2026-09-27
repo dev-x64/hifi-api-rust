@@ -297,6 +297,7 @@ async fn main() {
         account_manager.clone(),
         token_manager.clone(),
         proxy_manager.clone(),
+        tidal_client.clone(),
         notifier.clone(),
     )
     .await;
