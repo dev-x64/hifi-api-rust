@@ -2,6 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use axum::Json;
@@ -90,6 +91,7 @@ pub struct LogEntry {
 pub struct RequestLog {
     entries: Mutex<VecDeque<LogEntry>>,
     requests_per_second: Mutex<VecDeque<(i64, u64)>>,
+    total_requests: AtomicU64,
 }
 
 impl RequestLog {
@@ -97,10 +99,12 @@ impl RequestLog {
         Self {
             entries: Mutex::new(VecDeque::with_capacity(MAX_ENTRIES)),
             requests_per_second: Mutex::new(VecDeque::with_capacity(RATE_WINDOW_SECONDS as usize)),
+            total_requests: AtomicU64::new(0),
         }
     }
 
     pub fn record(&self, entry: LogEntry) {
+        self.total_requests.fetch_add(1, Ordering::Relaxed);
         let timestamp = entry.ts;
         if let Ok(mut entries) = self.entries.lock() {
             if entries.len() >= MAX_ENTRIES {
@@ -116,6 +120,11 @@ impl RequestLog {
                 buckets.push_back((timestamp, 1));
             }
         }
+    }
+
+    /// Completed API requests recorded since this process started.
+    pub fn total_requests(&self) -> u64 {
+        self.total_requests.load(Ordering::Relaxed)
     }
 
     /// Completed API requests in the last 60 seconds, including the current second.
@@ -430,6 +439,7 @@ mod tests {
         }
 
         assert_eq!(log.snapshot().len(), 5000);
+        assert_eq!(log.total_requests(), 5002);
         assert_eq!(log.requests_last_60s(), 5001);
     }
 

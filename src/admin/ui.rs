@@ -882,11 +882,11 @@ async function fetchData() {
         window._accounts = accounts.accounts;
 
         document.getElementById('stats').innerHTML =
-            '<div class="stat-card" title="Входящие API-запросы в журнале, до 5000 последних; внутренние переключения аккаунтов не дублируют счётчик"><div class="label">Всего запросов · до 5000</div><div class="value">' + (stats.total_requests || 0) + '</div></div>' +
+            '<div class="stat-card" title="Входящие API-запросы с момента запуска сервера; внутренние переключения аккаунтов не дублируют счётчик"><div class="label">Всего запросов · с запуска</div><div class="value">' + (stats.total_requests || 0) + '</div></div>' +
             '<div class="stat-card" title="Среднее число завершённых API-запросов в секунду за последние 60 секунд"><div class="label">Запросов/с · 60 с</div><div class="value">' + Number(stats.requests_per_second_60s || 0).toFixed(2) + '</div></div>' +
             '<div class="stat-card" title="95% запросов в журнале (до 5000 последних) ответили не медленнее этого значения"><div class="label">p95 ответа · до 5000</div><div class="value">' + (stats.recent_p95_ms != null ? stats.recent_p95_ms + ' <span style="font-size:15px;color:var(--muted);font-weight:500">мс</span>' : '—') + '</div></div>' +
             '<div class="stat-card" title="Доля ответов HTTP 4xx/5xx среди входящих API-запросов в журнале, до 5000 последних"><div class="label">Доля ошибок · до 5000</div><div class="value">' + (stats.error_rate || '0.00%') + '</div></div>' +
-            '<div class="stat-card"><div class="label">Активные аккаунты</div><div class="value">' + (stats.healthy_accounts || 0) + '<span style="font-size:15px;color:var(--muted);font-weight:500"> / ' + (stats.total_accounts || 0) + '</span></div></div>' +
+            '<div class="stat-card" title="Действующий токен без паузы 429; для playback также требуется недавняя успешная FULL-проверка"><div class="label">Работают сейчас</div><div class="value">' + (stats.live_accounts || 0) + '<span style="font-size:15px;color:var(--muted);font-weight:500"> / ' + (stats.total_accounts || 0) + '</span></div><div style="font-size:11px;color:var(--muted);margin-top:5px"><span>Включено:</span> ' + (stats.active_accounts || 0) + '</div></div>' +
             playbackCard(stats.playback) +
             catalogCard(stats.catalog, accounts.accounts) +
             redisCard(stats.redis);
