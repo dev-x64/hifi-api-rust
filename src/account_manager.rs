@@ -51,6 +51,9 @@ pub struct AccountState {
     pub heal_next_retry: AtomicI64,
     /// Preferred OAuth client-authentication shape for the next attempt.
     pub auth_use_basic: AtomicBool,
+    /// Consecutive auth-endpoint 403 responses on the account's current proxy.
+    /// Four failures arm a proxy change for the next recovery cycle.
+    pub auth_forbidden_streak: AtomicU64,
     pub rejected_access_token: RwLock<Option<String>>,
     pub notes: RwLock<String>,
     pub last_used: AtomicI64,
@@ -94,7 +97,8 @@ impl AccountState {
             auto_disabled: AtomicBool::new(false),
             heal_failures: AtomicU64::new(0),
             heal_next_retry: AtomicI64::new(0),
-            auth_use_basic: AtomicBool::new(true),
+            auth_use_basic: AtomicBool::new(false),
+            auth_forbidden_streak: AtomicU64::new(0),
             rejected_access_token: RwLock::new(None),
             notes: RwLock::new(notes),
             last_used: AtomicI64::new(0),
@@ -136,9 +140,18 @@ impl AccountState {
             old.heal_next_retry.load(Ordering::Relaxed),
             Ordering::Relaxed,
         );
-        if new.client_id == old.client_id && new.client_secret == old.client_secret
-            && new.refresh_token() == old.refresh_token() {
-            new.auth_use_basic.store(old.auth_use_basic.load(Ordering::Relaxed), Ordering::Relaxed);
+        if new.client_id == old.client_id
+            && new.client_secret == old.client_secret
+            && new.refresh_token() == old.refresh_token()
+        {
+            new.auth_use_basic.store(
+                old.auth_use_basic.load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
+            new.auth_forbidden_streak.store(
+                old.auth_forbidden_streak.load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
             if let (Ok(src), Ok(mut dst)) = (old.access_token.try_read(), new.access_token.try_write()) {
                 *dst = src.clone();
             }
@@ -159,6 +172,7 @@ impl AccountState {
             new.token_expires_at.store(0, Ordering::Relaxed);
             new.heal_failures.store(0, Ordering::Relaxed);
             new.heal_next_retry.store(0, Ordering::Relaxed);
+            new.auth_forbidden_streak.store(0, Ordering::Relaxed);
         }
     }
 
@@ -813,6 +827,7 @@ impl AccountManager {
             if !disabled || !was_disabled {
                 account.heal_failures.store(0, Ordering::Relaxed);
                 account.heal_next_retry.store(0, Ordering::Relaxed);
+                account.auth_forbidden_streak.store(0, Ordering::Relaxed);
             }
             let now = Utc::now().timestamp();
             account.updated_at.store(now, Ordering::Relaxed);
@@ -848,6 +863,7 @@ impl AccountManager {
             account.auto_disabled.store(false, Ordering::Relaxed);
             account.heal_failures.store(0, Ordering::Relaxed);
             account.heal_next_retry.store(0, Ordering::Relaxed);
+            account.auth_forbidden_streak.store(0, Ordering::Relaxed);
             account.disabled_at.store(disabled_at, Ordering::Relaxed);
             account.updated_at.store(now, Ordering::Relaxed);
             if let Some(db) = &self.db {

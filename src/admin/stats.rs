@@ -7,14 +7,15 @@ use crate::error::AppError;
 
 pub async fn get_stats(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     let accounts = state.account_manager.list_accounts().await;
-    let total_requests: u64 = accounts
+    let total_account_attempts: u64 = accounts
         .iter()
         .map(|a| a.request_count.load(std::sync::atomic::Ordering::Relaxed))
         .sum();
-    let total_errors: u64 = accounts
+    let total_account_errors: u64 = accounts
         .iter()
         .map(|a| a.error_count.load(std::sync::atomic::Ordering::Relaxed))
         .sum();
+    let (total_requests, total_errors) = state.request_log.outcome_counts();
     let requests_per_second_60s = state.request_log.requests_last_60s() as f64 / 60.0;
     let recent_p95_ms = state.request_log.recent_p95_ms();
     let active_count = accounts
@@ -61,6 +62,8 @@ pub async fn get_stats(State(state): State<AppState>) -> Result<Json<Value>, App
     Ok(Json(json!({
         "total_requests": total_requests,
         "total_errors": total_errors,
+        "total_account_attempts": total_account_attempts,
+        "total_account_errors": total_account_errors,
         "error_rate": if total_requests > 0 {
             format!("{:.2}%", (total_errors as f64 / total_requests as f64) * 100.0)
         } else { "0.00%".into() },

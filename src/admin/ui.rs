@@ -389,7 +389,7 @@ button:focus-visible,input:focus-visible,select:focus-visible { outline:2px soli
     <div class="section-head"><div><h2>Системные настройки</h2><p>Интеграции, резервные копии и обслуживание.</p></div></div>
     <div class="system-grid">
       <div class="form-section"><h3>Настройки панели</h3><p class="form-copy">Язык интерфейса сохраняется в cookie этого браузера.</p><div class="form-group"><label for="panel-language">Язык интерфейса</label><select id="panel-language" class="select" style="width:100%;padding:10px 12px" onchange="setLanguage(this.value)"><option value="en">English</option><option value="ru">Русский</option></select></div></div>
-      <div class="form-section"><h3>Воспроизведение</h3><p class="form-copy">Настройки выбора формата и автоматического восстановления.</p><div class="form-group" style="margin-bottom:16px"><label>Формат по умолчанию</label><select id="rl-atmos" class="select" style="width:100%;padding:10px 12px"><option value="high">HIGH · AAC 320 kbps (v1)</option><option value="off">FLAC в приоритете</option><option value="prefer">Atmos в приоритете</option></select></div><p class="form-copy">Автовосстановление всегда включено. Отключённые вручную аккаунты остаются выключенными.</p><div class="section-actions"><button class="btn btn-primary" onclick="saveSettings()">Сохранить</button><button class="btn" id="clearPlaybackBtn" onclick="clearPlaybackQueue()">Очистить очередь</button></div></div>
+      <div class="form-section"><h3>Воспроизведение</h3><p class="form-copy">Настройки выбора формата и исходящих запросов к Tidal.</p><div class="form-group" style="margin-bottom:16px"><label>Формат по умолчанию</label><select id="rl-atmos" class="select" style="width:100%;padding:10px 12px"><option value="high">HIGH · AAC 320 kbps (v1)</option><option value="off">FLAC в приоритете</option><option value="prefer">Atmos в приоритете</option></select></div><div class="form-row"><div class="form-group"><label for="rl-track-requests">Запросов на аккаунт · треки</label><input type="number" id="rl-track-requests" min="1" max="10" value="1"></div><div class="form-group"><label for="rl-catalog-requests">Запросов на аккаунт · каталог</label><input type="number" id="rl-catalog-requests" min="1" max="10" value="1"></div></div><p class="form-copy">Лимит включает первую попытку. При ошибке сервис всё ещё может перейти на другой аккаунт; цепочка аккаунтов в журнале показывает такие переключения.</p><p class="form-copy">Автовосстановление всегда включено. Отключённые вручную аккаунты остаются выключенными.</p><div class="section-actions"><button class="btn btn-primary" onclick="saveSettings()">Сохранить</button><button class="btn" id="clearPlaybackBtn" onclick="clearPlaybackQueue()">Очистить очередь</button></div></div>
       <div class="form-section"><h3>Прокси</h3><p class="form-copy">Маршрутизация исходящих запросов. Изменения применяются сразу.</p><div class="card-stats" style="margin-bottom:16px"><span class="card-stat">Статус <strong id="px-status">—</strong></span><span class="card-stat">Назначено <strong id="px-current">—</strong></span><span class="card-stat">В пуле <strong id="px-pool">—</strong></span><span class="card-stat">Сбоев <strong id="px-fails">—</strong></span></div><div id="px-assignments" class="helper" style="white-space:pre-line;margin-bottom:16px"></div><div class="form-group"><label for="px-list">Адреса прокси · по одному в строке</label><textarea id="px-list" spellcheck="false" placeholder="http://user:password@host:port" oninput="proxyListDirty=true"></textarea></div><div class="section-actions" style="margin-top:12px"><button class="btn btn-primary" id="pxToggleBtn" onclick="toggleProxies()">Включить прокси</button><button class="btn" id="pxSaveBtn" onclick="saveProxyList()">Сохранить список</button></div><p class="helper" id="px-persist" style="margin-top:11px"></p></div>
       <div class="form-section"><h3>Уведомления</h3><p class="form-copy">Discord-оповещения о риске блокировки и недоступности аккаунтов.</p><div class="card-stats" style="margin-bottom:15px"><span class="card-stat">Discord <strong id="al-discord">—</strong></span></div><div class="form-group"><label for="al-webhook">URL вебхука Discord</label><input type="password" id="al-webhook" placeholder="https://discord.com/api/webhooks/…" autocomplete="new-password" spellcheck="false"></div><p class="helper" style="margin:8px 0 14px">Сохранённый URL скрыт. Введите новый, чтобы заменить его.</p><div class="section-actions" style="margin-bottom:15px"><button class="btn btn-primary" onclick="saveDiscordWebhook()" id="saveWebhookBtn">Сохранить вебхук</button><button class="btn btn-danger" onclick="disableDiscordWebhook()" id="disableWebhookBtn">Отключить вебхук</button></div><div class="section-actions"><button class="btn" onclick="testAlert()" id="alertTestBtn">Тест</button><button class="btn" onclick="sendReport('status')" id="reportStatusBtn">Статус</button><button class="btn" onclick="sendReport('accounts')" id="reportAccountsBtn">Аккаунты</button></div></div>
       <div class="form-section"><h3>Кэш</h3><p class="form-copy">Очистка безопасна, но первые ответы после неё могут быть медленнее.</p><div class="card-stats" style="margin-bottom:15px"><span class="card-stat">Попадания <strong id="cc-hits">—</strong></span><span class="card-stat">Промахи <strong id="cc-misses">—</strong></span><span class="card-stat">Устаревшие <strong id="cc-stale">—</strong></span><span class="card-stat">Отрицательные <strong id="cc-negative">—</strong></span></div><button class="btn" onclick="clearCache()" id="clearCacheBtn">Очистить кэш</button></div>
@@ -882,10 +882,10 @@ async function fetchData() {
         window._accounts = accounts.accounts;
 
         document.getElementById('stats').innerHTML =
-            '<div class="stat-card"><div class="label">Всего запросов</div><div class="value">' + (stats.total_requests || 0) + '</div></div>' +
+            '<div class="stat-card" title="Входящие API-запросы в журнале, до 5000 последних; внутренние переключения аккаунтов не дублируют счётчик"><div class="label">Всего запросов · до 5000</div><div class="value">' + (stats.total_requests || 0) + '</div></div>' +
             '<div class="stat-card" title="Среднее число завершённых API-запросов в секунду за последние 60 секунд"><div class="label">Запросов/с · 60 с</div><div class="value">' + Number(stats.requests_per_second_60s || 0).toFixed(2) + '</div></div>' +
             '<div class="stat-card" title="95% запросов в журнале (до 5000 последних) ответили не медленнее этого значения"><div class="label">p95 ответа · до 5000</div><div class="value">' + (stats.recent_p95_ms != null ? stats.recent_p95_ms + ' <span style="font-size:15px;color:var(--muted);font-weight:500">мс</span>' : '—') + '</div></div>' +
-            '<div class="stat-card"><div class="label">Доля ошибок</div><div class="value">' + (stats.error_rate || '0.00%') + '</div></div>' +
+            '<div class="stat-card" title="Доля ответов HTTP 4xx/5xx среди входящих API-запросов в журнале, до 5000 последних"><div class="label">Доля ошибок · до 5000</div><div class="value">' + (stats.error_rate || '0.00%') + '</div></div>' +
             '<div class="stat-card"><div class="label">Активные аккаунты</div><div class="value">' + (stats.healthy_accounts || 0) + '<span style="font-size:15px;color:var(--muted);font-weight:500"> / ' + (stats.total_accounts || 0) + '</span></div></div>' +
             playbackCard(stats.playback) +
             catalogCard(stats.catalog, accounts.accounts) +
@@ -1597,6 +1597,8 @@ async function loadSettings() {
         var d = await res.json();
         var r = d.settings || d.rate_limits || {};
         document.getElementById('rl-atmos').value = r.atmos_mode || 'off';
+        document.getElementById('rl-track-requests').value = r.track_requests_per_account || 1;
+        document.getElementById('rl-catalog-requests').value = r.catalog_requests_per_account || 1;
     } catch(e) {}
 }
 
@@ -1635,7 +1637,9 @@ async function importCredentials(e) {
 async function saveSettings() {
     var body = {
         settings: {
-            atmos_mode: document.getElementById('rl-atmos').value
+            atmos_mode: document.getElementById('rl-atmos').value,
+            track_requests_per_account: Number(document.getElementById('rl-track-requests').value || 1),
+            catalog_requests_per_account: Number(document.getElementById('rl-catalog-requests').value || 1)
         }
     };
     try {
@@ -1647,6 +1651,8 @@ async function saveSettings() {
             var d = await res.json();
             var r = d.settings || d.rate_limits || {};
             document.getElementById('rl-atmos').value = r.atmos_mode || 'off';
+            document.getElementById('rl-track-requests').value = r.track_requests_per_account || 1;
+            document.getElementById('rl-catalog-requests').value = r.catalog_requests_per_account || 1;
         } else {
             var d = await res.json();
             document.getElementById('error').textContent = d.detail || 'Error saving settings';

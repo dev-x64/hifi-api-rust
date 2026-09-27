@@ -269,6 +269,7 @@ async fn main() {
         account_manager.clone(),
         notifier.clone(),
         config.clone(),
+        settings.clone(),
     ));
 
     let state = AppState {

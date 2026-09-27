@@ -69,9 +69,9 @@ Commit `Cargo.toml` and the updated `Cargo.lock` together. The API response, sta
 
 Token renewal and auto-heal are always enabled. Legacy `AUTO_HEAL` and persisted `auto_heal` settings are ignored. Recovery retries use backoff and respect `Retry-After`; manually disabled accounts stay off.
 
-Refresh uses the account's assigned proxy and a separate HTTP/1.1 auth client. API connections negotiate HTTP normally. Requests have connect/read/total deadlines of 5/15/25 seconds; each refresh operation has a 45-second deadline. The background worker checks accounts every 30 seconds after its previous pass, with up to four concurrent renewals. Temporary auth failures back off from roughly 30 seconds to one hour; explicit OAuth credential errors start at five minutes. Revoked credentials can still require reauthorization.
+Refresh uses the account's assigned proxy and a separate HTTP/1.1 auth client. API connections negotiate HTTP normally. Requests have connect/read/total deadlines of 5/15/25 seconds; each refresh operation has a 45-second deadline, and at most two account refreshes contact auth concurrently. The first recovery cycle makes up to four attempts for transient `403`, `408`, `425`, `429`, selected `5xx`, and network failures, using roughly `1.5 → 3 → 6` second delays with jitter and honoring `Retry-After`. Later recovery cycles send one probe per pause. Temporary auth failures then back off from roughly 30 seconds to one hour; explicit OAuth credential errors start at five minutes. Revoked credentials can still require reauthorization.
 
-Legacy URL-encoded client secrets are normalized when loaded/imported. Store raw secrets (`=` rather than `%3D`); request builders perform the required wire encoding. Rotated refresh tokens are persisted. After an auth 403 or `invalid_client`, the next scheduled attempt can try the alternate Basic/form authentication shape without an immediate retry burst.
+Legacy URL-encoded client secrets are normalized when loaded/imported. Store raw secrets (`=` rather than `%3D`); request builders perform the required wire encoding. Rotated refresh tokens are persisted. Auth starts with client credentials in the form body and alternates body/Basic only after a `403`; successful form choice is reused. Four consecutive auth `403` responses keep the current account-to-IP affinity for the complete fast cycle, then move that account to a different proxy before its next recovery probe. `429`, `5xx`, and network failures do not change the OAuth form.
 
 New device-authorized accounts keep the same client ID and secret that issued their refresh token. The access token returned by device authorization is cached immediately. Existing accounts are not rewritten automatically because imported credentials may legitimately belong to another client; reauthorize an old setup-created account to adopt the corrected pairing.
 
@@ -92,7 +92,7 @@ Copy [`.env.example`](.env.example) for the full list. Values saved in the admin
 | `ATMOS_MODE` | `prefer` | Default playback mode: `prefer`, `off`, or `high`. The admin setting and `?atmos=` can override it. |
 | `USE_PROXIES`, `PROXIES_FILE` | `false`, `proxies.txt` | Initial outbound proxy setting and proxy list. Editable in admin and persisted with SQLite. |
 | `FALLBACK_TO_DIRECT_CONNECTION` | `false` | Use the host connection when no proxy works. This exposes the host IP to Tidal. |
-| `MAX_RETRIES`, `ROTATE_PROXIES_ON_REFRESH` | `2`, `false` | Proxy retry count and whether to rotate on token refresh. |
+| `ROTATE_PROXIES_ON_REFRESH` | `false` | Whether to rotate an account's proxy on token refresh. |
 | `TRUST_PROXY_HEADERS` | `true` | Use `X-Forwarded-For` and `X-Real-IP` to identify clients. Enable only behind a trusted reverse proxy that replaces client-supplied forwarding headers; set `false` for direct access. |
 | `DISCORD_WEBHOOK_URL` | Empty | Initial Discord webhook for account and outage alerts. Admin → System → Notifications can replace or disable it without a restart; the saved value persists in SQLite and shared Redis when enabled. The panel never returns the saved URL. |
 | `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN` | Empty | Optional shared state across instances using Upstash REST. |
@@ -100,6 +100,8 @@ Copy [`.env.example`](.env.example) for the full list. Values saved in the admin
 | `RUST_LOG` | `info` | Log filter. |
 
 `USER_AGENT` and `DEV_MODE` configure upstream HTTP requests and diagnostics. See `.env.example` for their defaults. `PUBLIC_POOL_REDIS_URL` is a deprecated fallback for `REDIS_POOL`.
+
+The maximum number of upstream requests made on one account is configured live in Admin → System, independently for track playback and catalog metadata. Both default to `1` and persist in SQLite (and shared Redis when enabled).
 
 ### Proxies
 

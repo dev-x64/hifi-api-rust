@@ -12,6 +12,7 @@ use crate::config::Config;
 use crate::error::AppError;
 use crate::notifier::Notifier;
 use crate::proxy_manager::ProxyManager;
+use crate::settings::AppSettings;
 use crate::token_manager::TokenManager;
 
 pub struct TidalClient {
@@ -20,6 +21,7 @@ pub struct TidalClient {
     account_manager: Arc<AccountManager>,
     notifier: Arc<Notifier>,
     config: Arc<Config>,
+    settings: Arc<AppSettings>,
     catalog_rate_limited_until: AtomicI64,
 }
 
@@ -49,6 +51,7 @@ impl TidalClient {
         account_manager: Arc<AccountManager>,
         notifier: Arc<Notifier>,
         config: Arc<Config>,
+        settings: Arc<AppSettings>,
     ) -> Self {
         Self {
             proxy_manager,
@@ -56,6 +59,7 @@ impl TidalClient {
             account_manager,
             notifier,
             config,
+            settings,
             catalog_rate_limited_until: AtomicI64::new(0),
         }
     }
@@ -105,8 +109,14 @@ impl TidalClient {
         params: Option<Vec<(&str, &str)>>,
         preferred_account: Option<Arc<AccountState>>,
     ) -> Result<Value, AppError> {
-        self.make_request_with_limit(url, params, preferred_account, None)
-            .await
+        self.make_request_with_limit(
+            url,
+            params,
+            preferred_account,
+            None,
+            self.settings.track_requests_per_account(),
+        )
+        .await
     }
 
     async fn make_request_with_limit(
@@ -115,12 +125,9 @@ impl TidalClient {
         params: Option<Vec<(&str, &str)>>,
         preferred_account: Option<Arc<AccountState>>,
         account_limit: Option<usize>,
+        requests_per_account: u32,
     ) -> Result<Value, AppError> {
-        let max_retries = if self.proxy_manager.proxies_enabled() {
-            self.config.max_retries.max(1)
-        } else {
-            1
-        };
+        let requests_per_account = requests_per_account.max(1);
 
         let mut failed_ids: Vec<String> = Vec::new();
         let account_count = self.account_manager.playback_count().await;
@@ -183,7 +190,7 @@ impl TidalClient {
             let mut http = self.working_client_for(&account.id).await?;
 
             let mut refreshed_after_401 = false;
-            for attempt in 0..(max_retries + 1) {
+            for attempt in 0..requests_per_account {
                 let token = match self.token_manager.get_token(&account, &http).await {
                     Ok(t) => t,
                     Err(e @ AppError::RateLimited(_)) => {
@@ -259,17 +266,23 @@ impl TidalClient {
                 match status.as_u16() {
                     401 => {
                         if !refreshed_after_401 {
-                            refreshed_after_401 = true;
-                            match self.token_manager.refresh_after_unauthorized(&account, &http, &token).await {
-                                Ok(_) => continue,
-                                Err(e @ AppError::RateLimited(_)) => {
-                                    schedule_rate_limit_fallback(
-                                        account_try, &account.id, e, &mut first_rate_limit_try,
-                                        &mut failed_ids, &mut last_account_error,
-                                    )?;
-                                    break;
+                            if attempt + 1 < requests_per_account {
+                                refreshed_after_401 = true;
+                                match self.token_manager.refresh_after_unauthorized(&account, &http, &token).await {
+                                    Ok(_) => continue,
+                                    Err(e @ AppError::RateLimited(_)) => {
+                                        schedule_rate_limit_fallback(
+                                            account_try, &account.id, e, &mut first_rate_limit_try,
+                                            &mut failed_ids, &mut last_account_error,
+                                        )?;
+                                        break;
+                                    }
+                                    Err(e) => last_account_error = Some(e),
                                 }
-                                Err(e) => last_account_error = Some(e),
+                            } else {
+                                last_account_error = Some(AppError::Unauthorized(
+                                    "Tidal rejected token; per-account request limit prevented refresh retry".into(),
+                                ));
                             }
                         } else {
                             TokenManager::reject_refreshed_token(&account, &token).await;
@@ -304,7 +317,7 @@ impl TidalClient {
                         break;
                     }
                     403 => {
-                        if attempt < max_retries - 1 {
+                        if attempt + 1 < requests_per_account {
                             continue;
                         }
                         self.account_manager
@@ -321,7 +334,7 @@ impl TidalClient {
                     }
                     _ => {
                         if !status.is_success() {
-                            if attempt < max_retries - 1 && status.as_u16() >= 500 {
+                            if attempt + 1 < requests_per_account && status.as_u16() >= 500 {
                                 continue;
                             }
                             self.account_manager
@@ -579,7 +592,13 @@ impl TidalClient {
         }
         if let Some(previous_429) = rate_limit_error {
             return match self
-                .make_request_with_limit(url, Some(params), None, Some(1))
+                .make_request_with_limit(
+                    url,
+                    Some(params),
+                    None,
+                    Some(1),
+                    self.settings.catalog_requests_per_account(),
+                )
                 .await
             {
                 Ok(wrapped) => Ok(wrapped.get("data").cloned().unwrap_or(Value::Null)),
@@ -588,7 +607,13 @@ impl TidalClient {
             };
         }
         // No catalog configured (or it failed): normal pool request.
-        self.make_request(url, Some(params))
+        self.make_request_with_limit(
+            url,
+            Some(params),
+            None,
+            None,
+            self.settings.catalog_requests_per_account(),
+        )
             .await
             .map(|wrapped| wrapped.get("data").cloned().unwrap_or(Value::Null))
     }
@@ -673,7 +698,8 @@ impl TidalClient {
         }
         let mut http = self.working_client_for(&account.id).await?;
         let mut token = self.token_manager.get_token(account, &http).await?;
-        for attempt in 0..2 {
+        let requests_per_account = self.settings.catalog_requests_per_account().max(1);
+        for attempt in 0..requests_per_account {
             if let Some(seconds) = AccountManager::rate_limit_remaining(account) {
                 return Err(AppError::RateLimited(seconds));
             }
@@ -716,14 +742,19 @@ impl TidalClient {
                     .await;
                 return Err(AppError::RateLimited(seconds));
             }
-            if status.as_u16() == 401 && attempt == 0 {
+            if status.as_u16() == 401 && attempt + 1 < requests_per_account {
                 token = self.token_manager.refresh_after_unauthorized(account, &http, &token).await?;
                 continue;
             }
-            if status.as_u16() == 401 {
+            if status.as_u16() == 401 && attempt > 0 {
                 TokenManager::reject_refreshed_token(account, &token).await;
             }
             if !status.is_success() {
+                if attempt + 1 < requests_per_account
+                    && (status.as_u16() == 403 || status.as_u16() >= 500)
+                {
+                    continue;
+                }
                 return Err(AppError::UpstreamError(
                     status,
                     "Catalog account request failed".into(),
@@ -968,18 +999,28 @@ mod rate_limit_tests {
                 Ordering::Relaxed,
             );
         }
+        let settings = Arc::new(AppSettings::from_env());
+        // Keep the existing auth-refresh coverage explicit: it needs a
+        // second upstream request on the same account.
+        settings
+            .apply(&serde_json::json!({
+                "track_requests_per_account": 2,
+                "catalog_requests_per_account": 2
+            }))
+            .unwrap();
         let client = TidalClient::new(
             Arc::new(ProxyManager::new(config.clone(), None)),
             Arc::new(TokenManager::new(None)),
             manager.clone(),
-            Notifier::new(Arc::new(AppSettings::from_env())),
+            Notifier::new(settings.clone()),
             config,
+            settings,
         );
         (client, manager)
     }
 
     #[tokio::test]
-    async fn api_401_refreshes_and_retries_even_with_one_attempt_budget() {
+    async fn api_401_refreshes_when_two_requests_are_allowed() {
         use serde_json::json;
         use axum::{Json, http::HeaderMap, routing::post};
         let api_hits = Arc::new(AtomicUsize::new(0));
@@ -1088,6 +1129,76 @@ mod rate_limit_tests {
         let result = client.make_request(&url, None).await;
         server.abort();
         assert!(matches!(result, Err(AppError::NotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn track_request_limit_controls_same_account_retries() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let calls = hits.clone();
+        let app = Router::new().route(
+            "/track",
+            get(move || {
+                let calls = calls.clone();
+                async move {
+                    if calls.fetch_add(1, Ordering::Relaxed) < 2 {
+                        (StatusCode::BAD_GATEWAY, "{}")
+                    } else {
+                        (StatusCode::OK, "{\"title\":\"ok\"}")
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let url = format!("http://{}/track", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (client, _) = client_with_accounts(1).await;
+        client
+            .settings
+            .apply(&serde_json::json!({"track_requests_per_account": 3}))
+            .unwrap();
+
+        let result = client.make_request(&url, None).await;
+        server.abort();
+        assert_eq!(result.unwrap()["data"]["title"], "ok");
+        assert_eq!(hits.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn catalog_request_limit_controls_same_account_retries() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let calls = hits.clone();
+        let app = Router::new().route(
+            "/catalog",
+            get(move || {
+                let calls = calls.clone();
+                async move {
+                    if calls.fetch_add(1, Ordering::Relaxed) < 2 {
+                        (StatusCode::BAD_GATEWAY, "{}")
+                    } else {
+                        (StatusCode::OK, "{\"title\":\"ok\"}")
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let url = format!("http://{}/catalog", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (client, manager) = client_with_accounts(1).await;
+        let account = manager.list_accounts().await.remove(0);
+        manager.set_account_catalog(&account.id, true).await.unwrap();
+        client
+            .settings
+            .apply(&serde_json::json!({"catalog_requests_per_account": 3}))
+            .unwrap();
+
+        let result = client.catalog_get(&url, vec![]).await;
+        server.abort();
+        assert_eq!(result.unwrap()["title"], "ok");
+        assert_eq!(hits.load(Ordering::Relaxed), 3);
     }
 
     #[tokio::test]

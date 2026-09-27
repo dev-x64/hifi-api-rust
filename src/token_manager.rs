@@ -7,7 +7,7 @@ use moka::future::Cache;
 use reqwest::Client;
 use serde_json::Value;
 use sqlx::SqlitePool;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 
 use crate::account_manager::{AccountManager, AccountState};
 use crate::error::AppError;
@@ -15,6 +15,18 @@ use crate::proxy_manager::ProxyManager;
 use crate::upstash::UpstashStore;
 
 const TOKEN_URL: &str = "https://auth.tidal.com/v1/oauth2/token";
+const AUTH_INITIAL_ATTEMPTS: usize = 4;
+const AUTH_RETRY_BASE_MS: u64 = 1_500;
+const AUTH_RETRY_MAX_MS: u64 = 20_000;
+const AUTH_FORBIDDEN_ROTATE_THRESHOLD: u64 = 4;
+const AUTH_CONCURRENCY: usize = 2;
+
+struct TokenAttemptFailure {
+    error: AppError,
+    retryable: bool,
+    retry_after: u64,
+    forbidden: bool,
+}
 
 pub(crate) fn oauth_basic_component(value: &str) -> String {
     form_urlencoded::byte_serialize(value.as_bytes()).collect()
@@ -26,6 +38,7 @@ pub struct TokenManager {
     account_manager: OnceLock<Arc<AccountManager>>,
     proxy_manager: OnceLock<Arc<ProxyManager>>,
     upstash: OnceLock<Arc<UpstashStore>>,
+    auth_slots: Semaphore,
     #[cfg(test)]
     pub(crate) token_url: String,
 }
@@ -41,6 +54,7 @@ impl TokenManager {
             account_manager: OnceLock::new(),
             proxy_manager: OnceLock::new(),
             upstash: OnceLock::new(),
+            auth_slots: Semaphore::new(AUTH_CONCURRENCY),
             #[cfg(test)]
             token_url: TOKEN_URL.into(),
         }
@@ -200,15 +214,25 @@ impl TokenManager {
             return Ok(token);
         }
 
-        // Bound proxy resolution, network I/O and persistence. One sick account
-        // cannot hold a worker (or the per-account refresh lock) indefinitely.
-        let result =
-            tokio::time::timeout(Duration::from_secs(45), self.request_token(account, client))
-                .await;
+        // Keep simultaneous account recoveries from turning a shared auth/IP
+        // problem into a burst. Per-account refreshes are already coalesced by
+        // the lock above.
+        let _auth_slot = self
+            .auth_slots
+            .acquire()
+            .await
+            .expect("auth semaphore open");
+        // Bound the complete fast-retry cycle, proxy resolution and persistence.
+        let result = tokio::time::timeout(
+            Duration::from_secs(45),
+            self.request_token_cycle(account, client),
+        )
+        .await;
         match result {
             Ok(Ok(token)) => {
                 account.heal_failures.store(0, Ordering::Relaxed);
                 account.heal_next_retry.store(0, Ordering::Relaxed);
+                account.auth_forbidden_streak.store(0, Ordering::Relaxed);
                 Ok(token)
             }
             result => {
@@ -248,7 +272,7 @@ impl TokenManager {
         }
     }
 
-    async fn request_token(
+    async fn request_token_cycle(
         &self,
         account: &AccountState,
         fallback: &Client,
@@ -257,6 +281,18 @@ impl TokenManager {
         let http = if let Some(pm) = self.proxy_manager.get() {
             if pm.should_rotate_on_refresh() {
                 pm.rotate_account(&account.id).await;
+                account.auth_forbidden_streak.store(0, Ordering::Relaxed);
+            } else if pm.proxies_enabled()
+                && account.auth_forbidden_streak.load(Ordering::Relaxed)
+                    >= AUTH_FORBIDDEN_ROTATE_THRESHOLD
+            {
+                tracing::warn!(
+                    account = %account.label,
+                    failures = account.auth_forbidden_streak.load(Ordering::Relaxed),
+                    "Rotating account proxy after repeated Tidal auth 403 responses"
+                );
+                pm.rotate_account(&account.id).await;
+                account.auth_forbidden_streak.store(0, Ordering::Relaxed);
             }
             client = pm.working_auth_client_for(&account.id).await?;
             &client
@@ -264,6 +300,62 @@ impl TokenManager {
             fallback
         };
 
+        let attempts = if account.heal_failures.load(Ordering::Relaxed) == 0 {
+            AUTH_INITIAL_ATTEMPTS
+        } else {
+            1
+        };
+        let mut use_basic = account.auth_use_basic.load(Ordering::Relaxed);
+        let mut last_error = None;
+        for attempt in 0..attempts {
+            match self.request_token_once(account, http, use_basic).await {
+                Ok(token) => {
+                    account.auth_use_basic.store(use_basic, Ordering::Relaxed);
+                    account.auth_forbidden_streak.store(0, Ordering::Relaxed);
+                    return Ok(token);
+                }
+                Err(failure) => {
+                    if failure.forbidden {
+                        account
+                            .auth_forbidden_streak
+                            .fetch_add(1, Ordering::Relaxed);
+                        use_basic = !use_basic;
+                        account.auth_use_basic.store(use_basic, Ordering::Relaxed);
+                    } else {
+                        account.auth_forbidden_streak.store(0, Ordering::Relaxed);
+                    }
+                    let is_last = attempt + 1 == attempts;
+                    let long_retry_after =
+                        failure.retry_after.saturating_mul(1_000) > AUTH_RETRY_MAX_MS;
+                    if !failure.retryable || is_last || long_retry_after {
+                        return Err(failure.error);
+                    }
+                    let delay = auth_retry_delay(attempt, failure.retry_after);
+                    tracing::warn!(
+                        account = %account.label,
+                        attempt = attempt + 1,
+                        max_attempts = attempts,
+                        retry_in_ms = delay.as_millis(),
+                        next_form = if use_basic { "basic" } else { "body" },
+                        "Tidal token refresh attempt failed: {}",
+                        failure.error
+                    );
+                    last_error = Some(failure.error);
+                    sleep_auth_retry(delay).await;
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            AppError::ServiceUnavailable("No token refresh attempt completed".into())
+        }))
+    }
+
+    async fn request_token_once(
+        &self,
+        account: &AccountState,
+        http: &Client,
+        use_basic: bool,
+    ) -> Result<String, TokenAttemptFailure> {
         let old_refresh = account.refresh_token();
         // RFC 6749 section 2.3.1: form-encode each Basic component exactly once.
         // Stored secrets are raw (legacy %3D is normalized at account ingestion).
@@ -271,7 +363,6 @@ impl TokenManager {
         let url = TOKEN_URL;
         #[cfg(test)]
         let url = self.token_url.as_str();
-        let use_basic = account.auth_use_basic.load(Ordering::Relaxed);
         let mut fields = vec![
             ("client_id", account.client_id.as_str()),
             ("refresh_token", old_refresh.as_str()),
@@ -303,7 +394,13 @@ impl TokenManager {
                         pm.note_failure_for(&account.id).await;
                     }
                 }
-                return Err(e.into());
+                let retryable = e.is_connect() || e.is_timeout();
+                return Err(TokenAttemptFailure {
+                    error: e.into(),
+                    retryable,
+                    retry_after: 0,
+                    forbidden: false,
+                });
             }
         };
         let status = response.status();
@@ -313,46 +410,70 @@ impl TokenManager {
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
         if status.as_u16() == 429 {
-            return Err(AppError::RateLimited(AccountManager::pause_account(
-                account,
-                retry_after.as_deref(),
-            )));
+            let seconds = AccountManager::pause_account(account, retry_after.as_deref());
+            return Err(TokenAttemptFailure {
+                error: AppError::RateLimited(seconds),
+                retryable: true,
+                retry_after: seconds,
+                forbidden: false,
+            });
         }
         let data: Value = response.json().await.unwrap_or_default();
         if !status.is_success() {
             let oauth_error = data.get("error").and_then(Value::as_str).unwrap_or("");
-            // Try the other OAuth shape on the NEXT scheduled attempt, never
-            // a burst of auth calls. Neither shape is universal across clients.
-            if status.as_u16() == 403 || oauth_error == "invalid_client" {
-                account.auth_use_basic.store(!use_basic, Ordering::Relaxed);
-            }
             if matches!(status.as_u16(), 400 | 401)
                 && matches!(oauth_error, "invalid_grant" | "invalid_client")
             {
-                return Err(AppError::Unauthorized(format!("Tidal OAuth {oauth_error}")));
+                return Err(TokenAttemptFailure {
+                    error: AppError::Unauthorized(format!("Tidal OAuth {oauth_error}")),
+                    retryable: false,
+                    retry_after: 0,
+                    forbidden: false,
+                });
             }
-            if retry_after.is_some() {
-                return Err(AppError::ServiceUnavailableRetry(
+            let retry_after_secs = retry_after
+                .as_deref()
+                .map(|value| AccountManager::retry_after_secs(Some(value)))
+                .unwrap_or(0);
+            let error = if retry_after.is_some() {
+                AppError::ServiceUnavailableRetry(
                     format!("Tidal auth HTTP {status}"),
-                    AccountManager::retry_after_secs(retry_after.as_deref()),
-                ));
-            }
-            return Err(AppError::UpstreamError(
-                status,
-                format!("Tidal auth HTTP {status}"),
-            ));
+                    retry_after_secs,
+                )
+            } else {
+                AppError::UpstreamError(status, format!("Tidal auth HTTP {status}"))
+            };
+            return Err(TokenAttemptFailure {
+                error,
+                retryable: matches!(
+                    status.as_u16(),
+                    403 | 408 | 425 | 429 | 500 | 502 | 503 | 504
+                ),
+                retry_after: retry_after_secs,
+                forbidden: status.as_u16() == 403,
+            });
         }
         let token = data
             .get("access_token")
             .and_then(Value::as_str)
             .filter(|t| !t.is_empty())
-            .ok_or_else(|| AppError::Internal("Empty access_token in auth response".into()))?
+            .ok_or_else(|| TokenAttemptFailure {
+                error: AppError::Internal("Empty access_token in auth response".into()),
+                retryable: false,
+                retry_after: 0,
+                forbidden: false,
+            })?
             .to_string();
         let expires_in = data
             .get("expires_in")
             .and_then(Value::as_i64)
             .filter(|n| *n > 0)
-            .ok_or_else(|| AppError::Internal("Invalid expires_in in auth response".into()))?;
+            .ok_or_else(|| TokenAttemptFailure {
+                error: AppError::Internal("Invalid expires_in in auth response".into()),
+                retryable: false,
+                retry_after: 0,
+                forbidden: false,
+            })?;
         let expires_at = Utc::now()
             .timestamp()
             .saturating_add(expires_in)
@@ -365,10 +486,13 @@ impl TokenManager {
         // Serialize credential persistence with account replacement/deletion.
         if let Some(am) = self.account_manager.get() {
             am.store_refreshed_credentials(account, &old_refresh, rotated, &token, expires_at)
-                .await?;
+                .await
+                .map_err(non_retryable_attempt)?;
         } else {
             if let Some(db) = &self.db {
-                persist_token(db, account, &old_refresh, rotated, &token, expires_at).await?;
+                persist_token(db, account, &old_refresh, rotated, &token, expires_at)
+                    .await
+                    .map_err(non_retryable_attempt)?;
             }
             if let Some(rotated) = rotated {
                 account.replace_refresh_token(rotated.into());
@@ -389,6 +513,43 @@ impl TokenManager {
                 .await;
         }
         Ok(token)
+    }
+}
+
+fn non_retryable_attempt(error: AppError) -> TokenAttemptFailure {
+    TokenAttemptFailure {
+        error,
+        retryable: false,
+        retry_after: 0,
+        forbidden: false,
+    }
+}
+
+fn auth_retry_delay(attempt: usize, retry_after: u64) -> Duration {
+    let exponent = u32::try_from(attempt).unwrap_or(u32::MAX).min(8);
+    let base_ms = AUTH_RETRY_BASE_MS
+        .saturating_mul(1_u64 << exponent)
+        .min(AUTH_RETRY_MAX_MS);
+    let jitter_max = (base_ms / 4).min(1_000);
+    let jitter_ms = if jitter_max == 0 {
+        0
+    } else {
+        rand::random::<u64>() % (jitter_max + 1)
+    };
+    Duration::from_millis(
+        base_ms
+            .saturating_add(jitter_ms)
+            .max(retry_after.saturating_mul(1_000)),
+    )
+}
+
+async fn sleep_auth_retry(delay: Duration) {
+    #[cfg(not(test))]
+    tokio::time::sleep(delay).await;
+    #[cfg(test)]
+    {
+        let _ = delay;
+        tokio::time::sleep(Duration::from_millis(1)).await;
     }
 }
 
@@ -426,9 +587,9 @@ mod tests {
     use axum::{
         Json, Router,
         http::{HeaderMap, StatusCode},
+        response::IntoResponse,
         routing::post,
     };
-    use base64::Engine;
     use std::sync::atomic::AtomicUsize;
 
     struct MockAuth {
@@ -444,21 +605,38 @@ mod tests {
     }
     impl MockAuth {
         async fn new(status: StatusCode, body: Value) -> Self {
+            Self::with_retry_after(status, body, None).await
+        }
+
+        async fn with_retry_after(
+            status: StatusCode,
+            body: Value,
+            retry_after: Option<&str>,
+        ) -> Self {
             let calls = Arc::new(AtomicUsize::new(0));
             let requests = Arc::new(Mutex::new(Vec::new()));
             let handler_calls = calls.clone();
             let handler_requests = requests.clone();
+            let retry_after = retry_after.map(str::to_string);
             let app = Router::new().route(
                 "/token",
                 post(move |headers: HeaderMap, request: String| {
                     let calls = handler_calls.clone();
                     let requests = handler_requests.clone();
                     let body = body.clone();
+                    let retry_after = retry_after.clone();
                     async move {
                         calls.fetch_add(1, Ordering::Relaxed);
                         requests.lock().await.push((headers, request));
                         tokio::time::sleep(Duration::from_millis(20)).await;
-                        (status, [("Retry-After", "120")], Json(body))
+                        let mut response = (status, Json(body)).into_response();
+                        if let Some(value) = retry_after {
+                            response.headers_mut().insert(
+                                reqwest::header::RETRY_AFTER,
+                                value.parse().unwrap(),
+                            );
+                        }
+                        response
                     }
                 }),
             );
@@ -556,26 +734,16 @@ mod tests {
         assert_eq!(restored.access_token.read().await.as_deref(), Some("new"));
         let requests = mock.requests.lock().await;
         let (headers, body) = &requests[0];
-        let basic = headers["authorization"]
-            .to_str()
-            .unwrap()
-            .strip_prefix("Basic ")
-            .unwrap();
-        assert_eq!(
-            base64::engine::general_purpose::STANDARD
-                .decode(basic)
-                .unwrap(),
-            b"client:secret%3D"
-        );
+        assert!(!headers.contains_key("authorization"));
         let fields: std::collections::HashMap<_, _> = form_urlencoded::parse(body.as_bytes())
             .into_owned()
             .collect();
         assert_eq!(fields["refresh_token"], "refresh+old=");
-        assert!(!fields.contains_key("client_secret"));
+        assert_eq!(fields["client_secret"], "secret=");
     }
 
     #[tokio::test]
-    async fn transient_403_preserves_valid_access_and_backs_off_before_alternate_form() {
+    async fn transient_403_uses_four_fast_alternating_attempts_then_backs_off() {
         let mock = MockAuth::new(StatusCode::FORBIDDEN, Value::Null).await;
         let (am, account) = account().await;
         let mut tm = TokenManager::new(None);
@@ -587,13 +755,34 @@ mod tests {
         assert!(!account.auto_disabled.load(Ordering::Relaxed));
         assert_eq!(tm.get_token(&account, &client).await.unwrap(), "old");
         assert!(tm.refresh_token(&account, &client).await.is_err());
-        assert_eq!(mock.calls.load(Ordering::Relaxed), 1);
-        assert!(account.heal_next_retry.load(Ordering::Relaxed) >= Utc::now().timestamp() + 119);
+        assert_eq!(mock.calls.load(Ordering::Relaxed), AUTH_INITIAL_ATTEMPTS);
+        assert_eq!(
+            account.auth_forbidden_streak.load(Ordering::Relaxed),
+            AUTH_FORBIDDEN_ROTATE_THRESHOLD
+        );
+        assert!(account.heal_next_retry.load(Ordering::Relaxed) >= Utc::now().timestamp() + 29);
+        {
+            let requests = mock.requests.lock().await;
+            assert_eq!(requests.len(), AUTH_INITIAL_ATTEMPTS);
+            for (index, (headers, body)) in requests.iter().enumerate() {
+                if index % 2 == 0 {
+                    assert!(!headers.contains_key("authorization"));
+                    assert!(body.contains("client_secret=secret%3D"));
+                } else {
+                    assert!(headers.contains_key("authorization"));
+                    assert!(!body.contains("client_secret"));
+                }
+            }
+        }
         account.heal_next_retry.store(0, Ordering::Relaxed);
         assert!(tm.refresh_token(&account, &client).await.is_err());
         assert_eq!(account.heal_failures.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            mock.calls.load(Ordering::Relaxed),
+            AUTH_INITIAL_ATTEMPTS + 1
+        );
         let requests = mock.requests.lock().await;
-        let (headers, body) = &requests[1];
+        let (headers, body) = &requests[AUTH_INITIAL_ATTEMPTS];
         assert!(!headers.contains_key("authorization"));
         assert!(body.contains("client_secret=secret%3D"));
         assert!(!body.contains("%253D"));
@@ -629,7 +818,12 @@ mod tests {
 
     #[tokio::test]
     async fn auth_429_does_not_disable_account_or_retry_immediately() {
-        let mock = MockAuth::new(StatusCode::TOO_MANY_REQUESTS, Value::Null).await;
+        let mock = MockAuth::with_retry_after(
+            StatusCode::TOO_MANY_REQUESTS,
+            Value::Null,
+            Some("120"),
+        )
+        .await;
         let (am, account) = account().await;
         let mut tm = TokenManager::new(None);
         tm.token_url = mock.url.clone();
@@ -694,6 +888,7 @@ mod tests {
             am.clone(),
             Notifier::new(settings.clone()),
             Arc::new(Config::from_env()),
+            settings.clone(),
         ));
         crate::autoheal::start_autoheal_loop(
             am,

@@ -157,6 +157,19 @@ impl RequestLog {
             .unwrap_or_default()
     }
 
+    /// Client-visible API outcomes in the bounded request log. Account
+    /// failovers are deliberately counted once, as one incoming request.
+    pub fn outcome_counts(&self) -> (u64, u64) {
+        self.entries
+            .lock()
+            .map(|entries| {
+                let total = entries.len() as u64;
+                let errors = entries.iter().filter(|entry| entry.status >= 400).count() as u64;
+                (total, errors)
+            })
+            .unwrap_or((0, 0))
+    }
+
     pub fn summary(&self, limit: usize) -> Value {
         let entries = self.snapshot();
         let total = entries.len();
@@ -429,6 +442,17 @@ mod tests {
             log.record(entry(now, latency));
         }
         assert_eq!(log.recent_p95_ms(), Some(95));
+    }
+
+    #[test]
+    fn outcome_counts_each_incoming_request_once() {
+        let log = RequestLog::new();
+        let now = chrono::Utc::now().timestamp();
+        log.record(entry(now, 10));
+        let mut failed = entry(now, 20);
+        failed.status = 409;
+        log.record(failed);
+        assert_eq!(log.outcome_counts(), (2, 1));
     }
 
     #[test]

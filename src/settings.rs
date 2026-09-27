@@ -10,6 +10,11 @@ pub struct AppSettings {
     /// off (FLAC) | prefer (Atmos) | high (AAC 320 kbps).
     /// Query param `atmos=` overrides per request.
     pub atmos_mode: RwLock<String>,
+    /// Maximum number of upstream playback requests made with one selected
+    /// account before falling over to another account.
+    track_requests_per_account: RwLock<u32>,
+    /// Same limit for metadata requests made with a catalog account.
+    catalog_requests_per_account: RwLock<u32>,
     /// Secret: never include this in API snapshots or logs.
     discord_webhook_url: RwLock<String>,
     /// Shared cross-instance state (None = single-host mode, skip sync).
@@ -20,6 +25,8 @@ impl AppSettings {
     pub fn from_env() -> Self {
         Self {
             atmos_mode: RwLock::new(default_atmos_mode()),
+            track_requests_per_account: RwLock::new(1),
+            catalog_requests_per_account: RwLock::new(1),
             discord_webhook_url: RwLock::new(
                 std::env::var("DISCORD_WEBHOOK_URL").unwrap_or_default(),
             ),
@@ -42,7 +49,23 @@ impl AppSettings {
         json!({
             "auto_heal": true,
             "atmos_mode": self.atmos_mode.read().map(|v| v.clone()).unwrap_or_else(|_| "prefer".to_string()),
+            "track_requests_per_account": self.track_requests_per_account(),
+            "catalog_requests_per_account": self.catalog_requests_per_account(),
         })
+    }
+
+    pub fn track_requests_per_account(&self) -> u32 {
+        *self
+            .track_requests_per_account
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn catalog_requests_per_account(&self) -> u32 {
+        *self
+            .catalog_requests_per_account
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     pub fn discord_webhook_url(&self) -> String {
@@ -84,6 +107,18 @@ impl AppSettings {
             if let Ok(mut w) = self.atmos_mode.write() {
                 *w = normalize_atmos_mode(&v);
             }
+        }
+        if let Some(v) = first_opt_u32(updates, "track_requests_per_account")? {
+            *self
+                .track_requests_per_account
+                .write()
+                .unwrap_or_else(|e| e.into_inner()) = normalize_requests_per_account(v);
+        }
+        if let Some(v) = first_opt_u32(updates, "catalog_requests_per_account")? {
+            *self
+                .catalog_requests_per_account
+                .write()
+                .unwrap_or_else(|e| e.into_inner()) = normalize_requests_per_account(v);
         }
         Ok(())
     }
@@ -127,12 +162,33 @@ impl AppSettings {
                     .write()
                     .unwrap_or_else(|e| e.into_inner()) = value.to_string();
             }
+            "track_requests_per_account" => {
+                if let Ok(value) = value.parse::<u32>() {
+                    *self
+                        .track_requests_per_account
+                        .write()
+                        .unwrap_or_else(|e| e.into_inner()) = normalize_requests_per_account(value);
+                }
+            }
+            "catalog_requests_per_account" => {
+                if let Ok(value) = value.parse::<u32>() {
+                    *self
+                        .catalog_requests_per_account
+                        .write()
+                        .unwrap_or_else(|e| e.into_inner()) = normalize_requests_per_account(value);
+                }
+            }
             _ => {}
         }
     }
 
     /// Setting names mirrored to Redis (same keys as the SQLite table).
-    const REDIS_SETTING_NAMES: &'static [&'static str] = &["atmos_mode", "discord_webhook_url"];
+    const REDIS_SETTING_NAMES: &'static [&'static str] = &[
+        "atmos_mode",
+        "discord_webhook_url",
+        "track_requests_per_account",
+        "catalog_requests_per_account",
+    ];
 
     /// Canonical (key, value) snapshot, shared by the SQLite and Redis writers.
     fn settings_entries(&self) -> Vec<(String, String)> {
@@ -145,6 +201,14 @@ impl AppSettings {
                     .unwrap_or_else(|_| "prefer".to_string()),
             ),
             ("discord_webhook_url", self.discord_webhook_url()),
+            (
+                "track_requests_per_account",
+                self.track_requests_per_account().to_string(),
+            ),
+            (
+                "catalog_requests_per_account",
+                self.catalog_requests_per_account().to_string(),
+            ),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v))
@@ -262,6 +326,26 @@ fn default_atmos_mode() -> String {
     }
 }
 
+fn normalize_requests_per_account(value: u32) -> u32 {
+    value.clamp(1, 10)
+}
+
+fn first_opt_u32(obj: &Value, key: &str) -> Result<Option<u32>, String> {
+    match obj.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(value)) => value
+            .as_u64()
+            .and_then(|value| u32::try_from(value).ok())
+            .map(Some)
+            .ok_or_else(|| format!("{} must be an integer", key)),
+        Some(Value::String(value)) => value
+            .parse::<u32>()
+            .map(Some)
+            .map_err(|_| format!("{} must be an integer", key)),
+        Some(_) => Err(format!("{} must be an integer", key)),
+    }
+}
+
 fn first_opt_string(obj: &Value, keys: &[&str]) -> Result<Option<String>, String> {
     for key in keys {
         match obj.get(key) {
@@ -332,6 +416,28 @@ mod tests {
         assert_eq!(normalize_atmos_mode("off"), "off");
         assert_eq!(normalize_atmos_mode("HIGH"), "high");
         assert_eq!(normalize_atmos_mode("banana"), "off");
+    }
+
+    #[test]
+    fn per_account_request_limits_are_independent_and_bounded() {
+        let settings = AppSettings::from_env();
+        settings
+            .apply(&serde_json::json!({
+                "track_requests_per_account": 3,
+                "catalog_requests_per_account": 7
+            }))
+            .unwrap();
+        assert_eq!(settings.track_requests_per_account(), 3);
+        assert_eq!(settings.catalog_requests_per_account(), 7);
+
+        settings
+            .apply(&serde_json::json!({
+                "track_requests_per_account": 0,
+                "catalog_requests_per_account": 99
+            }))
+            .unwrap();
+        assert_eq!(settings.track_requests_per_account(), 1);
+        assert_eq!(settings.catalog_requests_per_account(), 10);
     }
 
     #[test]

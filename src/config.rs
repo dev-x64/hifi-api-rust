@@ -11,7 +11,6 @@ pub struct Config {
     pub trust_proxy: bool,
     pub proxies_file: PathBuf,
     pub fallback_to_direct: bool,
-    pub max_retries: u32,
     pub api_version: String,
     /// Upstream User-Agent (upstream: USER_AGENT, default okhttp/5.3.2).
     pub user_agent: String,
@@ -49,7 +48,6 @@ impl std::fmt::Debug for Config {
             .field("trust_proxy", &self.trust_proxy)
             .field("proxies_file", &self.proxies_file)
             .field("fallback_to_direct", &self.fallback_to_direct)
-            .field("max_retries", &self.max_retries)
             .field("api_version", &self.api_version)
             .field("user_agent", &self.user_agent)
             .field("dev_mode", &self.dev_mode)
@@ -89,11 +87,6 @@ impl Config {
             .unwrap_or_default()
             .to_lowercase()
             == "true";
-        let max_retries = std::env::var("MAX_RETRIES")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(2)
-            .max(1);
         let user_agent = std::env::var("USER_AGENT").unwrap_or_else(|_| "okhttp/5.3.2".into());
         let dev_mode = env_flag("DEV_MODE", false);
         let rotate_proxies_on_refresh = env_flag("ROTATE_PROXIES_ON_REFRESH", false);
@@ -133,7 +126,6 @@ impl Config {
             trust_proxy,
             proxies_file,
             fallback_to_direct,
-            max_retries,
             api_version: env!("CARGO_PKG_VERSION").into(),
             user_agent,
             dev_mode,
