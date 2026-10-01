@@ -65,6 +65,8 @@ pub struct AccountState {
     /// Result of the latest automatic or manual FULL/PREVIEW probe; informational only.
     pub premium_status: RwLock<String>,
     pub premium_checked_at: AtomicI64,
+    /// Original insertion time. Used to keep the admin account list stable.
+    pub created_at: AtomicI64,
     /// Last mutation unix timestamp (local admin ops AND Redis merges).
     /// Drives newest-wins convergence across instances.
     pub updated_at: AtomicI64,
@@ -107,6 +109,7 @@ impl AccountState {
             rate_limited_until: AtomicI64::new(0),
             premium_status: RwLock::new("unknown".to_string()),
             premium_checked_at: AtomicI64::new(0),
+            created_at: AtomicI64::new(0),
             updated_at: AtomicI64::new(0),
         }
     }
@@ -122,6 +125,10 @@ impl AccountState {
             .store(old.error_count.load(Ordering::Relaxed), Ordering::Relaxed);
         new.rate_limited_until.store(
             old.rate_limited_until.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        new.created_at.store(
+            old.created_at.load(Ordering::Relaxed),
             Ordering::Relaxed,
         );
         new.token_expires_at.store(
@@ -214,6 +221,7 @@ pub struct DbAccountRow {
     pub access_token: Option<String>,
     pub expires_at: Option<i64>,
     pub updated_at: Option<i64>,
+    pub created_at: i64,
 }
 
 /// Extract a numeric user id from an auto-generated "Tidal Account (<id>)" label.
@@ -315,7 +323,7 @@ impl AccountManager {
         let rows: Vec<DbAccountRow> = sqlx::query_as::<_, DbAccountRow>(
             "SELECT a.id, a.label, a.client_id, a.client_secret, a.refresh_token,
              a.user_id, a.is_active, a.auto_disabled, a.disabled_at, a.is_catalog, a.notes,
-             t.access_token, t.expires_at, a.updated_at
+             t.access_token, t.expires_at, a.updated_at, a.created_at
              FROM accounts a
              LEFT JOIN tokens t ON t.account_id = a.id
              ORDER BY a.created_at ASC",
@@ -372,6 +380,9 @@ impl AccountManager {
                     state.token_expires_at.store(expires, Ordering::Relaxed);
                 }
             }
+            state
+                .created_at
+                .store(row.created_at, Ordering::Relaxed);
             state
                 .updated_at
                 .store(row.updated_at.unwrap_or(0), Ordering::Relaxed);
@@ -434,6 +445,7 @@ impl AccountManager {
                 .await?;
         }
 
+        state.created_at.store(now, Ordering::Relaxed);
         state.updated_at.store(now, Ordering::Relaxed);
         self.accounts.write().await.push(state.clone());
         self.push_account_to_redis(&state).await;
@@ -948,6 +960,7 @@ impl AccountManager {
             "auto_disabled": acc.auto_disabled.load(Ordering::Relaxed),
             "is_catalog": acc.is_catalog.load(Ordering::Relaxed),
             "notes": acc.notes.read().await.clone(),
+            "created_at": acc.created_at.load(Ordering::Relaxed),
             "updated_at": acc.updated_at.load(Ordering::Relaxed),
         })
         .to_string()
@@ -1002,6 +1015,12 @@ impl AccountManager {
                 let str_field =
                     |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
                 let remote_updated = v.get("updated_at").and_then(|x| x.as_i64()).unwrap_or(0);
+                let remote_created = v
+                    .get("created_at")
+                    .and_then(|x| x.as_i64())
+                    .filter(|ts| *ts > 0)
+                    .or_else(|| (remote_updated > 0).then_some(remote_updated))
+                    .unwrap_or_else(|| Utc::now().timestamp());
                 let user_id = v
                     .get("user_id")
                     .and_then(|x| x.as_str())
@@ -1084,9 +1103,9 @@ impl AccountManager {
                     if is_catalog {
                         state.is_catalog.store(true, Ordering::Relaxed);
                     }
+                    state.created_at.store(remote_created, Ordering::Relaxed);
                     state.updated_at.store(remote_updated, Ordering::Relaxed);
                     if let Some(db) = &self.db {
-                        let now = Utc::now().timestamp();
                         let _ = sqlx::query(
                             "INSERT INTO accounts (id, label, client_id, client_secret, refresh_token,
                              user_id, is_active, auto_disabled, disabled_at, is_catalog, notes, created_at, updated_at)
@@ -1104,7 +1123,7 @@ impl AccountManager {
                         .bind(disabled_at)
                         .bind(is_catalog as i32)
                         .bind(&notes)
-                        .bind(now)
+                        .bind(remote_created)
                         .bind(remote_updated)
                         .execute(db)
                         .await;
@@ -1286,6 +1305,7 @@ mod tests {
             true,
             "note".into(),
         );
+        acc.created_at.store(12300, Ordering::Relaxed);
         acc.updated_at.store(12345, Ordering::Relaxed);
         let raw = super::AccountManager::account_to_json(&acc).await;
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
@@ -1297,6 +1317,7 @@ mod tests {
         assert_eq!(v["user_id"], "977");
         assert_eq!(v["is_active"], true);
         assert_eq!(v["notes"], "note");
+        assert_eq!(v["created_at"], 12300);
         assert_eq!(v["updated_at"], 12345);
     }
 

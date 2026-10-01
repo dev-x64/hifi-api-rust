@@ -280,6 +280,8 @@ button:focus-visible,input:focus-visible,select:focus-visible { outline:2px soli
 .search-wrap input { width:100%; height:38px; background:#0e1319; border:1px solid var(--line); border-radius:9px; color:var(--text); padding:0 12px 0 36px; }
 .search-wrap svg { position:absolute; left:12px; top:10px; width:17px; color:#667281; }
 .helper { color:var(--muted); font-size:11px; line-height:1.5; }
+.account-summary { display:inline-flex; align-items:center; gap:7px; min-height:38px; padding:0 12px; border:1px solid var(--line); border-radius:9px; background:#0e1319; color:var(--muted); font-size:12px; white-space:nowrap; }
+.account-summary strong { color:var(--green); font-size:13px; }
 .auth-error { min-height:20px; color:#ff8e8e; font-size:12px; margin-top:10px; }
 .mobile-bar,.sidebar-scrim { display:none; }
 .overlay { background:rgba(3,5,8,.75); }
@@ -370,7 +372,7 @@ button:focus-visible,input:focus-visible,select:focus-visible { outline:2px soli
 
   <section id="view-accounts" class="view">
     <div class="section-head"><div><h2>Tidal-аккаунты</h2><p>Управляйте пулом воспроизведения, токенами и каталогом.</p></div><div class="section-actions"><button class="btn" onclick="testAll()" id="testAllBtn">Проверить все</button><button class="btn btn-primary" onclick="openAddAccount()">+ Добавить</button></div></div>
-    <div class="toolbar"><div class="search-wrap"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg><input id="accountSearch" type="search" placeholder="Найти аккаунт..." oninput="filterAccounts(this.value)"></div><div class="helper" id="accountCount">Загрузка…</div></div>
+    <div class="toolbar"><div class="search-wrap"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg><input id="accountSearch" type="search" placeholder="Найти аккаунт..." oninput="filterAccounts(this.value)"></div><div class="account-summary" id="accountCount"><span class="status-dot status-ok"></span><span>Работают</span><strong>— из —</strong></div></div>
     <div id="accounts-container" class="accounts-grid"></div>
     <div class="test-results-section" id="testResultsSection" style="display:none"><div class="test-results-header"><h3>Результаты проверки</h3><div class="test-summary" id="testSummary"></div></div><div class="test-results-body" id="testResultsList"></div></div>
   </section>
@@ -974,7 +976,9 @@ async function fetchData() {
             }
         }
         document.getElementById('accounts-container').innerHTML = html;
-        document.getElementById('accountCount').textContent = accounts.accounts.length + ' ' + plural(accounts.accounts.length, 'аккаунт', 'аккаунта', 'аккаунтов');
+        var liveAccounts = Number(stats.live_accounts || 0);
+        var totalAccounts = Number(stats.total_accounts || accounts.accounts.length || 0);
+        document.getElementById('accountCount').innerHTML = '<span class="status-dot status-ok"></span><span>Работают</span><strong>' + liveAccounts + ' из ' + totalAccounts + '</strong>';
         filterAccounts(document.getElementById('accountSearch').value);
         renderTestResults(_testResults);
         return true;

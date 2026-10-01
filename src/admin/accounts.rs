@@ -13,6 +13,16 @@ use crate::error::AppError;
 
 static TEST_CACHE: Mutex<Option<(i64, Value)>> = Mutex::new(None);
 
+fn sort_accounts_by_created_at(
+    accounts: &mut [std::sync::Arc<crate::account_manager::AccountState>],
+) {
+    accounts.sort_by(|a, b| {
+        let a_created = a.created_at.load(std::sync::atomic::Ordering::Relaxed);
+        let b_created = b.created_at.load(std::sync::atomic::Ordering::Relaxed);
+        a_created.cmp(&b_created).then_with(|| a.id.cmp(&b.id))
+    });
+}
+
 #[derive(Deserialize)]
 pub struct AddAccountRequest {
     pub label: Option<String>,
@@ -34,7 +44,8 @@ pub struct ToggleAccountRequest {
 }
 
 pub async fn list_accounts(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
-    let accounts = state.account_manager.list_accounts().await;
+    let mut accounts = state.account_manager.list_accounts().await;
+    sort_accounts_by_created_at(&mut accounts);
     let mut list: Vec<Value> = Vec::with_capacity(accounts.len());
     for a in &accounts {
         list.push(json!({
@@ -57,6 +68,7 @@ pub async fn list_accounts(State(state): State<AppState>) -> Result<Json<Value>,
             "last_used": a.last_used.load(std::sync::atomic::Ordering::Relaxed),
             "premium_status": a.premium_status.read().await.clone(),
             "premium_checked_at": a.premium_checked_at.load(std::sync::atomic::Ordering::Relaxed),
+            "created_at": a.created_at.load(std::sync::atomic::Ordering::Relaxed),
             "notes": a.notes.read().await.clone(),
         }));
     }
@@ -529,5 +541,42 @@ pub async fn test_account(
                 "is_active": is_active,
             })))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sort_accounts_by_created_at;
+    use crate::account_manager::AccountState;
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    fn account(id: &str, created_at: i64) -> Arc<AccountState> {
+        let account = Arc::new(AccountState::new(
+            id.into(),
+            id.into(),
+            "client".into(),
+            "secret".into(),
+            "refresh".into(),
+            None,
+            true,
+            String::new(),
+        ));
+        account.created_at.store(created_at, Ordering::Relaxed);
+        account
+    }
+
+    #[test]
+    fn accounts_are_sorted_by_oldest_creation_date_first() {
+        let mut accounts = vec![
+            account("newest", 300),
+            account("oldest", 100),
+            account("middle", 200),
+        ];
+
+        sort_accounts_by_created_at(&mut accounts);
+
+        let ids: Vec<&str> = accounts.iter().map(|account| account.id.as_str()).collect();
+        assert_eq!(ids, vec!["oldest", "middle", "newest"]);
     }
 }
