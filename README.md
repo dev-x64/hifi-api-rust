@@ -55,6 +55,8 @@ The server listens on `0.0.0.0:8000` by default; use `HOST` and `PORT` to change
 
 You may instead provide `CLIENT_ID`, `REFRESH_TOKEN`, and optionally `CLIENT_SECRET` and `USER_ID` in `.env`. When the database has no playback accounts, these values create a default account. Keep refresh tokens and `ADMIN_KEY` out of version control.
 
+Each account card shows availability over the last seven days, with up/down durations and an availability percentage for the observed period. This tracks the last known enabled/disabled pool status, including manual disabling and automatic OAuth rejection/recovery; it is not a continuous upstream connectivity check. History starts when monitoring is introduced, and earlier time is shown as unknown. SQLite preserves history across restarts and backups; ephemeral mode retains it only until restart. Status changes adopted from Redis are recorded when observed locally.
+
 ### Changing the version
 
 Set the version in `Cargo.toml` under `[package]`. Cargo updates the generated `Cargo.lock` when you build or run `cargo check`:

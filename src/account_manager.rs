@@ -30,6 +30,7 @@ impl Default for SwitchingWeights {
 }
 
 pub struct AccountState {
+    uptime: OnceLock<Arc<Mutex<crate::account_uptime::AccountUptime>>>,
     pub id: String,
     pub label: String,
     pub client_id: String,
@@ -85,6 +86,7 @@ impl AccountState {
         notes: String,
     ) -> Self {
         Self {
+            uptime: OnceLock::new(),
             id,
             label,
             client_id,
@@ -117,6 +119,7 @@ impl AccountState {
     /// Copy live counters from `old` into a rebuilt state, so admin
     /// edits and cross-instance merges never wipe stats or tokens.
     pub fn carry_over(new: &AccountState, old: &AccountState) {
+        let _ = new.uptime.set(old.uptime_history().clone());
         new.last_used
             .store(old.last_used.load(Ordering::Relaxed), Ordering::Relaxed);
         new.request_count
@@ -181,6 +184,14 @@ impl AccountState {
             new.heal_next_retry.store(0, Ordering::Relaxed);
             new.auth_forbidden_streak.store(0, Ordering::Relaxed);
         }
+    }
+
+    fn uptime_history(&self) -> &Arc<Mutex<crate::account_uptime::AccountUptime>> {
+        self.uptime.get_or_init(|| Arc::new(Mutex::new(Default::default())))
+    }
+
+    pub async fn uptime_summary(&self, now: i64) -> crate::account_uptime::UptimeSummary {
+        self.uptime_history().lock().await.summary(now)
     }
 
     pub fn refresh_token(&self) -> String {
@@ -314,6 +325,28 @@ impl AccountManager {
         self.upstash.get().cloned()
     }
 
+    async fn observe_uptime(&self, account: &AccountState) {
+        let mut history = account.uptime_history().lock().await;
+        if let Err(error) = history.observe(
+            self.db.as_ref(),
+            &account.id,
+            account.is_active.load(Ordering::Relaxed),
+            Utc::now().timestamp(),
+        ).await {
+            tracing::warn!(account = %account.id, "Could not persist account uptime: {error}");
+        }
+    }
+
+    async fn load_uptime(&self, account: &AccountState) -> Result<(), sqlx::Error> {
+        if let Some(db) = &self.db {
+            *account.uptime_history().lock().await = crate::account_uptime::AccountUptime::load(
+                db, &account.id, Utc::now().timestamp(),
+            ).await?;
+        }
+        self.observe_uptime(account).await;
+        Ok(())
+    }
+
     pub async fn load_from_db(&self) -> Result<(), AppError> {
         let db = match &self.db {
             Some(db) => db,
@@ -386,6 +419,7 @@ impl AccountManager {
             state
                 .updated_at
                 .store(row.updated_at.unwrap_or(0), Ordering::Relaxed);
+            self.load_uptime(&state).await?;
             accounts.push(state);
         }
 
@@ -447,6 +481,7 @@ impl AccountManager {
 
         state.created_at.store(now, Ordering::Relaxed);
         state.updated_at.store(now, Ordering::Relaxed);
+        self.observe_uptime(&state).await;
         self.accounts.write().await.push(state.clone());
         self.push_account_to_redis(&state).await;
         if let Some(proxy_manager) = self.proxy_manager.get() {
@@ -878,6 +913,7 @@ impl AccountManager {
             account.auth_forbidden_streak.store(0, Ordering::Relaxed);
             account.disabled_at.store(disabled_at, Ordering::Relaxed);
             account.updated_at.store(now, Ordering::Relaxed);
+            self.observe_uptime(account).await;
             if let Some(db) = &self.db {
                 sqlx::query("UPDATE accounts SET is_active = ?, auto_disabled = 0, disabled_at = ?, updated_at = ? WHERE id = ?")
                     .bind(active as i32)
@@ -916,6 +952,7 @@ impl AccountManager {
         let disabled_at = if disabled_at == 1 { now } else { disabled_at };
         account.disabled_at.store(disabled_at, Ordering::Relaxed);
         account.updated_at.store(now, Ordering::Relaxed);
+        self.observe_uptime(account).await;
         if let Some(db) = &self.db {
             sqlx::query("UPDATE accounts SET is_active = ?, auto_disabled = ?, disabled_at = ?, updated_at = ? WHERE id = ?")
                 .bind(!disabled as i32).bind(disabled as i32).bind(disabled_at).bind(now).bind(&account.id)
@@ -1081,6 +1118,7 @@ impl AccountManager {
                         .execute(db)
                         .await;
                     }
+                    self.observe_uptime(&rebuilt).await;
                     accounts[pos] = rebuilt;
                 } else {
                     // Unknown locally: restore into SQLite (survives the next
@@ -1136,6 +1174,9 @@ impl AccountManager {
                         .await;
                     }
                     tracing::info!("Restored account {} from Redis backup", state.label);
+                    if let Err(error) = self.load_uptime(&state).await {
+                        tracing::warn!(account = %state.id, "Could not load account uptime: {error}");
+                    }
                     accounts.push(state);
                     restored_ids.push(id.clone());
                 }
@@ -1601,6 +1642,35 @@ mod tests {
         assert_eq!(restored.disabled_at.load(Ordering::Relaxed), disabled_at);
         reloaded.set_account_active(&account.id, true).await.unwrap();
         assert_eq!(restored.disabled_at.load(Ordering::Relaxed), 0);
+
+        let states: Vec<bool> = sqlx::query_scalar(
+            "SELECT is_active FROM account_uptime_events WHERE account_id = ? ORDER BY id",
+        )
+        .bind(&account.id)
+        .fetch_all(&db)
+        .await
+        .unwrap();
+        assert_eq!(states, vec![true, false, true]);
+
+        // System failures and recovery use the same history as manual toggles.
+        assert!(reloaded.set_system_disabled(&restored, true).await.unwrap());
+        reloaded.update_account(&account.id, Some("renamed".into()), None, None, None, None)
+            .await.unwrap();
+        let edited = reloaded.get_account_by_id(&account.id).await.unwrap();
+        assert!(std::sync::Arc::ptr_eq(restored.uptime_history(), edited.uptime_history()));
+        assert!(reloaded.set_system_disabled(&edited, false).await.unwrap());
+        let states: Vec<bool> = sqlx::query_scalar(
+            "SELECT is_active FROM account_uptime_events WHERE account_id = ? ORDER BY id",
+        )
+        .bind(&account.id)
+        .fetch_all(&db)
+        .await
+        .unwrap();
+        assert_eq!(states, vec![true, false, true, false, true]);
+        reloaded.remove_account(&account.id).await.unwrap();
+        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM account_uptime_events")
+            .fetch_one(&db).await.unwrap();
+        assert_eq!(remaining, 0);
 
         db.close().await;
         std::fs::remove_file(path).unwrap();

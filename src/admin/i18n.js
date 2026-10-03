@@ -1,6 +1,13 @@
 // The existing markup and renderers use Russian source strings. Keep their
 // originals so switching languages never translates an already translated text.
 var ruToEn = {
+    'Аптайм · последние 7 дней': 'Uptime · last 7 days',
+    'Работал': 'Up',
+    'Простой': 'Down',
+    'Доступность': 'Availability',
+    'Процент за период с известным статусом': 'Percentage of the period with a known status',
+    'По последнему известному статусу в пуле. Ручное и автоматическое отключение считаются простоем.': 'Based on the last known pool status. Manual and automatic disabling count as downtime.',
+    'До начала наблюдения история недоступна.': 'History before monitoring began is unavailable.',
     'Ключ администратора': 'Admin key',
     'Войти': 'Sign in',
     'Панель управления': 'Admin panel',
@@ -419,6 +426,7 @@ function setLanguage(language) {
     var select = document.getElementById('panel-language');
     if (select) select.value = adminLanguage;
     localizeTree(document.body);
+    if (typeof refreshUptimeCharts === 'function') refreshUptimeCharts();
 }
 
 function initLanguage() {

@@ -208,6 +208,11 @@ pub async fn restore_backup(
         .execute(&mut *tx)
         .await
         .map_err(|e| AppError::Internal(format!("Restore failed: {}", e)))?;
+    // Old backups have no uptime table: start fresh rather than keep unrelated history.
+    sqlx::query("DELETE FROM account_uptime_events")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AppError::Internal(format!("Restore failed: {}", e)))?;
     for (table, cols) in [
         (
             "accounts",
@@ -247,6 +252,10 @@ pub async fn restore_backup(
                 ("last_error_at", NullableInt),
                 ("last_error_message", NullableText),
             ][..],
+        ),
+        (
+            "account_uptime_events",
+            &[("id", Int), ("account_id", Text), ("observed_at", Int), ("is_active", Int)][..],
         ),
         (
             "api_keys",

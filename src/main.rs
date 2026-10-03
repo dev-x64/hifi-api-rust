@@ -1,4 +1,5 @@
 mod account_manager;
+mod account_uptime;
 mod admin;
 mod api_keys;
 mod autoheal;

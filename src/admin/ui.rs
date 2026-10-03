@@ -53,6 +53,22 @@ body { font-family:'SF Mono','Fira Code','Cascadia Code','JetBrains Mono',Menlo,
 .card-stats { display:flex; gap:14px; flex-wrap:wrap; }
 .card-stat { font-size:11px; color:#8b949e; white-space:nowrap; }
 .card-stat strong { color:#c9d1d9; }
+.account-uptime { padding:16px 20px; border-top:1px solid #30363d; }
+.uptime-heading { display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px; margin-bottom:12px; font-size:12px; color:#8b949e; }
+.uptime-heading strong { color:#c9d1d9; }
+.uptime-chart,.uptime-dates { display:grid; grid-template-columns:repeat(7,minmax(0,1fr)); gap:4px; }
+.uptime-day { display:flex; height:20px; overflow:hidden; border-radius:3px; background:#30363d; }
+.uptime-day:focus-visible { outline:2px solid #7c6cff; outline-offset:2px; }
+.uptime-span { height:100%; flex-shrink:0; }
+.uptime-up { background:#3fb950; }
+.uptime-down { background:#f85149; }
+.uptime-unknown { background:repeating-linear-gradient(135deg,#30363d,#30363d 4px,#3c444f 4px,#3c444f 8px); }
+.uptime-dates { margin-top:6px; color:#8b949e; font-size:10px; }
+.uptime-totals { display:flex; flex-wrap:wrap; gap:8px 18px; margin-top:12px; color:#8b949e; font-size:11px; }
+.uptime-totals span { display:inline-flex; align-items:center; gap:6px; }
+.uptime-totals strong { color:#c9d1d9; }
+.uptime-key { display:inline-block; width:8px; height:8px; border-radius:2px; }
+.uptime-note { margin-top:8px; font-size:10px; line-height:1.5; color:#8b949e; }
 .test-badge { cursor:pointer; text-decoration:underline; text-decoration-style:dotted; text-underline-offset:2px; }
 .test-badge:hover { color:#f0f6fc; }
 
@@ -622,6 +638,66 @@ function sleepDuration(ts) {
     return minutes + ' мин';
 }
 
+function uptimeDuration(seconds) {
+    var s = Math.max(0, Math.floor(Number(seconds) || 0));
+    var units = adminLanguage === 'ru' ? ['д', 'ч', 'мин', 'с'] : ['d', 'hr', 'min', 's'];
+    if (s < 60) return s + ' ' + units[3];
+    var minutes = Math.floor(s / 60);
+    var days = Math.floor(minutes / 1440);
+    var hours = Math.floor((minutes % 1440) / 60);
+    var parts = [];
+    if (days) parts.push(days + ' ' + units[0]);
+    if (hours) parts.push(hours + ' ' + units[1]);
+    if (minutes % 60) parts.push((minutes % 60) + ' ' + units[2]);
+    return parts.join(' ');
+}
+
+function uptimeCard(uptime) {
+    if (!uptime) return '';
+    var span = uptime.window_end - uptime.window_start;
+    if (!(span > 0)) return '';
+    var locale = adminLanguage === 'ru' ? 'ru-RU' : 'en-GB';
+    var labels = [tr('Нет данных'), tr('Работал'), tr('Простой')];
+    var classes = ['uptime-unknown', 'uptime-up', 'uptime-down'];
+    var segments = uptime.segments || [];
+    var chart = '', dates = '';
+    function stamp(ts) { return new Date(ts * 1000).toLocaleString(locale); }
+    for (var day = 0; day < 7; day++) {
+        var start = uptime.window_start + day * span / 7;
+        var end = uptime.window_start + (day + 1) * span / 7;
+        var totals = [0, 0, 0], bars = '';
+        segments.forEach(function(segment) {
+            var from = Math.max(start, segment.start), to = Math.min(end, segment.end);
+            if (to <= from) return;
+            var kind = segment.active == null ? 0 : (segment.active ? 1 : 2);
+            totals[kind] += to - from;
+            var tooltip = labels[kind] + ': ' + uptimeDuration(to - from) + '\n' + stamp(from) + ' — ' + stamp(to);
+            bars += '<span class="uptime-span ' + classes[kind] + '" style="width:' + ((to - from) * 100 / (end - start)) + '%" title="' + esc(tooltip) + '"></span>';
+        });
+        var dayTitle = stamp(start) + ' — ' + stamp(end) + '\n' + labels[1] + ': ' + uptimeDuration(totals[1]) + '\n' + labels[2] + ': ' + uptimeDuration(totals[2]) + '\n' + labels[0] + ': ' + uptimeDuration(totals[0]);
+        chart += '<div class="uptime-day" tabindex="0" role="img" aria-label="' + esc(dayTitle) + '" title="' + esc(dayTitle) + '">' + bars + '</div>';
+        dates += '<span>' + new Date(start * 1000).toLocaleDateString(locale, {day:'2-digit', month:'2-digit'}) + '</span>';
+    }
+    var percentage = uptime.percentage == null ? '—' : Number(uptime.percentage).toLocaleString(locale, {minimumFractionDigits:2, maximumFractionDigits:2}) + '%';
+    var totalsHtml = '';
+    [1, 2, 0].forEach(function(kind) {
+        var seconds = [uptime.unknown_seconds, uptime.up_seconds, uptime.down_seconds][kind];
+        if (kind === 0 && !seconds) return;
+        totalsHtml += '<span><i class="uptime-key ' + classes[kind] + '" aria-hidden="true"></i>' + labels[kind] + ' <strong>' + esc(uptimeDuration(seconds)) + '</strong></span>';
+    });
+    return '<div class="uptime-heading"><strong>' + tr('Аптайм · последние 7 дней') + '</strong><span title="' + esc(tr('Процент за период с известным статусом')) + '">' + tr('Доступность') + ' <strong>' + percentage + '</strong></span></div>' +
+        '<div class="uptime-chart">' + chart + '</div><div class="uptime-dates" aria-hidden="true">' + dates + '</div><div class="uptime-totals">' + totalsHtml + '</div>' +
+        '<p class="uptime-note">' + tr('По последнему известному статусу в пуле. Ручное и автоматическое отключение считаются простоем.') +
+        (uptime.unknown_seconds > 0 ? ' ' + tr('До начала наблюдения история недоступна.') : '') + '</p>';
+}
+
+function refreshUptimeCharts() {
+    (window._accounts || []).forEach(function(account) {
+        var element = document.getElementById('uptime-' + account.id);
+        if (element) element.innerHTML = uptimeCard(account.uptime);
+    });
+}
+
 function playbackCard(pb) {
     pb = pb || {};
     var active = pb.active != null ? pb.active : '—';
@@ -960,6 +1036,7 @@ async function fetchData() {
                         '<div class="cred-row"><span class="cred-key">USER_ID</span><span class="cred-value">' + esc(uid) + '</span></div>' +
                         '<div class="cred-row"><span class="cred-key">Роль</span><span class="cred-value">' + (a.is_catalog ? 'Только каталог' : 'Воспроизведение') + '</span></div>' +
                     '</div>' +
+                    '<div class="account-uptime" data-no-i18n id="uptime-' + esc(a.id) + '">' + uptimeCard(a.uptime) + '</div>' +
                     '<div class="card-footer">' +
                         '<div class="card-stats">' +
                             '<span class="card-stat">Запросов <strong>' + a.request_count + '</strong></span>' +

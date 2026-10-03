@@ -47,6 +47,7 @@ pub async fn list_accounts(State(state): State<AppState>) -> Result<Json<Value>,
     let mut accounts = state.account_manager.list_accounts().await;
     sort_accounts_by_created_at(&mut accounts);
     let mut list: Vec<Value> = Vec::with_capacity(accounts.len());
+    let now = chrono::Utc::now().timestamp();
     for a in &accounts {
         list.push(json!({
             "id": a.id,
@@ -70,6 +71,7 @@ pub async fn list_accounts(State(state): State<AppState>) -> Result<Json<Value>,
             "premium_checked_at": a.premium_checked_at.load(std::sync::atomic::Ordering::Relaxed),
             "created_at": a.created_at.load(std::sync::atomic::Ordering::Relaxed),
             "notes": a.notes.read().await.clone(),
+            "uptime": a.uptime_summary(now).await,
         }));
     }
 
