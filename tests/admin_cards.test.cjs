@@ -130,3 +130,43 @@ test('one verified proxy assignment is not described as a fully verified pool', 
     assert.equal(elements.get('px-status').textContent, 'Частично проверены');
     assert.equal(elements.get('px-verified').textContent, '1 / 2');
 });
+
+for (const language of ['en', 'ru']) {
+    test(`uptime is one strip and retains mixed states within each bar (${language})`, () => {
+        const { ctx } = context(language);
+        ctx.uptime = { window_start: 0, window_end: 6000, percentage: 50,
+            up_seconds: 2950, down_seconds: 50, waiting_seconds: 100, unknown_seconds: 2900,
+            segments: [
+                { start: 0, end: 2900, active: null, status: null },
+                { start: 2900, end: 2950, active: true, status: 'up' },
+                { start: 2950, end: 3050, active: true, status: 'waiting' },
+                { start: 3050, end: 3100, active: false, status: 'down' },
+                { start: 3100, end: 6000, active: true, status: 'up' },
+            ] };
+        const html = vm.runInContext('uptimeCard(uptime)', ctx);
+        assert.equal((html.match(/class="uptime-bar"/g) || []).length, 60);
+        assert.doesNotMatch(html, /uptime-day|uptime-dates|undefined|NaN/);
+        assert.match(html, /uptime-span uptime-up" style="height:50%/);
+        assert.match(html, /uptime-span uptime-waiting" style="height:50%/);
+        assert.match(html, /uptime-span uptime-down" style="height:50%/);
+        if (language === 'en') assert.doesNotMatch(html, /[А-Яа-яЁё]/);
+    });
+
+    test(`expired token shows the refresh failure, safely escaped (${language})`, () => {
+        const { ctx } = context(language);
+        ctx.account = { availability: { token: 'expired' }, heal_next_retry: Date.now() / 1000 + 60,
+            last_refresh_error: 'Tidal auth HTTP 403: <script>bad()</script>' };
+        const html = vm.runInContext('tokenRefreshDetails(account)', ctx);
+        assert.match(html, /HTTP 403/);
+        assert.match(html, /&lt;script&gt;/);
+        assert.doesNotMatch(html, /<script>/);
+        assert.match(html, language === 'en' ? /Token refresh failed:/ : /Обновление токена не удалось:/);
+        ctx.account.last_refresh_error = null;
+        const expired = vm.runInContext('tokenRefreshDetails(account)', ctx);
+        assert.match(expired, language === 'en' ? /expiry time/ : /Срок действия/);
+        ctx.account.availability.token = 'valid';
+        ctx.account.heal_next_retry = 0;
+        ctx.account.last_refresh_error = 'Old error';
+        assert.equal(vm.runInContext('tokenRefreshDetails(account)', ctx), '');
+    });
+}

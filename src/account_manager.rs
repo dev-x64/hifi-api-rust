@@ -51,6 +51,8 @@ pub struct AccountState {
     pub auto_disabled: AtomicBool,
     pub heal_failures: AtomicU64,
     pub heal_next_retry: AtomicI64,
+    /// Last real refresh failure; cooldown checks must never replace its cause.
+    last_refresh_error: std::sync::RwLock<Option<String>>,
     /// Preferred OAuth client-authentication shape for the next attempt.
     pub auth_use_basic: AtomicBool,
     /// Consecutive auth-endpoint 403 responses on the account's current proxy.
@@ -103,6 +105,7 @@ impl AccountState {
             auto_disabled: AtomicBool::new(false),
             heal_failures: AtomicU64::new(0),
             heal_next_retry: AtomicI64::new(0),
+            last_refresh_error: std::sync::RwLock::new(None),
             auth_use_basic: AtomicBool::new(false),
             auth_forbidden_streak: AtomicU64::new(0),
             rejected_access_token: RwLock::new(None),
@@ -159,6 +162,7 @@ impl AccountState {
             && new.client_secret == old.client_secret
             && new.refresh_token() == old.refresh_token()
         {
+            new.set_last_refresh_error(old.last_refresh_error());
             new.auth_use_basic.store(
                 old.auth_use_basic.load(Ordering::Relaxed),
                 Ordering::Relaxed,
@@ -216,6 +220,14 @@ impl AccountState {
         ).await {
             tracing::warn!(account = %self.id, "Could not persist account uptime: {error}");
         }
+    }
+
+    pub fn last_refresh_error(&self) -> Option<String> {
+        self.last_refresh_error.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub(crate) fn set_last_refresh_error(&self, error: Option<String>) {
+        *self.last_refresh_error.write().unwrap_or_else(|e| e.into_inner()) = error;
     }
 
     pub fn refresh_token(&self) -> String {

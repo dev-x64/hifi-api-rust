@@ -101,6 +101,7 @@ impl TokenManager {
 
     pub(crate) async fn reject_refreshed_token(account: &AccountState, rejected: &str) {
         Self::reject_access_token(account, rejected).await;
+        account.set_last_refresh_error(Some("Tidal HTTP 401: refreshed access token rejected".into()));
         Self::defer_retry(account, 30);
     }
 
@@ -123,6 +124,7 @@ impl TokenManager {
         }
         *account.access_token.write().await = Some(token.into());
         account.token_expires_at.store(expires, Ordering::Relaxed);
+        account.set_last_refresh_error(None);
         account.observe_uptime(Utc::now().timestamp()).await;
         Some(token.into())
     }
@@ -233,6 +235,7 @@ impl TokenManager {
         .await;
         match result {
             Ok(Ok(token)) => {
+                account.set_last_refresh_error(None);
                 account.heal_failures.store(0, Ordering::Relaxed);
                 account.heal_next_retry.store(0, Ordering::Relaxed);
                 account.auth_forbidden_streak.store(0, Ordering::Relaxed);
@@ -268,6 +271,7 @@ impl TokenManager {
                     AppError::Unauthorized(_) => 300,
                     _ => 0,
                 };
+                account.set_last_refresh_error(Some(error.to_string()));
                 let delay = Self::defer_retry(account, minimum);
                 tracing::warn!(account = %account.label, retry_in = delay, "Token refresh failed: {}", error);
                 Err(error)
@@ -428,7 +432,7 @@ impl TokenManager {
                 && matches!(oauth_error, "invalid_grant" | "invalid_client")
             {
                 return Err(TokenAttemptFailure {
-                    error: AppError::Unauthorized(format!("Tidal OAuth {oauth_error}")),
+                    error: AppError::Unauthorized(format!("Tidal auth HTTP {status}: OAuth {oauth_error}")),
                     retryable: false,
                     retry_after: 0,
                     forbidden: false,
@@ -728,7 +732,9 @@ mod tests {
         let mut tm = TokenManager::new(Some(db.clone()));
         tm.token_url = mock.url.clone();
         tm.set_account_manager(am.clone());
+        account.set_last_refresh_error(Some("Previous refresh failure".into()));
         tm.refresh_token(&account, &Client::new()).await.unwrap();
+        assert_eq!(account.last_refresh_error(), None);
         assert_eq!(account.refresh_token(), "rotated+=");
         let reloaded = AccountManager::new(Some(db), SwitchingWeights::default());
         reloaded.load_from_db().await.unwrap();
@@ -755,10 +761,13 @@ mod tests {
         tm.set_account_manager(am);
         let client = Client::new();
         assert!(tm.refresh_token(&account, &client).await.is_err());
+        let cause = account.last_refresh_error().unwrap();
+        assert!(cause.contains("403"));
         assert!(account.is_active.load(Ordering::Relaxed));
         assert!(!account.auto_disabled.load(Ordering::Relaxed));
         assert_eq!(tm.get_token(&account, &client).await.unwrap(), "old");
         assert!(tm.refresh_token(&account, &client).await.is_err());
+        assert_eq!(account.last_refresh_error().as_deref(), Some(cause.as_str()));
         assert_eq!(mock.calls.load(Ordering::Relaxed), AUTH_INITIAL_ATTEMPTS);
         assert_eq!(
             account.auth_forbidden_streak.load(Ordering::Relaxed),

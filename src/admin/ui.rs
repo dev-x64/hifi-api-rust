@@ -56,16 +56,16 @@ body { font-family:'SF Mono','Fira Code','Cascadia Code','JetBrains Mono',Menlo,
 .account-uptime { padding:16px 20px; border-top:1px solid #30363d; }
 .uptime-heading { display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px; margin-bottom:12px; font-size:12px; color:#8b949e; }
 .uptime-heading strong { color:#c9d1d9; }
-.uptime-chart,.uptime-dates { display:grid; grid-template-columns:repeat(7,minmax(0,1fr)); gap:4px; }
-.uptime-day { display:flex; height:20px; overflow:hidden; border-radius:3px; background:#30363d; }
-.uptime-day:focus-visible { outline:2px solid #7c6cff; outline-offset:2px; }
-.uptime-span { height:100%; flex-shrink:0; }
+.uptime-chart { display:flex; gap:3px; }
+.uptime-bar { display:flex; flex-direction:column; flex:1; min-width:0; height:28px; overflow:hidden; border-radius:3px; background:#30363d; }
+.uptime-bar:focus-visible { outline:2px solid #7c6cff; outline-offset:2px; }
+.uptime-span { width:100%; flex-shrink:0; }
 .uptime-up { background:#3fb950; }
 .uptime-down { background:#f85149; }
 .uptime-waiting { background:#d29922; }
 .uptime-current { display:inline-flex; align-items:center; gap:6px; }
 .uptime-unknown { background:repeating-linear-gradient(135deg,#30363d,#30363d 4px,#3c444f 4px,#3c444f 8px); }
-.uptime-dates { margin-top:6px; color:#8b949e; font-size:10px; }
+.token-refresh-error { margin-top:12px; font-size:12px; line-height:1.5; color:#d29922; overflow-wrap:anywhere; }
 .uptime-totals { display:flex; flex-wrap:wrap; gap:8px 18px; margin-top:12px; color:#8b949e; font-size:11px; }
 .uptime-totals span { display:inline-flex; align-items:center; gap:6px; }
 .uptime-totals strong { color:#c9d1d9; }
@@ -669,11 +669,12 @@ function uptimeCard(uptime) {
     var labels = [tr('Нет данных'), tr('Работал'), tr('Простой'), tr('Без токена')];
     var classes = ['uptime-unknown', 'uptime-up', 'uptime-down', 'uptime-waiting'];
     var segments = uptime.segments || [];
-    var chart = '', dates = '';
+    var chart = '';
     function stamp(ts) { return new Date(ts * 1000).toLocaleString(locale); }
-    for (var day = 0; day < 7; day++) {
-        var start = uptime.window_start + day * span / 7;
-        var end = uptime.window_start + (day + 1) * span / 7;
+    var barCount = 60;
+    for (var bar = 0; bar < barCount; bar++) {
+        var start = uptime.window_start + bar * span / barCount;
+        var end = uptime.window_start + (bar + 1) * span / barCount;
         var totals = [0, 0, 0, 0], bars = '';
         segments.forEach(function(segment) {
             var from = Math.max(start, segment.start), to = Math.min(end, segment.end);
@@ -681,11 +682,10 @@ function uptimeCard(uptime) {
             var kind = segment.status === 'waiting' ? 3 : (segment.active == null ? 0 : (segment.active ? 1 : 2));
             totals[kind] += to - from;
             var tooltip = labels[kind] + ': ' + uptimeDuration(to - from) + '\n' + stamp(from) + ' — ' + stamp(to);
-            bars += '<span class="uptime-span ' + classes[kind] + '" style="width:' + ((to - from) * 100 / (end - start)) + '%" title="' + esc(tooltip) + '"></span>';
+            bars += '<span class="uptime-span ' + classes[kind] + '" style="height:' + ((to - from) * 100 / (end - start)) + '%" title="' + esc(tooltip) + '"></span>';
         });
-        var dayTitle = stamp(start) + ' — ' + stamp(end) + '\n' + labels[1] + ': ' + uptimeDuration(totals[1]) + '\n' + labels[2] + ': ' + uptimeDuration(totals[2]) + '\n' + labels[3] + ': ' + uptimeDuration(totals[3]) + '\n' + labels[0] + ': ' + uptimeDuration(totals[0]);
-        chart += '<div class="uptime-day" tabindex="0" role="img" aria-label="' + esc(dayTitle) + '" title="' + esc(dayTitle) + '">' + bars + '</div>';
-        dates += '<span>' + new Date(start * 1000).toLocaleDateString(locale, {day:'2-digit', month:'2-digit'}) + '</span>';
+        var barTitle = stamp(start) + ' — ' + stamp(end) + '\n' + labels[1] + ': ' + uptimeDuration(totals[1]) + '\n' + labels[2] + ': ' + uptimeDuration(totals[2]) + '\n' + labels[3] + ': ' + uptimeDuration(totals[3]) + '\n' + labels[0] + ': ' + uptimeDuration(totals[0]);
+        chart += '<div class="uptime-bar" tabindex="0" role="img" aria-label="' + esc(barTitle) + '" title="' + esc(barTitle) + '">' + bars + '</div>';
     }
     var percentage = uptime.percentage == null ? '—' : Number(uptime.percentage).toLocaleString(locale, {minimumFractionDigits:2, maximumFractionDigits:2}) + '%';
     var totalsHtml = '';
@@ -697,7 +697,7 @@ function uptimeCard(uptime) {
     var current = uptime.current_status === 'waiting'
         ? '<span class="uptime-current"><i class="uptime-key uptime-waiting" aria-hidden="true"></i>' + tr('Нет действующего токена') + '</span>' : '';
     return '<div class="uptime-heading"><strong>' + tr('Аптайм · последние 7 дней') + '</strong>' + current + '<span title="' + esc(tr('Процент за период с известным статусом')) + '">' + tr('Доступность токена') + ' <strong>' + percentage + '</strong></span></div>' +
-        '<div class="uptime-chart">' + chart + '</div><div class="uptime-dates" aria-hidden="true">' + dates + '</div><div class="uptime-totals">' + totalsHtml + '</div>' +
+        '<div class="uptime-chart">' + chart + '</div><div class="uptime-totals">' + totalsHtml + '</div>' +
         '<p class="uptime-note">' + tr('Зелёный — действующий токен. Жёлтый — токен отсутствует, истёк или отклонён. Красный — аккаунт отключён.') +
         (uptime.unknown_seconds > 0 ? ' ' + tr('До начала наблюдения история недоступна.') : '') + '</p>';
 }
@@ -735,6 +735,19 @@ function tokenDescription(account) {
     if (status === 'missing') return 'Не получен';
     if (status === 'rejected') return 'Отклонён Tidal';
     return timeStr(account.token_expires_at);
+}
+
+function tokenRefreshDetails(account) {
+    var token = (account.availability || {}).token;
+    var coolingDown = account.heal_next_retry > Date.now() / 1000;
+    if (token === 'valid' && !coolingDown && !account.auto_disabled) return '';
+    var reason = account.last_refresh_error;
+    if (reason) {
+        return '<div class="token-refresh-error" data-no-i18n>' + tr('Обновление токена не удалось:') + ' <strong>' + esc(reason) + '</strong></div>';
+    }
+    var description = token === 'expired' ? 'Срок действия access token закончился.' :
+        (token === 'rejected' ? 'Tidal отклонил access token.' : '');
+    return description ? '<div class="token-refresh-error" data-no-i18n>' + tr(description) + '</div>' : '';
 }
 
 function metricPair(label, value) {
@@ -1109,7 +1122,7 @@ async function fetchData() {
                     : '<button class="btn" onclick="setCatalog(\'' + a.id + '\',true)" title="Использовать только для метаданных">В каталог</button>';
                 html += '<div class="account-card" data-search="' + esc((label + ' ' + uid + ' ' + a.client_id).toLowerCase()) + '">' +
                     '<div class="card-header">' +
-                        '<div class="left"><span class="acc-num">' + (i + 1) + '</span><span class="' + statusClass + '"></span><span class="label">' + esc(label) + '</span><span class="status-label ' + readiness.tone + '">' + statusText + '</span>' + catalogBadge + premiumBadge + '</div>' +
+                        '<div class="left"><span class="acc-num">' + (i + 1) + '</span><span class="' + statusClass + '"></span><span class="label">' + esc(label) + '</span><span class="status-label ' + readiness.tone + '">' + statusText + '</span>' + (a.heal_next_retry > Date.now() / 1000 ? '<span class="status-label status-warn" data-no-i18n>' + tr('Пауза обновления') + '</span>' : '') + catalogBadge + premiumBadge + '</div>' +
                         '<div class="card-actions">' +
                             '<button class="btn" onclick="refreshAccount(\'' + a.id + '\')">Обновить токен</button>' +
                             '<button class="btn" onclick="checkPremium(\'' + a.id + '\')" title="Проверка FULL/PREVIEW отправляет до четырёх запросов к Tidal">Проверить FULL</button>' +
@@ -1123,7 +1136,7 @@ async function fetchData() {
                     '<div class="card-body">' +
                         '<div class="cred-row"><span class="cred-key">CLIENT_ID</span><span class="cred-value">' + esc(a.client_id) + '</span></div>' +
                         '<div class="cred-row"><span class="cred-key">USER_ID</span><span class="cred-value">' + esc(uid) + '</span></div>' +
-                        '<div class="cred-row"><span class="cred-key">Роль</span><span class="cred-value">' + (a.is_catalog ? 'Только каталог' : 'Воспроизведение') + '</span></div>' +
+                        '<div class="cred-row"><span class="cred-key">Роль</span><span class="cred-value">' + (a.is_catalog ? 'Только каталог' : 'Воспроизведение') + '</span></div>' + tokenRefreshDetails(a) +
                     '</div>' +
                     '<div class="account-uptime" data-no-i18n id="uptime-' + esc(a.id) + '">' + uptimeCard(a.uptime) + '</div>' +
                     '<div class="card-footer">' +
