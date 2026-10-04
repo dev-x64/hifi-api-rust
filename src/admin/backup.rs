@@ -255,7 +255,8 @@ pub async fn restore_backup(
         ),
         (
             "account_uptime_events",
-            &[("id", Int), ("account_id", Text), ("observed_at", Int), ("is_active", Int)][..],
+            &[("id", Int), ("account_id", Text), ("observed_at", Int), ("is_active", Int),
+                ("token_ready", Int), ("token_expires_at", NullableInt)][..],
         ),
         (
             "api_keys",

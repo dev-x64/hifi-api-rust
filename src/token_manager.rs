@@ -95,6 +95,8 @@ impl TokenManager {
         if current.as_deref() == Some(rejected) {
             *account.rejected_access_token.write().await = Some(rejected.into());
         }
+        drop(current);
+        account.observe_uptime(Utc::now().timestamp()).await;
     }
 
     pub(crate) async fn reject_refreshed_token(account: &AccountState, rejected: &str) {
@@ -121,6 +123,7 @@ impl TokenManager {
         }
         *account.access_token.write().await = Some(token.into());
         account.token_expires_at.store(expires, Ordering::Relaxed);
+        account.observe_uptime(Utc::now().timestamp()).await;
         Some(token.into())
     }
 
@@ -501,6 +504,7 @@ impl TokenManager {
             account
                 .token_expires_at
                 .store(expires_at, Ordering::Relaxed);
+            account.observe_uptime(Utc::now().timestamp()).await;
         }
         if let Some(store) = self.upstash.get() {
             let payload = serde_json::json!({"t": token, "e": expires_at}).to_string();

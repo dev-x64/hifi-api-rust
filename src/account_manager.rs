@@ -31,6 +31,7 @@ impl Default for SwitchingWeights {
 
 pub struct AccountState {
     uptime: OnceLock<Arc<Mutex<crate::account_uptime::AccountUptime>>>,
+    uptime_db: OnceLock<SqlitePool>,
     pub id: String,
     pub label: String,
     pub client_id: String,
@@ -87,6 +88,7 @@ impl AccountState {
     ) -> Self {
         Self {
             uptime: OnceLock::new(),
+            uptime_db: OnceLock::new(),
             id,
             label,
             client_id,
@@ -120,6 +122,9 @@ impl AccountState {
     /// edits and cross-instance merges never wipe stats or tokens.
     pub fn carry_over(new: &AccountState, old: &AccountState) {
         let _ = new.uptime.set(old.uptime_history().clone());
+        if let Some(db) = old.uptime_db.get() {
+            let _ = new.uptime_db.set(db.clone());
+        }
         new.last_used
             .store(old.last_used.load(Ordering::Relaxed), Ordering::Relaxed);
         new.request_count
@@ -191,7 +196,26 @@ impl AccountState {
     }
 
     pub async fn uptime_summary(&self, now: i64) -> crate::account_uptime::UptimeSummary {
+        self.observe_uptime(now).await;
         self.uptime_history().lock().await.summary(now)
+    }
+
+    pub(crate) async fn observe_uptime(&self, now: i64) {
+        // Serialize the token snapshot with history updates, including rejected-token events.
+        let mut history = self.uptime_history().lock().await;
+        let active = self.is_active.load(Ordering::Relaxed);
+        let expires = self.token_expires_at.load(Ordering::Relaxed);
+        let token = self.access_token.read().await;
+        let token_ready = active && expires > now
+            && token.as_deref().is_some_and(|token| !token.is_empty())
+            && self.rejected_access_token.read().await.as_deref() != token.as_deref();
+        drop(token);
+        if let Err(error) = history.observe(
+            self.uptime_db.get(), &self.id, active, token_ready,
+            token_ready.then_some(expires), now,
+        ).await {
+            tracing::warn!(account = %self.id, "Could not persist account uptime: {error}");
+        }
     }
 
     pub fn refresh_token(&self) -> String {
@@ -326,15 +350,10 @@ impl AccountManager {
     }
 
     async fn observe_uptime(&self, account: &AccountState) {
-        let mut history = account.uptime_history().lock().await;
-        if let Err(error) = history.observe(
-            self.db.as_ref(),
-            &account.id,
-            account.is_active.load(Ordering::Relaxed),
-            Utc::now().timestamp(),
-        ).await {
-            tracing::warn!(account = %account.id, "Could not persist account uptime: {error}");
+        if let Some(db) = &self.db {
+            let _ = account.uptime_db.set(db.clone());
         }
+        account.observe_uptime(Utc::now().timestamp()).await;
     }
 
     async fn load_uptime(&self, account: &AccountState) -> Result<(), sqlx::Error> {
@@ -861,6 +880,7 @@ impl AccountManager {
         }
 
         accounts[idx] = updated.clone();
+        self.observe_uptime(&updated).await;
         drop(accounts);
         self.push_account_to_redis(&updated).await;
         Ok(())
@@ -977,6 +997,7 @@ impl AccountManager {
         if let Some(rotated) = rotated { account.replace_refresh_token(rotated.into()); }
         *account.access_token.write().await = Some(token.into());
         account.token_expires_at.store(expires_at, Ordering::Relaxed);
+        self.observe_uptime(account).await;
         account.updated_at.store(Utc::now().timestamp(), Ordering::Relaxed);
         self.push_account_to_redis(account).await;
         Ok(())
@@ -1612,6 +1633,43 @@ mod tests {
             let picked = am.select_account_excluding(&[]).await.unwrap();
             assert_eq!(picked.id, a.id);
         }
+    }
+
+    #[tokio::test]
+    async fn uptime_tracks_missing_rejected_and_replaced_tokens() {
+        use crate::account_uptime::UptimeStatus;
+
+        let db = crate::db::init_pool("sqlite::memory:").await.unwrap();
+        let am = AccountManager::new(Some(db.clone()), SwitchingWeights::default());
+        let account = am.add_account("a".into(), "c".into(), "s".into(), "r".into(), None)
+            .await.unwrap();
+        let now = chrono::Utc::now().timestamp();
+        assert_eq!(account.uptime_summary(now).await.current_status, Some(UptimeStatus::Waiting));
+
+        am.store_refreshed_credentials(&account, "r", None, "usable", now + 3600)
+            .await.unwrap();
+        assert_eq!(account.uptime_summary(now).await.current_status, Some(UptimeStatus::Up));
+        // A stale 401 must not turn a newer, usable token yellow.
+        crate::token_manager::TokenManager::reject_access_token(&account, "older-token").await;
+        assert_eq!(account.uptime_summary(now).await.current_status, Some(UptimeStatus::Up));
+        crate::token_manager::TokenManager::reject_access_token(&account, "usable").await;
+        assert_eq!(account.uptime_summary(now).await.current_status, Some(UptimeStatus::Waiting));
+
+        am.store_refreshed_credentials(&account, "r", None, "replacement", now + 3600)
+            .await.unwrap();
+        assert_eq!(account.uptime_summary(now).await.current_status, Some(UptimeStatus::Up));
+        am.update_account(&account.id, None, None, None, Some("new-refresh".into()), None)
+            .await.unwrap();
+        let edited = am.get_account_by_id(&account.id).await.unwrap();
+        assert_eq!(edited.uptime_summary(now).await.current_status, Some(UptimeStatus::Waiting));
+        am.set_account_active(&account.id, false).await.unwrap();
+        assert_eq!(edited.uptime_summary(now).await.current_status, Some(UptimeStatus::Down));
+
+        let states: Vec<(bool, bool)> = sqlx::query_as(
+            "SELECT is_active, token_ready FROM account_uptime_events WHERE account_id = ? ORDER BY id",
+        ).bind(&account.id).fetch_all(&db).await.unwrap();
+        assert_eq!(states, vec![(true, false), (true, true), (true, false), (true, true), (true, false), (false, false)]);
+        db.close().await;
     }
 
     #[tokio::test]

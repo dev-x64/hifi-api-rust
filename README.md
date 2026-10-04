@@ -55,7 +55,7 @@ The server listens on `0.0.0.0:8000` by default; use `HOST` and `PORT` to change
 
 You may instead provide `CLIENT_ID`, `REFRESH_TOKEN`, and optionally `CLIENT_SECRET` and `USER_ID` in `.env`. When the database has no playback accounts, these values create a default account. Keep refresh tokens and `ADMIN_KEY` out of version control.
 
-Each account card shows availability over the last seven days, with up/down durations and an availability percentage for the observed period. This tracks the last known enabled/disabled pool status, including manual disabling and automatic OAuth rejection/recovery; it is not a continuous upstream connectivity check. History starts when monitoring is introduced, and earlier time is shown as unknown. SQLite preserves history across restarts and backups; ephemeral mode retains it only until restart. Status changes adopted from Redis are recorded when observed locally.
+Each account card shows availability over the last seven days. Green means an enabled account has a nonempty, unexpired token that has not been rejected; yellow means an enabled account has no usable token; red means the account is disabled. Time without a usable token is shown separately and lowers the availability percentage. Token expiration is recorded in history so idle accounts stop accruing uptime at expiration. This is not a continuous upstream connectivity check. History starts when monitoring is introduced, and earlier time is shown as unknown. Existing pool-only history is preserved. SQLite preserves history across restarts and backups; ephemeral mode retains it only until restart. Status changes adopted from Redis are recorded when observed locally.
 
 ### Changing the version
 

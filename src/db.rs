@@ -82,6 +82,20 @@ pub async fn init_pool(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
         .execute(&pool)
         .await?;
 
+    let uptime_cols: Vec<(i64, String, String, i64, Option<String>, i64)> =
+        sqlx::query_as("PRAGMA table_info(account_uptime_events)")
+            .fetch_all(&pool)
+            .await?;
+    if !uptime_cols.iter().any(|c| c.1 == "token_ready") {
+        // Existing events described pool state only; preserve their history.
+        sqlx::query("ALTER TABLE account_uptime_events ADD COLUMN token_ready INTEGER NOT NULL DEFAULT 1 CHECK (token_ready IN (0, 1))")
+            .execute(&pool).await?;
+    }
+    if !uptime_cols.iter().any(|c| c.1 == "token_expires_at") {
+        sqlx::query("ALTER TABLE account_uptime_events ADD COLUMN token_expires_at INTEGER")
+            .execute(&pool).await?;
+    }
+
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS daily_usage (
             account_id TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
