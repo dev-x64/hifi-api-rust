@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use chrono::Utc;
@@ -68,6 +68,8 @@ pub struct AccountState {
     pub last_used: AtomicI64,
     pub request_count: AtomicU64,
     pub error_count: AtomicU64,
+    /// Metadata requests this catalog account is serving right now.
+    pub catalog_inflight: AtomicUsize,
     /// Temporary upstream 429 pause. Kept separate from account health so
     /// rate limiting never disables a valid credential.
     pub rate_limited_until: AtomicI64,
@@ -122,6 +124,7 @@ impl AccountState {
             last_used: AtomicI64::new(0),
             request_count: AtomicU64::new(0),
             error_count: AtomicU64::new(0),
+            catalog_inflight: AtomicUsize::new(0),
             rate_limited_until: AtomicI64::new(0),
             premium_status: RwLock::new("unknown".to_string()),
             premium_checked_at: AtomicI64::new(0),
@@ -216,6 +219,26 @@ impl AccountState {
         self.uptime_history().lock().await.summary(now)
     }
 
+    /// Claim one concurrent metadata slot. `limit` 0 means unlimited.
+    fn try_claim_catalog_slot(&self, limit: u32) -> bool {
+        let limit = limit as usize;
+        let mut current = self.catalog_inflight.load(Ordering::Relaxed);
+        loop {
+            if limit > 0 && current >= limit {
+                return false;
+            }
+            match self.catalog_inflight.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::SeqCst,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
     /// A token Tidal accepts right now: present, unexpired and not rejected.
     pub(crate) async fn has_usable_token(&self, now: i64) -> bool {
         let token = self.access_token.read().await;
@@ -287,6 +310,29 @@ impl AccountState {
         .await?;
         Ok(())
     }
+}
+
+/// One claimed metadata slot on a catalog account; released on drop.
+pub struct CatalogSlot(Arc<AccountState>);
+
+impl CatalogSlot {
+    pub fn account(&self) -> &Arc<AccountState> {
+        &self.0
+    }
+}
+
+impl Drop for CatalogSlot {
+    fn drop(&mut self) {
+        self.0.catalog_inflight.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+pub enum CatalogClaim {
+    Slot(CatalogSlot),
+    /// Usable catalog accounts exist, but all are at the concurrency limit.
+    Busy,
+    /// No active catalog account outside a 429 pause.
+    Unavailable,
 }
 
 /// Legacy helpers stored URL-escaped base64 secrets. Decode once; never turn
@@ -823,6 +869,34 @@ impl AccountManager {
         let acc = catalog[(seq as usize) % catalog.len()].clone();
         Self::note_selection(&acc);
         Some(acc)
+    }
+
+    /// Round-robin like `next_active_catalog`, but each pick also claims one
+    /// of the account's concurrent metadata slots (`limit` 0 = unlimited).
+    /// Accounts already at the limit are skipped, so the caller can send
+    /// the overflow to the playback pool.
+    pub async fn claim_catalog_slot(&self, limit: u32) -> CatalogClaim {
+        let accounts = self.accounts.read().await;
+        let catalog: Vec<&Arc<AccountState>> = accounts
+            .iter()
+            .filter(|a| {
+                a.is_catalog.load(Ordering::Relaxed)
+                    && a.is_active.load(Ordering::Relaxed)
+                    && Self::rate_limit_remaining(a).is_none()
+            })
+            .collect();
+        if catalog.is_empty() {
+            return CatalogClaim::Unavailable;
+        }
+        let start = (self.catalog_rr.fetch_add(1, Ordering::Relaxed) % catalog.len() as u64) as usize;
+        for offset in 0..catalog.len() {
+            let account = catalog[(start + offset) % catalog.len()];
+            if account.try_claim_catalog_slot(limit) {
+                Self::note_selection(account);
+                return CatalogClaim::Slot(CatalogSlot(account.clone()));
+            }
+        }
+        CatalogClaim::Busy
     }
 
     /// Metadata account selection (upstream catalog=True): round-robin
@@ -1765,6 +1839,55 @@ mod tests {
         for _ in 0..3 {
             let picked = am.select_account_excluding(&[]).await.unwrap();
             assert_eq!(picked.id, a.id);
+        }
+    }
+
+    #[tokio::test]
+    async fn catalog_slots_cap_concurrent_requests_per_account() {
+        use super::{AccountManager, CatalogClaim, SwitchingWeights};
+        let am = AccountManager::new(None, SwitchingWeights::default());
+        assert!(matches!(am.claim_catalog_slot(1).await, CatalogClaim::Unavailable));
+        let mut ids = Vec::new();
+        for label in ["a", "b"] {
+            let account = am
+                .add_account(label.into(), "c".into(), "s".into(), format!("rt-{label}"), None)
+                .await
+                .unwrap();
+            am.set_account_catalog(&account.id, true).await.unwrap();
+            ids.push(account.id.clone());
+        }
+
+        // With a limit of one, two requests land on different accounts and a
+        // third finds every account busy.
+        let CatalogClaim::Slot(first) = am.claim_catalog_slot(1).await else {
+            panic!("first catalog slot");
+        };
+        let CatalogClaim::Slot(second) = am.claim_catalog_slot(1).await else {
+            panic!("second catalog slot");
+        };
+        assert_ne!(first.account().id, second.account().id);
+        assert!(matches!(am.claim_catalog_slot(1).await, CatalogClaim::Busy));
+
+        // Finishing a request frees its account again.
+        let freed = first.account().id.clone();
+        drop(first);
+        let CatalogClaim::Slot(third) = am.claim_catalog_slot(1).await else {
+            panic!("slot freed by the finished request");
+        };
+        assert_eq!(third.account().id, freed);
+
+        // Zero keeps today's behaviour: no cap.
+        let mut unlimited = Vec::new();
+        for _ in 0..10 {
+            let CatalogClaim::Slot(slot) = am.claim_catalog_slot(0).await else {
+                panic!("unlimited catalog slot");
+            };
+            unlimited.push(slot);
+        }
+        drop((second, third, unlimited));
+        for id in &ids {
+            let account = am.get_account_by_id(id).await.unwrap();
+            assert_eq!(account.catalog_inflight.load(Ordering::Relaxed), 0);
         }
     }
 

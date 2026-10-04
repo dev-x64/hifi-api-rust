@@ -7,7 +7,7 @@ use rand::Rng;
 use reqwest::Client;
 use serde_json::{Value, json};
 
-use crate::account_manager::{AccountManager, AccountState};
+use crate::account_manager::{AccountManager, AccountState, CatalogClaim};
 use crate::config::Config;
 use crate::error::AppError;
 use crate::notifier::Notifier;
@@ -541,9 +541,13 @@ impl TidalClient {
 
     /// Shared catalog resolution: static token → catalog account → pool.
     /// A 429 uses at most one other credential, including the playback pool.
+    /// Catalog accounts at their concurrency limit are skipped; when all are
+    /// busy the request overflows to the pool.
     async fn catalog_get(&self, url: &str, params: Vec<(&str, &str)>) -> Result<Value, AppError> {
         let mut rate_limit_error: Option<AppError> = None;
         let mut fallback_tried = false;
+        let mut catalog_busy = false;
+        let concurrency = self.settings.catalog_concurrency_per_account();
         if !self.config.catalog_token.is_empty() {
             match self.catalog_static_get(url, params.clone()).await {
                 Ok(data) => return Ok(data),
@@ -557,13 +561,19 @@ impl TidalClient {
             if rate_limit_error.is_some() && fallback_tried {
                 return Err(rate_limit_error.unwrap());
             }
-            let Some(acc) = self.account_manager.next_active_catalog().await else {
-                break;
+            // Held for the whole upstream call; released when it goes out of scope.
+            let slot = match self.account_manager.claim_catalog_slot(concurrency).await {
+                CatalogClaim::Slot(slot) => slot,
+                CatalogClaim::Busy => {
+                    catalog_busy = true;
+                    break;
+                }
+                CatalogClaim::Unavailable => break,
             };
             if rate_limit_error.is_some() {
                 fallback_tried = true;
             }
-            match self.catalog_account_get(&acc, url, params.clone()).await {
+            match self.catalog_account_get(slot.account(), url, params.clone()).await {
                 Ok(data) => return Ok(data),
                 Err(e @ AppError::RateLimited(_)) => {
                     if fallback_tried {
@@ -606,7 +616,15 @@ impl TidalClient {
                 Err(e) => Err(e),
             };
         }
-        // No catalog configured (or it failed): normal pool request.
+        // Without a playback pool there is nowhere for the overflow to go:
+        // shed it instead of reporting every account as down.
+        if catalog_busy && self.account_manager.playback_count().await == 0 {
+            return Err(AppError::ServiceUnavailableRetry(
+                "Catalog accounts are at their concurrent request limit".into(),
+                1,
+            ));
+        }
+        // No catalog configured (or it failed or is busy): normal pool request.
         self.make_request_with_limit(
             url,
             Some(params),

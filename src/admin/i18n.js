@@ -183,6 +183,8 @@ var ruToEn = {
     'Atmos в приоритете': 'Prefer Atmos',
     'Запросов на аккаунт · треки': 'Requests per account · tracks',
     'Запросов на аккаунт · каталог': 'Requests per account · catalog',
+    'Одновременных запросов на аккаунт каталога': 'Concurrent requests per catalog account',
+    '0 — без ограничения. Когда все аккаунты каталога заняты, запросы метаданных уходят в пул воспроизведения.': '0 means no limit. When every catalog account is busy, metadata requests go to the playback pool.',
     'Лимит включает первую попытку. При ошибке сервис всё ещё может перейти на другой аккаунт; цепочка аккаунтов в журнале показывает такие переключения.': 'The limit includes the first attempt. On failure, the service may still switch to another account; the account chain in the log shows those failovers.',
     'Автовосстановление отключённых системой аккаунтов': 'Automatically recover system-disabled accounts',
     'Сохранить': 'Save',

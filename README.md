@@ -107,7 +107,7 @@ Copy [`.env.example`](.env.example) for the full list. Values saved in the admin
 
 `USER_AGENT` and `DEV_MODE` configure upstream HTTP requests and diagnostics. See `.env.example` for their defaults. `PUBLIC_POOL_REDIS_URL` is a deprecated fallback for `REDIS_POOL`.
 
-The maximum number of upstream requests made on one account is configured live in Admin → System, independently for track playback and catalog metadata. Both default to `1` and persist in SQLite (and shared Redis when enabled).
+The maximum number of upstream requests made on one account is configured live in Admin → System, independently for track playback and catalog metadata. Both default to `1` and persist in SQLite (and shared Redis when enabled). A separate setting caps how many metadata requests one catalog account serves at the same time: `0` (the default) means no cap, and when every catalog account is at the cap the overflow goes to the playback pool. With no playback pool the overflow gets `503` with `Retry-After: 1`. The cap does not apply to the static catalog token or to metadata served by the playback pool.
 
 ### Proxies
 
@@ -168,7 +168,7 @@ Add `-H 'X-API-Key: YOUR_KEY'` to the `curl` commands after enabling API keys.
 
 ### Playback queue and formats
 
-`/track/`, `/trackManifests`, `/dash`, `/widevine`, and `/video/` use playback accounts. The queue allows up to the number of active playback accounts to run simultaneously. If all slots are busy, the API returns `202 Accepted` with a `Location` header pointing to `/playback/requests/{request_id}` and a `Retry-After` header. Poll that URL with `GET` until it returns the original result; `DELETE` cancels the job. Finished jobs expire after five minutes. Catalog accounts do not serve playback.
+`/track/`, `/trackManifests`, `/dash`, `/widevine`, and `/video/` use playback accounts. The queue allows as many simultaneous requests as there are playback accounts able to serve right now (enabled, usable token, no 429 cooldown; at least one). If all slots are busy, the API returns `202 Accepted` with a `Location` header pointing to `/playback/requests/{request_id}` and a `Retry-After` header. Poll that URL with `GET` until it returns the original result; `DELETE` cancels the job. Finished jobs expire after five minutes. Catalog accounts do not serve playback.
 
 The pending queue is capped at the playback pool size. Once full, new requests receive `503` with `Retry-After: 5` instead of accumulating. Pending jobs without a poll for 60 seconds are cancelled, and a background reaper removes finished jobs after five minutes. Each playback operation times out after 120 seconds. Metadata GET responses use a one-hour fresh cache plus a one-hour stale window with background refresh; repeatable 404/429/5xx responses have short negative-cache lifetimes. Playback and Widevine responses are excluded from this shared cache.
 
