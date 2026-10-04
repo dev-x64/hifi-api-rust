@@ -57,6 +57,10 @@ You may instead provide `CLIENT_ID`, `REFRESH_TOKEN`, and optionally `CLIENT_SEC
 
 Each account card shows availability over the last seven days. Green means an enabled account has a nonempty, unexpired token that has not been rejected; yellow means an enabled account has no usable token; red means the account is disabled. Time without a usable token is shown separately and lowers the availability percentage. Token expiration is recorded in history so idle accounts stop accruing uptime at expiration. This is not a continuous upstream connectivity check. History starts when monitoring is introduced, and earlier time is shown as unknown. Existing pool-only history is preserved. SQLite preserves history across restarts and backups; ephemeral mode retains it only until restart. Status changes adopted from Redis are recorded when observed locally.
 
+The overview separates **playback requests running now**, **queued requests**, and the **concurrent request limit** from account readiness. Enabled playback accounts determine the limit, even while their tokens are being renewed. **Ready accounts** require a usable token and no 429 cooldown; playback accounts additionally need a successful FULL check within the last eight hours. Account cards use the same readiness rules and show why an enabled account is not ready. Metadata only needs a usable token, so its available account count can be higher than the FULL playback count.
+
+Request totals and account attempt/error counters are local to the server process and start over on restart. Requests per second use the last 60 seconds; p95 and HTTP error percentage use the bounded recent log (up to 5000 requests), with the actual sample count shown. An empty sample has no error rate or p95. Cache counters also count requests since process start; clearing cached data does not reset these counters. UI rendering checks run with `node --test tests/admin_cards.test.cjs`, alongside `cargo test`.
+
 ### Changing the version
 
 Set the version in `Cargo.toml` under `[package]`. Cargo updates the generated `Cargo.lock` when you build or run `cargo check`:

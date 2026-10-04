@@ -127,6 +127,9 @@ body { font-family:'SF Mono','Fira Code','Cascadia Code','JetBrains Mono',Menlo,
 .status-label { font-size:11px; margin-left:6px; padding:2px 8px; border-radius:4px; font-weight:500; }
 .status-label.status-ok { color:#3fb950; background:rgba(63,185,80,0.1); }
 .status-label.status-err { color:#f85149; background:rgba(248,81,73,0.1); }
+.status-label.status-warn { color:#d29922; background:rgba(210,153,34,0.1); }
+.status-unknown { background:#8b949e; }
+.card-stat.test-fail { white-space:normal; overflow-wrap:anywhere; }
 .playback-access { display:inline-flex; align-items:center; gap:7px; min-height:28px; margin-left:4px; padding:4px 9px; border:1px solid; border-radius:7px; font-family:Inter,sans-serif; line-height:1; white-space:nowrap; }
 .playback-access .access-caption { font-size:9px; font-weight:700; letter-spacing:.55px; text-transform:uppercase; opacity:.72; }
 .playback-access strong { font-size:12px; letter-spacing:.25px; }
@@ -265,6 +268,10 @@ button:focus-visible,input:focus-visible,select:focus-visible { outline:2px soli
 .stat-card:hover { border-color:#394452; }
 .stat-card .label { color:var(--muted); font-family:Inter,sans-serif; font-size:10px; font-weight:700; }
 .stat-card .value { font-family:Inter,sans-serif; color:var(--text); font-size:25px; margin-top:10px; }
+.metric-unit { font-size:14px; color:var(--muted); font-weight:500; }
+.metric-text { font-size:18px; }
+.stat-details { display:grid; gap:6px; margin-top:10px; font-size:11px; line-height:1.5; color:var(--muted); overflow-wrap:anywhere; }
+.stat-details strong { color:var(--text); font-weight:600; }
 .account-card,.form-section,.test-results-section,.terminal { background:var(--panel); border-color:var(--line); border-radius:12px; box-shadow:none; }
 .account-card:hover,.form-section:hover,.test-results-section:hover { border-color:#35404d; box-shadow:0 12px 36px rgba(0,0,0,.18); }
 .card-header,.test-results-section .test-results-header { background:var(--panel-2); border-color:var(--line); }
@@ -390,7 +397,7 @@ button:focus-visible,input:focus-visible,select:focus-visible { outline:2px soli
 
   <section id="view-accounts" class="view">
     <div class="section-head"><div><h2>Tidal-аккаунты</h2><p>Управляйте пулом воспроизведения, токенами и каталогом.</p></div><div class="section-actions"><button class="btn" onclick="testAll()" id="testAllBtn">Проверить все</button><button class="btn btn-primary" onclick="openAddAccount()">+ Добавить</button></div></div>
-    <div class="toolbar"><div class="search-wrap"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg><input id="accountSearch" type="search" placeholder="Найти аккаунт..." oninput="filterAccounts(this.value)"></div><div class="account-summary" id="accountCount"><span class="status-dot status-ok"></span><span>Работают</span><strong>— из —</strong></div></div>
+    <div class="toolbar"><div class="search-wrap"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg><input id="accountSearch" type="search" placeholder="Найти аккаунт..." oninput="filterAccounts(this.value)"></div><div class="account-summary" id="accountCount"><span class="status-dot status-ok"></span><span>Готовы сейчас</span><strong>— / —</strong></div></div>
     <div id="accounts-container" class="accounts-grid"></div>
     <div class="test-results-section" id="testResultsSection" style="display:none"><div class="test-results-header"><h3>Результаты проверки</h3><div class="test-summary" id="testSummary"></div></div><div class="test-results-body" id="testResultsList"></div></div>
   </section>
@@ -402,7 +409,7 @@ button:focus-visible,input:focus-visible,select:focus-visible { outline:2px soli
       <div class="form-row"><div class="form-group"><label>Название</label><input type="text" id="new-key-label" placeholder="Например, мобильное приложение"></div><div class="form-group"><label>Квота запросов</label><input type="number" id="new-key-quota" min="0" placeholder="0"></div></div>
       <button class="btn btn-primary" onclick="addApiKey()">Создать ключ</button><div id="keyResult" style="font-size:12px;margin-top:12px;color:var(--green);word-break:break-all"></div>
     </div>
-    <div class="form-section"><h3>Активные ключи</h3><p class="form-copy">Если ключей нет, публичные маршруты API остаются открытыми.</p><div id="keys-container"></div></div>
+    <div class="form-section"><h3>API-ключи</h3><p class="form-copy">Если ключей нет, публичные маршруты API остаются открытыми.</p><div id="keys-container"></div></div>
   </section>
 
   <section id="view-system" class="view">
@@ -410,9 +417,9 @@ button:focus-visible,input:focus-visible,select:focus-visible { outline:2px soli
     <div class="system-grid">
       <div class="form-section"><h3>Настройки панели</h3><p class="form-copy">Язык интерфейса сохраняется в cookie этого браузера.</p><div class="form-group"><label for="panel-language">Язык интерфейса</label><select id="panel-language" class="select" style="width:100%;padding:10px 12px" onchange="setLanguage(this.value)"><option value="en">English</option><option value="ru">Русский</option></select></div></div>
       <div class="form-section"><h3>Воспроизведение</h3><p class="form-copy">Настройки выбора формата и исходящих запросов к Tidal.</p><div class="form-group" style="margin-bottom:16px"><label>Формат по умолчанию</label><select id="rl-atmos" class="select" style="width:100%;padding:10px 12px"><option value="high">HIGH · AAC 320 kbps (v1)</option><option value="off">FLAC в приоритете</option><option value="prefer">Atmos в приоритете</option></select></div><div class="form-row"><div class="form-group"><label for="rl-track-requests">Запросов на аккаунт · треки</label><input type="number" id="rl-track-requests" min="1" max="10" value="1"></div><div class="form-group"><label for="rl-catalog-requests">Запросов на аккаунт · каталог</label><input type="number" id="rl-catalog-requests" min="1" max="10" value="1"></div></div><p class="form-copy">Лимит включает первую попытку. При ошибке сервис всё ещё может перейти на другой аккаунт; цепочка аккаунтов в журнале показывает такие переключения.</p><p class="form-copy">Автовосстановление всегда включено. Отключённые вручную аккаунты остаются выключенными.</p><div class="section-actions"><button class="btn btn-primary" onclick="saveSettings()">Сохранить</button><button class="btn" id="clearPlaybackBtn" onclick="clearPlaybackQueue()">Очистить очередь</button></div></div>
-      <div class="form-section"><h3>Прокси</h3><p class="form-copy">Маршрутизация исходящих запросов. Изменения применяются сразу.</p><div class="card-stats" style="margin-bottom:16px"><span class="card-stat">Статус <strong id="px-status">—</strong></span><span class="card-stat">Назначено <strong id="px-current">—</strong></span><span class="card-stat">В пуле <strong id="px-pool">—</strong></span><span class="card-stat">Сбоев <strong id="px-fails">—</strong></span></div><div id="px-assignments" class="helper" style="white-space:pre-line;margin-bottom:16px"></div><div class="form-group"><label for="px-list">Адреса прокси · по одному в строке</label><textarea id="px-list" spellcheck="false" placeholder="http://user:password@host:port" oninput="proxyListDirty=true"></textarea></div><div class="section-actions" style="margin-top:12px"><button class="btn btn-primary" id="pxToggleBtn" onclick="toggleProxies()">Включить прокси</button><button class="btn" id="pxSaveBtn" onclick="saveProxyList()">Сохранить список</button></div><p class="helper" id="px-persist" style="margin-top:11px"></p></div>
+      <div class="form-section"><h3>Прокси</h3><p class="form-copy">Маршрутизация исходящих запросов. Изменения применяются сразу.</p><div class="card-stats" style="margin-bottom:16px"><span class="card-stat">Статус <strong id="px-status">—</strong></span><span class="card-stat">Назначено <strong id="px-current">—</strong></span><span class="card-stat">В пуле <strong id="px-pool">—</strong></span><span class="card-stat">Проверено назначений <strong id="px-verified">—</strong></span><span class="card-stat" title="Сумма последовательных ошибок по текущим назначениям; сбрасываются после успешного запроса">Ошибок подряд <strong id="px-fails">—</strong></span></div><div id="px-assignments" class="helper" style="white-space:pre-line;margin-bottom:16px"></div><div class="form-group"><label for="px-list">Адреса прокси · по одному в строке</label><textarea id="px-list" spellcheck="false" placeholder="http://user:password@host:port" oninput="proxyListDirty=true"></textarea></div><div class="section-actions" style="margin-top:12px"><button class="btn btn-primary" id="pxToggleBtn" onclick="toggleProxies()">Включить прокси</button><button class="btn" id="pxSaveBtn" onclick="saveProxyList()">Сохранить список</button></div><p class="helper" id="px-persist" style="margin-top:11px"></p></div>
       <div class="form-section"><h3>Уведомления</h3><p class="form-copy">Discord-оповещения о риске блокировки и недоступности аккаунтов.</p><div class="card-stats" style="margin-bottom:15px"><span class="card-stat">Discord <strong id="al-discord">—</strong></span></div><div class="form-group"><label for="al-webhook">URL вебхука Discord</label><input type="password" id="al-webhook" placeholder="https://discord.com/api/webhooks/…" autocomplete="new-password" spellcheck="false"></div><p class="helper" style="margin:8px 0 14px">Сохранённый URL скрыт. Введите новый, чтобы заменить его.</p><div class="section-actions" style="margin-bottom:15px"><button class="btn btn-primary" onclick="saveDiscordWebhook()" id="saveWebhookBtn">Сохранить вебхук</button><button class="btn btn-danger" onclick="disableDiscordWebhook()" id="disableWebhookBtn">Отключить вебхук</button></div><div class="section-actions"><button class="btn" onclick="testAlert()" id="alertTestBtn">Тест</button><button class="btn" onclick="sendReport('status')" id="reportStatusBtn">Статус</button><button class="btn" onclick="sendReport('accounts')" id="reportAccountsBtn">Аккаунты</button></div></div>
-      <div class="form-section"><h3>Кэш</h3><p class="form-copy">Очистка безопасна, но первые ответы после неё могут быть медленнее.</p><div class="card-stats" style="margin-bottom:15px"><span class="card-stat">Попадания <strong id="cc-hits">—</strong></span><span class="card-stat">Промахи <strong id="cc-misses">—</strong></span><span class="card-stat">Устаревшие <strong id="cc-stale">—</strong></span><span class="card-stat">Отрицательные <strong id="cc-negative">—</strong></span></div><button class="btn" onclick="clearCache()" id="clearCacheBtn">Очистить кэш</button></div>
+      <div class="form-section"><h3>Кэш</h3><p class="form-copy">Счётчики запросов с запуска сервера. Устаревшие и объединённые ответы входят в попадания. Очистка кэша не обнуляет счётчики.</p><div class="card-stats" style="margin-bottom:15px"><span class="card-stat">Попадания <strong id="cc-hits">—</strong></span><span class="card-stat">Промахи <strong id="cc-misses">—</strong></span><span class="card-stat">Из устаревшего кэша <strong id="cc-stale">—</strong></span><span class="card-stat">Ошибок из кэша <strong id="cc-negative">—</strong></span><span class="card-stat">Объединённых запросов <strong id="cc-coalesced">—</strong></span></div><button class="btn" onclick="clearCache()" id="clearCacheBtn">Очистить кэш</button></div>
       <div class="form-section"><h3>Учётные данные</h3><p class="form-copy">Экспортируйте или импортируйте Tidal-аккаунты в JSON. Дубликаты токенов будут пропущены.</p><div class="section-actions"><button class="btn" onclick="exportCredentials()">Экспорт JSON</button><button class="btn" onclick="document.getElementById('importFile').click()">Импорт JSON</button><input type="file" id="importFile" accept=".json,application/json" style="display:none" onchange="importCredentials(event)"></div><div id="importResult" class="helper" style="margin-top:10px"></div></div>
       <div class="form-section"><h3>База данных</h3><p class="form-copy">Скачайте полный снимок или восстановите состояние без перезапуска.</p><div class="section-actions"><button class="btn" onclick="downloadBackup()">Скачать копию</button><button class="btn btn-danger" onclick="document.getElementById('restoreFile').click()">Восстановить</button><input type="file" id="restoreFile" accept=".db,.sqlite,.sqlite3,application/x-sqlite3" style="display:none" onchange="restoreBackup(event)"></div><div id="restoreResult" class="helper" style="margin-top:10px"></div></div>
     </div>
@@ -689,7 +696,7 @@ function uptimeCard(uptime) {
     });
     var current = uptime.current_status === 'waiting'
         ? '<span class="uptime-current"><i class="uptime-key uptime-waiting" aria-hidden="true"></i>' + tr('Нет действующего токена') + '</span>' : '';
-    return '<div class="uptime-heading"><strong>' + tr('Аптайм · последние 7 дней') + '</strong>' + current + '<span title="' + esc(tr('Процент за период с известным статусом')) + '">' + tr('Доступность') + ' <strong>' + percentage + '</strong></span></div>' +
+    return '<div class="uptime-heading"><strong>' + tr('Аптайм · последние 7 дней') + '</strong>' + current + '<span title="' + esc(tr('Процент за период с известным статусом')) + '">' + tr('Доступность токена') + ' <strong>' + percentage + '</strong></span></div>' +
         '<div class="uptime-chart">' + chart + '</div><div class="uptime-dates" aria-hidden="true">' + dates + '</div><div class="uptime-totals">' + totalsHtml + '</div>' +
         '<p class="uptime-note">' + tr('Зелёный — действующий токен. Жёлтый — токен отсутствует, истёк или отклонён. Красный — аккаунт отключён.') +
         (uptime.unknown_seconds > 0 ? ' ' + tr('До начала наблюдения история недоступна.') : '') + '</p>';
@@ -702,40 +709,112 @@ function refreshUptimeCharts() {
     });
 }
 
-function playbackCard(pb) {
-    pb = pb || {};
-    var active = pb.active != null ? pb.active : '—';
-    var pending = pb.pending != null ? pb.pending : '—';
-    var pool = pb.pool_size != null ? pb.pool_size : '—';
-    return '<div class="stat-card"><div class="label">Воспроизведение · ' + active + '/' + pool + '</div><div class="value">' + pending + ' <span style="font-size:14px;color:var(--muted);font-weight:500">в очереди</span></div></div>';
+function metricNumber(value, digits) {
+    if (value == null || !Number.isFinite(Number(value))) return '—';
+    return Number(value).toLocaleString(adminLanguage === 'ru' ? 'ru-RU' : 'en-GB', {
+        minimumFractionDigits: digits || 0, maximumFractionDigits: digits || 0
+    });
 }
 
-function catalogCard(cat, accounts) {
-    cat = cat || {};
-    accounts = accounts || [];
+function accountStatus(account) {
+    var state = (account.availability || {}).state;
+    if (state === 'ready') return {tone:'status-ok', text:account.is_catalog ? 'Готов к каталогу' : 'Готов к FULL'};
+    if (state === 'disabled') return {tone:'status-err', text:account.auto_disabled ? 'Автоотключён' : 'Отключён вручную'};
+    if (state === 'no_token') {
+        var token = (account.availability || {}).token;
+        return {tone:'status-warn', text:token === 'rejected' ? 'Токен отклонён' : (token === 'expired' ? 'Токен истёк' : 'Нет токена')};
+    }
+    if (state === 'rate_limited') return {tone:'status-warn', text:'Пауза 429'};
+    if (state === 'preview_only') return {tone:'status-warn', text:'Только PREVIEW'};
+    if (state === 'needs_check') return {tone:'status-warn', text:'Нужна FULL-проверка'};
+    return {tone:'status-unknown', text:'Статус неизвестен'};
+}
+
+function tokenDescription(account) {
+    var status = (account.availability || {}).token;
+    if (status === 'missing') return 'Не получен';
+    if (status === 'rejected') return 'Отклонён Tidal';
+    return timeStr(account.token_expires_at);
+}
+
+function metricPair(label, value) {
+    return '<span>' + esc(label) + '</span> <strong>' + esc(metricNumber(value)) + '</strong>';
+}
+
+function metricCard(label, value, details, title) {
+    return '<div class="stat-card"' + (title ? ' title="' + esc(title) + '"' : '') + '><div class="label">' + esc(label) + '</div>' +
+        '<div class="value">' + value + '</div><div class="stat-details">' + (details || []).map(function(detail) {
+            return '<div>' + detail + '</div>';
+        }).join('') + '</div></div>';
+}
+
+function accountsCard(stats) {
+    var counts = stats.account_readiness || {};
+    var playback = stats.playback_readiness || {}, catalog = stats.catalog_readiness || {};
+    var reasons = [];
+    [['no_token', 'Без токена:'], ['needs_check', 'Нужна FULL-проверка:'], ['preview_only', 'Только PREVIEW:'], ['rate_limited', 'Пауза 429:']].forEach(function(item) {
+        if (counts[item[0]]) reasons.push(metricPair(item[1], counts[item[0]]));
+    });
+    var details = [metricPair('Включено:', counts.enabled) + ' · ' + metricPair('Отключено:', counts.disabled),
+        metricPair('Готовы FULL:', playback.ready) + ' · ' + metricPair('Каталог:', catalog.ready)];
+    if (reasons.length) details.push(reasons.join(' · '));
+    if (counts.total === 0) details.push('Добавьте аккаунт для доступа к Tidal.');
+    return metricCard('Готовые аккаунты', esc(metricNumber(counts.ready)) + ' <span class="metric-unit"><span>из</span> ' + esc(metricNumber(counts.total)) + '</span>', details,
+        'Готовность: действующий токен и отсутствие паузы 429. Для воспроизведения нужна подтверждённая FULL-проверка не старше 8 часов.');
+}
+
+function playbackCard(pb, readiness) {
+    pb = pb || {}; readiness = readiness || {};
+    var details = [metricPair('В очереди:', pb.pending), metricPair('Лимит одновременно:', pb.pool_size),
+        metricPair('Включено аккаунтов:', readiness.enabled) + ' · ' + metricPair('Готовы FULL:', readiness.ready)];
+    if (readiness.enabled === 0) details.push('Нет включённых аккаунтов воспроизведения.');
+    if (pb.pending > 0) details.push('<span>Самое долгое ожидание:</span> <strong>' + esc(uptimeDuration(pb.oldest_pending_secs)) + '</strong>');
+    return metricCard('Запросы воспроизведения', esc(metricNumber(pb.active)) + ' <span class="metric-unit">выполняются</span>', details,
+        'Запросы треков, видео и лицензий, выполняемые в момент обновления. Лимит задан включёнными аккаунтами; их готовность показана отдельно.');
+}
+
+function catalogCard(cat, playback, catalog) {
+    cat = cat || {}; playback = playback || {}; catalog = catalog || {};
     var mode = cat.mode || 'pool';
-    var catalog = accounts.filter(function(a) { return a.is_catalog; });
-    var active = catalog.filter(function(a) { return a.is_active; });
-    var label = mode === 'static_token' ? 'Статичный токен' :
-        (active.length ? active.length + ' ' + plural(active.length, 'активный аккаунт', 'активных аккаунта', 'активных аккаунтов') : 'Общий пул');
-    var detail = mode === 'static_token'
-        ? (active.length ? 'Резерв: ' + active.length + ' ' + plural(active.length, 'аккаунт каталога', 'аккаунта каталога', 'аккаунтов каталога') : 'Метаданные через токен')
-        : (active.length ? (active.length > 1 ? 'Циклически (round-robin): ' : '') + active.map(function(a) { return a.label || 'Без названия'; }).join(' · ') :
-            (catalog.length ? 'Аккаунты каталога неактивны; используется пул воспроизведения' : 'Метаданные через пул воспроизведения'));
-    var color = mode === 'pool' || (mode !== 'static_token' && !active.length) ? '#8b949e' : '#d2a8ff';
-    return '<div class="stat-card"><div class="label">Каталог</div><div class="value" style="font-size:18px;color:' + color + '">' + esc(label) + '</div>' +
-        '<div style="font-size:11px;color:var(--muted);margin-top:5px;overflow-wrap:anywhere">' + esc(detail) + '</div></div>';
+    var label = mode === 'static_token' ? 'Статичный токен' : (mode === 'account' ? 'Аккаунты каталога' : 'Пул воспроизведения');
+    var details;
+    if (mode === 'static_token') {
+        details = ['Токен настроен; доступ проверяется при запросе.', metricPair('Резервных аккаунтов каталога:', catalog.enabled)];
+    } else {
+        var source = mode === 'account' ? catalog : playback;
+        details = [metricPair('С действующим токеном:', source.metadata_ready) + ' <span>из</span> ' + esc(metricNumber(source.enabled)) + ' <span>включённых</span>',
+            'Для метаданных FULL-проверка не требуется.'];
+        if (!source.enabled) details.push('Нет включённых аккаунтов для метаданных.');
+        else if (!source.metadata_ready) details.push('Нет готовых токенов; требуется обновление или завершение паузы.');
+        if (mode === 'pool' && catalog.total > 0) details.push('Аккаунты каталога отключены или на паузе 429.');
+    }
+    return metricCard('Источник метаданных', '<span class="metric-text">' + esc(label) + '</span>', details,
+        'Приоритет источников: статичный токен → аккаунты каталога → пул воспроизведения.');
 }
 
-function redisCard(redis) {    redis = redis || {};
-    if (!redis.configured) {
-        return '<div class="stat-card"><div class="label">Синхронизация Redis</div><div class="value" style="font-size:18px;color:#8b949e">Один сервер</div></div>';
-    }
-    var ep = redis.endpoint ? '<div style="font-size:11px;color:#8b949e;margin-top:4px;word-break:break-all">' + esc(redis.endpoint) + '</div>' : '';
-    if (redis.status === 'ok') {
-        return '<div class="stat-card" style="border-color:#3fb950"><div class="label">Синхронизация Redis</div><div class="value" style="color:#3fb950;font-size:18px">Работает</div>' + ep + '</div>';
-    }
-    return '<div class="stat-card" style="border-color:#f85149"><div class="label">Синхронизация Redis</div><div class="value" style="color:#f85149;font-size:18px">Нет связи</div>' + ep + '</div>';
+function redisCard(redis) {
+    redis = redis || {};
+    var label = !redis.configured ? 'Не настроена' : (redis.status === 'ok' ? 'Redis доступен' : 'Нет связи с Redis');
+    var detail = !redis.configured ? 'Общие данные между серверами не синхронизируются.' :
+        (redis.status === 'ok' ? 'Redis отвечает; общие данные синхронизируются.' : 'Сервис использует локальное состояние.');
+    var details = [detail];
+    if (redis.endpoint) details.push('<span data-no-i18n>' + esc(redis.endpoint) + '</span>');
+    return metricCard('Синхронизация данных', '<span class="metric-text">' + esc(label) + '</span>', details);
+}
+
+function overviewCards(stats) {
+    var sample = stats.recent_requests;
+    var sampleDetail = metricPair('Запросов в выборке:', sample);
+    var errorValue = sample > 0 ? metricNumber(stats.recent_error_rate_percent, 2) + '%' : '—';
+    return metricCard('Завершённые API-запросы', esc(metricNumber(stats.total_requests)), ['С момента запуска сервера.'],
+            'Один входящий API-запрос считается один раз, включая внутренние повторы через другие аккаунты.') +
+        metricCard('Запросов в секунду', esc(metricNumber(stats.requests_per_second_60s, 2)), ['Среднее за последние 60 секунд.']) +
+        metricCard('Время ответа · p95', esc(metricNumber(stats.recent_p95_ms)) + (stats.recent_p95_ms != null ? ' <span class="metric-unit">мс</span>' : ''),
+            [sampleDetail, sample > 0 ? '95% ответов укладываются в это время.' : 'Пока нет завершённых запросов.']) +
+        metricCard('Ответы с ошибками', esc(errorValue), [sampleDetail, sample > 0 ? metricPair('HTTP 4xx/5xx:', stats.total_errors) : 'Пока нет завершённых запросов.'],
+            'Доля ответов HTTP 4xx/5xx, включая 404 и 429, среди последних завершённых запросов. Журнал хранит до 5000 записей.') +
+        accountsCard(stats) + playbackCard(stats.playback, stats.playback_readiness) +
+        catalogCard(stats.catalog, stats.playback_readiness, stats.catalog_readiness) + redisCard(stats.redis);
 }
 
 var _testResults = {};
@@ -794,11 +873,21 @@ function renderTestResults(results) {
         html += '</div>';
         var badge = document.getElementById('test-' + id);
         if (badge) {
-            badge.className = r.ok ? 'card-stat test-pass' : 'card-stat test-fail';
-            badge.innerHTML = 'Проверка <strong>' + (r.ok ? 'OK ' + r.ms + ' мс' : 'Ошибка ' + esc(r.error || '')) + '</strong>';
+            badge.className = r.ok ? 'card-stat test-badge test-pass' : 'card-stat test-badge test-fail';
+            badge.innerHTML = '<span>Последний тест</span> <strong>' + (r.ok ? 'OK ' + r.ms + ' мс' : esc(testErrorSummary(r.error))) + '</strong>';
+            badge.title = tr('Результат ручной проверки. Подробности по нажатию; текущее состояние — в заголовке аккаунта.');
         }
     }
     document.getElementById('testResultsList').innerHTML = html;
+}
+
+function testErrorSummary(error) {
+    var text = String(error || '');
+    if (/cooling down/i.test(text)) return 'Ожидание обновления токена';
+    if (/RateLimited|429/i.test(text)) return 'Пауза 429';
+    if (/Unauthorized|TokenError|invalid_grant/i.test(text)) return 'Ошибка авторизации';
+    if (/Timeout|timed out/i.test(text)) return 'Нет ответа вовремя';
+    return 'Ошибка проверки';
 }
 
 function formatJsonString(str) {
@@ -963,15 +1052,8 @@ async function fetchData() {
         try { accounts = JSON.parse(accountsText); } catch(e) { document.getElementById('error').textContent = 'Accounts parse: ' + accountsText.slice(0, 200); return; }
         window._accounts = accounts.accounts;
 
-        document.getElementById('stats').innerHTML =
-            '<div class="stat-card" title="Входящие API-запросы с момента запуска сервера; внутренние переключения аккаунтов не дублируют счётчик"><div class="label">Всего запросов · с запуска</div><div class="value">' + (stats.total_requests || 0) + '</div></div>' +
-            '<div class="stat-card" title="Среднее число завершённых API-запросов в секунду за последние 60 секунд"><div class="label">Запросов/с · 60 с</div><div class="value">' + Number(stats.requests_per_second_60s || 0).toFixed(2) + '</div></div>' +
-            '<div class="stat-card" title="95% запросов в журнале (до 5000 последних) ответили не медленнее этого значения"><div class="label">p95 ответа · до 5000</div><div class="value">' + (stats.recent_p95_ms != null ? stats.recent_p95_ms + ' <span style="font-size:15px;color:var(--muted);font-weight:500">мс</span>' : '—') + '</div></div>' +
-            '<div class="stat-card" title="Доля ответов HTTP 4xx/5xx среди входящих API-запросов в журнале, до 5000 последних"><div class="label">Доля ошибок · до 5000</div><div class="value">' + (stats.error_rate || '0.00%') + '</div></div>' +
-            '<div class="stat-card" title="Действующий токен без паузы 429; для playback также требуется недавняя успешная FULL-проверка"><div class="label">Работают сейчас</div><div class="value">' + (stats.live_accounts || 0) + '<span style="font-size:15px;color:var(--muted);font-weight:500"> / ' + (stats.total_accounts || 0) + '</span></div><div style="font-size:11px;color:var(--muted);margin-top:5px"><span>Включено:</span> ' + (stats.active_accounts || 0) + '</div></div>' +
-            playbackCard(stats.playback) +
-            catalogCard(stats.catalog, accounts.accounts) +
-            redisCard(stats.redis);
+        window._stats = stats;
+        document.getElementById('stats').innerHTML = overviewCards(stats);
 
         var html = '';
         if (accounts.accounts.length === 0) {
@@ -980,11 +1062,12 @@ async function fetchData() {
             for (var i = 0; i < accounts.accounts.length; i++) {
                 var a = accounts.accounts[i];
                 var label = a.label || a.id.slice(0, 8);
-                var statusClass = 'status-dot ' + (a.is_active ? 'status-ok' : 'status-err');
-                var statusText = a.is_active ? 'Активен' : 'Отключён';
+                var readiness = accountStatus(a);
+                var statusClass = 'status-dot ' + readiness.tone;
+                var statusText = readiness.text;
                 var activeCls = a.is_active ? ' btn-active' : '';
                 var toggleText = a.is_active ? 'Включён' : 'Включить';
-                var tokenStr = timeStr(a.token_expires_at);
+                var tokenStr = tokenDescription(a);
                 var disabledAt = !a.is_active && Number(a.disabled_at) > 0 ? Number(a.disabled_at) : 0;
                 var disabledSince = disabledAt
                     ? new Date(disabledAt * 1000).toLocaleString(adminLanguage === 'ru' ? 'ru-RU' : 'en-GB', { day:'2-digit', month:'2-digit', year:'numeric', hour:'2-digit', minute:'2-digit' })
@@ -997,9 +1080,10 @@ async function fetchData() {
                     premiumClass = 'access-catalog';
                     premiumDescription = 'Аккаунт используется только для каталога';
                 } else if (a.premium_status === 'premium') {
-                    premiumLabel = 'FULL';
-                    premiumClass = 'access-full';
-                    premiumDescription = 'Полное воспроизведение подтверждено';
+                    var freshFull = a.availability && a.availability.full_check_fresh;
+                    premiumLabel = freshFull ? 'FULL' : 'FULL · УСТАРЕЛО';
+                    premiumClass = freshFull ? 'access-full' : 'access-unknown';
+                    premiumDescription = freshFull ? 'Полное воспроизведение подтверждено' : 'FULL подтверждался ранее; нужна новая проверка';
                 } else if (a.premium_status === 'preview-only') {
                     premiumLabel = 'PREVIEW';
                     premiumClass = 'access-preview';
@@ -1018,13 +1102,14 @@ async function fetchData() {
                     ? '<span class="card-stat access-check-time">FULL/PREVIEW <strong>для каталога не проверяется</strong></span>'
                     : (a.premium_checked_at
                         ? '<span class="card-stat access-check-time">Последняя FULL/PREVIEW проверка <strong>' + new Date(a.premium_checked_at * 1000).toLocaleString(adminLanguage === 'ru' ? 'ru-RU' : 'en-GB') + '</strong></span>'
-                        : '<span class="card-stat access-check-time">Автопроверка FULL/PREVIEW <strong>в течение 5 минут</strong></span>');
+                        : '<span class="card-stat access-check-time">Автопроверка FULL/PREVIEW <strong>' +
+                            ((a.availability || {}).state === 'no_token' ? 'ожидает токен' : (!a.is_active ? 'аккаунт отключён' : 'ожидает выполнения')) + '</strong></span>');
                 var catalogBtn = a.is_catalog
                     ? '<button class="btn" onclick="setCatalog(\'' + a.id + '\',false)" title="Вернуть в пул воспроизведения">Из каталога</button>'
                     : '<button class="btn" onclick="setCatalog(\'' + a.id + '\',true)" title="Использовать только для метаданных">В каталог</button>';
                 html += '<div class="account-card" data-search="' + esc((label + ' ' + uid + ' ' + a.client_id).toLowerCase()) + '">' +
                     '<div class="card-header">' +
-                        '<div class="left"><span class="acc-num">' + (i + 1) + '</span><span class="' + statusClass + '"></span><span class="label">' + esc(label) + '</span><span class="status-label ' + (a.is_active ? 'status-ok' : 'status-err') + '">' + statusText + '</span>' + catalogBadge + premiumBadge + '</div>' +
+                        '<div class="left"><span class="acc-num">' + (i + 1) + '</span><span class="' + statusClass + '"></span><span class="label">' + esc(label) + '</span><span class="status-label ' + readiness.tone + '">' + statusText + '</span>' + catalogBadge + premiumBadge + '</div>' +
                         '<div class="card-actions">' +
                             '<button class="btn" onclick="refreshAccount(\'' + a.id + '\')">Обновить токен</button>' +
                             '<button class="btn" onclick="checkPremium(\'' + a.id + '\')" title="Проверка FULL/PREVIEW отправляет до четырёх запросов к Tidal">Проверить FULL</button>' +
@@ -1043,14 +1128,15 @@ async function fetchData() {
                     '<div class="account-uptime" data-no-i18n id="uptime-' + esc(a.id) + '">' + uptimeCard(a.uptime) + '</div>' +
                     '<div class="card-footer">' +
                         '<div class="card-stats">' +
-                            '<span class="card-stat">Запросов <strong>' + a.request_count + '</strong></span>' +
-                            '<span class="card-stat">Ошибок <strong>' + a.error_count + '</strong></span>' +
-                            (a.auto_disabled ? '<span class="card-stat">Автовосстановление <strong>повтор</strong></span>' : '') +
-                            (!a.is_active ? '<span class="card-stat">' + (a.auto_disabled ? 'Упал' : 'Отключён с') + ' <strong>' + disabledSince + '</strong></span>' +
-                                '<span class="card-stat">Спит <strong>' + (disabledAt ? sleepDuration(disabledAt) : '—') + '</strong></span>' : '') +
-                            '<span class="card-stat">Токен <strong>' + tokenStr + '</strong></span>' +
+                            '<span class="card-stat" title="Обращения к этому аккаунту с запуска сервера, включая повторы для одного API-запроса">Обращений с запуска <strong>' + metricNumber(a.request_count) + '</strong></span>' +
+                            '<span class="card-stat" title="Ошибки запросов и обновления токена этого аккаунта с запуска сервера">Ошибок с запуска <strong>' + metricNumber(a.error_count) + '</strong></span>' +
+                            (a.heal_next_retry > Date.now() / 1000 ? '<span class="card-stat">Повтор обновления через <strong>' + esc(uptimeDuration(a.heal_next_retry - Date.now() / 1000)) + '</strong></span>' : (a.auto_disabled ? '<span class="card-stat">Восстановление <strong>ожидает попытки</strong></span>' : '')) +
+                            (a.rate_limited_until > Date.now() / 1000 ? '<span class="card-stat">Пауза 429 ещё <strong>' + esc(uptimeDuration(a.rate_limited_until - Date.now() / 1000)) + '</strong></span>' : '') +
+                            (!a.is_active ? '<span class="card-stat">' + (a.auto_disabled ? 'Автоотключён с' : 'Отключён с') + ' <strong>' + disabledSince + '</strong></span>' +
+                                '<span class="card-stat">Без работы <strong>' + (disabledAt ? sleepDuration(disabledAt) : '—') + '</strong></span>' : '') +
+                            '<span class="card-stat">' + ((a.availability || {}).token === 'valid' ? 'Токен действует ещё' : 'Токен') + ' <strong>' + tokenStr + '</strong></span>' +
                             premiumCheckStat +
-                            '<span class="card-stat test-badge" id="test-' + a.id + '" onclick="showTestDetails(\'' + a.id + '\')">Проверка <strong>—</strong></span>' +
+                            '<span class="card-stat test-badge" id="test-' + a.id + '" onclick="showTestDetails(\'' + a.id + '\')">Последний тест <strong>не запускался</strong></span>' +
                         '</div>' +
                     '</div>' +
                 '</div>';
@@ -1059,7 +1145,7 @@ async function fetchData() {
         document.getElementById('accounts-container').innerHTML = html;
         var liveAccounts = Number(stats.live_accounts || 0);
         var totalAccounts = Number(stats.total_accounts || accounts.accounts.length || 0);
-        document.getElementById('accountCount').innerHTML = '<span class="status-dot status-ok"></span><span>Работают</span><strong>' + liveAccounts + ' из ' + totalAccounts + '</strong>';
+        document.getElementById('accountCount').innerHTML = '<span class="status-dot ' + (liveAccounts > 0 ? 'status-ok' : (totalAccounts > 0 ? 'status-warn' : 'status-unknown')) + '"></span><span>Готовы сейчас</span><strong>' + metricNumber(liveAccounts) + ' <span>из</span> ' + metricNumber(totalAccounts) + '</strong>';
         filterAccounts(document.getElementById('accountSearch').value);
         renderTestResults(_testResults);
         return true;
@@ -1389,9 +1475,10 @@ async function loadApiKeys() {
         var keys = (await res.json()).api_keys || [];
         var html = '';
         for (var k of keys) {
-            var quota = (k.quota && k.quota > 0) ? (k.used + '/' + k.quota) : (k.used + '/∞');
+            var quota = metricNumber(k.used) + ' / ' + (k.quota > 0 ? metricNumber(k.quota) : '∞');
+            var keyStatus = !k.is_active ? 'Отключён' : (k.quota > 0 && k.used >= k.quota ? 'Квота исчерпана' : 'Доступен');
             html += '<div class="cred-row"><span class="cred-key">' + esc(k.label || k.key_prefix) + '</span>' +
-                '<span class="cred-value">' + esc(k.key_prefix) + '… · использовано ' + quota + ' · ' + (k.is_active ? 'активен' : 'отключён') + '</span>' +
+                '<span class="cred-value"><span data-no-i18n>' + esc(k.key_prefix) + '…</span> · <span>Использовано:</span> ' + quota + ' · <span>' + keyStatus + '</span></span>' +
                 '<span style="margin-left:auto;display:flex;gap:6px">' +
                 '<button class="btn" onclick="toggleApiKey(\'' + k.id + '\',' + (!k.is_active) + ')">' + (k.is_active ? 'Отключить' : 'Включить') + '</button>' +
                 '<button class="btn btn-danger" onclick="removeApiKey(\'' + k.id + '\')">Удалить</button>' +
@@ -1530,6 +1617,7 @@ async function loadCacheStats() {
         document.getElementById('cc-misses').textContent = c.misses != null ? c.misses : '—';
         document.getElementById('cc-stale').textContent = c.stale != null ? c.stale : '—';
         document.getElementById('cc-negative').textContent = c.negative != null ? c.negative : '—';
+        document.getElementById('cc-coalesced').textContent = c.coalesced != null ? c.coalesced : '—';
     } catch(e) {}
 }
 
@@ -1631,14 +1719,19 @@ async function loadProxyStatus() {
         var p = data.proxies || {};
         var assignments = p.assignments || [];
         proxyEnabled = !!p.enabled;
-        var trying = !p.last_try || Date.now() / 1000 - p.last_try < 20;
-        var status = !p.enabled ? 'Напрямую' : (assignments.some(function(a) { return a.verified; }) || p.ready ? 'Активен' : (trying ? 'Проверяем прокси' : 'Нет рабочего прокси'));
+        var trying = p.last_try && Date.now() / 1000 - p.last_try < 20;
+        var verified = assignments.filter(function(a) { return a.verified; }).length;
+        var status = !p.enabled ? 'Напрямую' : (verified > 0
+            ? (verified === assignments.length ? 'Назначения проверены' : 'Частично проверены')
+            : (p.ready ? 'Есть доступный прокси' : (!p.last_try ? 'Ожидают проверки' : (trying ? 'Проверяем прокси' : 'Нет рабочего прокси'))));
         document.getElementById('px-status').textContent = status;
         document.getElementById('px-current').textContent = p.enabled ? assignments.length : '—';
         document.getElementById('px-pool').textContent = p.pool_size != null ? p.pool_size : '—';
+        document.getElementById('px-verified').textContent = p.enabled ? verified + ' / ' + assignments.length : '—';
         document.getElementById('px-fails').textContent = assignments.reduce(function(sum, a) { return sum + (a.consecutive_fails || 0); }, 0);
         document.getElementById('overviewProxy').innerHTML = '<span>Прокси</span><span class="separator">·</span><span>' + status + '</span>' +
             (p.enabled ? '<span class="separator">·</span><span>Назначено <strong>' + assignments.length + '</strong></span>' +
+                '<span class="separator">·</span><span>Проверено назначений <strong>' + verified + ' / ' + assignments.length + '</strong></span>' +
                 '<span class="separator">·</span><span>В пуле <strong>' + (p.pool_size != null ? p.pool_size : '—') + '</strong></span>' : '');
         document.getElementById('px-assignments').textContent = p.enabled ? assignments.map(function(a) {
             var account = (window._accounts || []).find(function(item) { return item.id === a.account_id; });
