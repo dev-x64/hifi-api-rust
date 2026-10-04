@@ -168,6 +168,17 @@ impl Notifier {
         self.send_throttled("healed", payload).await;
     }
 
+    /// Fired when repeated PREVIEW checks move an account out of playback.
+    pub async fn alert_catalog_only(&self, label: &str) {
+        let payload = Self::embed(
+            "⚠️ Account moved to catalog-only",
+            "Three automatic checks in a row returned PREVIEW. The account now serves metadata only.",
+            0xD29922,
+            vec![json!({"name": "Account", "value": label, "inline": true})],
+        );
+        self.send_throttled("catalog", payload).await;
+    }
+
     /// Manual on-demand report from the admin panel (bypasses throttle).
     pub async fn send_report(&self, payload: Value) -> Result<(), String> {
         let url = self.settings.discord_webhook_url();

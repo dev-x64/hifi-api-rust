@@ -5,9 +5,10 @@
 //! a pollable job (`202 + Location: /playback/requests/{id}`) instead of
 //! failing. Jobs expire 300s after finishing and can be cancelled.
 //!
-//! Slots here are concurrency permits sized to the playback pool
-//! (non-catalog accounts); the wrapped operation still uses the normal
-//! multi-account failover inside its slot.
+//! Slots here are concurrency permits sized to the playback accounts that
+//! can serve right now (enabled, non-catalog, usable token, no 429 pause);
+//! the wrapped operation still uses the normal multi-account failover
+//! inside its slot.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};

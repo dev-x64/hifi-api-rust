@@ -119,6 +119,24 @@ pub async fn start_autoheal_loop(
                             let previous = account.premium_status.read().await.clone();
                             let (status, reason) = tidal.probe_account_premium(&account).await;
                             am.set_premium(&account.id, &status).await;
+                            if status == "preview-only" {
+                                match am.note_preview_check(&account).await {
+                                    Ok(true) => {
+                                        tracing::warn!(
+                                            account = %account.label,
+                                            "Account moved to catalog-only after {} PREVIEW checks in a row",
+                                            crate::account_manager::PREVIEW_CHECKS_BEFORE_CATALOG
+                                        );
+                                        notifier.alert_catalog_only(&account.label).await;
+                                    }
+                                    Ok(false) => {}
+                                    Err(e) => tracing::warn!(
+                                        "Could not move {} to catalog-only: {}",
+                                        account.label,
+                                        e
+                                    ),
+                                }
+                            }
                             if status != previous {
                                 tracing::info!(
                                     account = %account.label,

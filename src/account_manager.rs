@@ -12,6 +12,10 @@ use crate::error::AppError;
 use crate::proxy_manager::ProxyManager;
 use crate::upstash::UpstashStore;
 
+/// Consecutive automatic FULL/PREVIEW checks that must return PREVIEW before
+/// a playback account is moved to catalog-only.
+pub const PREVIEW_CHECKS_BEFORE_CATALOG: i64 = 3;
+
 #[derive(Clone, Debug)]
 pub struct SwitchingWeights {
     pub balance: f64,
@@ -70,6 +74,9 @@ pub struct AccountState {
     /// Result of the latest automatic or manual FULL/PREVIEW probe; informational only.
     pub premium_status: RwLock<String>,
     pub premium_checked_at: AtomicI64,
+    /// Automatic checks in a row that returned PREVIEW. A FULL result resets
+    /// it; inconclusive checks leave it unchanged.
+    pub preview_streak: AtomicI64,
     /// Original insertion time. Used to keep the admin account list stable.
     pub created_at: AtomicI64,
     /// Last mutation unix timestamp (local admin ops AND Redis merges).
@@ -118,6 +125,7 @@ impl AccountState {
             rate_limited_until: AtomicI64::new(0),
             premium_status: RwLock::new("unknown".to_string()),
             premium_checked_at: AtomicI64::new(0),
+            preview_streak: AtomicI64::new(0),
             created_at: AtomicI64::new(0),
             updated_at: AtomicI64::new(0),
         }
@@ -189,6 +197,8 @@ impl AccountState {
                 old.premium_checked_at.load(Ordering::Relaxed),
                 Ordering::Relaxed,
             );
+            new.preview_streak
+                .store(old.preview_streak.load(Ordering::Relaxed), Ordering::Relaxed);
         } else {
             new.token_expires_at.store(0, Ordering::Relaxed);
             new.heal_failures.store(0, Ordering::Relaxed);
@@ -204,6 +214,16 @@ impl AccountState {
     pub async fn uptime_summary(&self, now: i64) -> crate::account_uptime::UptimeSummary {
         self.observe_uptime(now).await;
         self.uptime_history().lock().await.summary(now)
+    }
+
+    /// A token Tidal accepts right now: present, unexpired and not rejected.
+    pub(crate) async fn has_usable_token(&self, now: i64) -> bool {
+        let token = self.access_token.read().await;
+        let Some(token) = token.as_deref().filter(|token| !token.is_empty()) else {
+            return false;
+        };
+        let rejected = self.rejected_access_token.read().await;
+        self.token_expires_at.load(Ordering::Relaxed) > now && rejected.as_deref() != Some(token)
     }
 
     pub(crate) async fn observe_uptime(&self, now: i64) {
@@ -303,6 +323,7 @@ pub struct DbAccountRow {
     pub heal_next_retry: i64,
     pub rejected_access_token: Option<String>,
     pub last_refresh_error: Option<String>,
+    pub preview_streak: i64,
 }
 
 /// Extract a numeric user id from an auto-generated "Tidal Account (<id>)" label.
@@ -422,7 +443,8 @@ impl AccountManager {
             "SELECT a.id, a.label, a.client_id, a.client_secret, a.refresh_token,
              a.user_id, a.is_active, a.auto_disabled, a.disabled_at, a.is_catalog, a.notes,
              t.access_token, t.expires_at, a.updated_at, a.created_at,
-             a.heal_failures, a.heal_next_retry, a.rejected_access_token, a.last_refresh_error
+             a.heal_failures, a.heal_next_retry, a.rejected_access_token, a.last_refresh_error,
+             a.preview_streak
              FROM accounts a
              LEFT JOIN tokens t ON t.account_id = a.id
              ORDER BY a.created_at ASC",
@@ -489,6 +511,7 @@ impl AccountManager {
             state.heal_next_retry.store(row.heal_next_retry.max(0), Ordering::Relaxed);
             *state.rejected_access_token.write().await = row.rejected_access_token;
             state.set_last_refresh_error(row.last_refresh_error);
+            state.preview_streak.store(row.preview_streak.max(0), Ordering::Relaxed);
             self.load_uptime(&state).await?;
             accounts.push(state);
         }
@@ -729,19 +752,26 @@ impl AccountManager {
     }
 
     /// Playback pool size (upstream: PlaybackCredentialPool.size).
-    /// Only accounts that can actually be selected count: active,
-    /// non-catalog. Minimum 1 so callers without playback accounts still
-    /// run once and surface the real error.
+    /// Only accounts that can serve a request right now count: active,
+    /// non-catalog, holding a usable token and not on a 429 pause. Enabled
+    /// accounts without a token must not widen the gate, or the working
+    /// ones would each take several requests at once. Minimum 1 so a
+    /// request still runs, triggers a token refresh and surfaces the real
+    /// error when nothing is ready.
     pub async fn playback_slots(&self) -> usize {
-        self.accounts
-            .read()
-            .await
-            .iter()
-            .filter(|a| {
-                !a.is_catalog.load(Ordering::Relaxed) && a.is_active.load(Ordering::Relaxed)
-            })
-            .count()
-            .max(1)
+        let now = Utc::now().timestamp();
+        let accounts = self.accounts.read().await;
+        let mut slots = 0;
+        for account in accounts.iter() {
+            if !account.is_catalog.load(Ordering::Relaxed)
+                && account.is_active.load(Ordering::Relaxed)
+                && Self::rate_limit_remaining(account).is_none()
+                && account.has_usable_token(now).await
+            {
+                slots += 1;
+            }
+        }
+        slots.max(1)
     }
 
     /// Number of selectable playback (active, non-catalog) accounts.
@@ -864,6 +894,42 @@ impl AccountManager {
             account
                 .premium_checked_at
                 .store(Utc::now().timestamp(), Ordering::Relaxed);
+            // Only a confirmed FULL result ends a PREVIEW streak; an
+            // inconclusive check says nothing about the subscription.
+            if status == "premium" && account.preview_streak.swap(0, Ordering::Relaxed) != 0 {
+                self.save_preview_streak(&account).await;
+            }
+        }
+    }
+
+    /// Count one automatic check that returned PREVIEW. The third in a row
+    /// makes the account catalog-only: it can still serve metadata, while
+    /// playback would only return previews. Returns true when it was moved.
+    pub async fn note_preview_check(&self, account: &AccountState) -> Result<bool, AppError> {
+        let streak = account.preview_streak.fetch_add(1, Ordering::Relaxed) + 1;
+        if streak < PREVIEW_CHECKS_BEFORE_CATALOG {
+            self.save_preview_streak(account).await;
+            return Ok(false);
+        }
+        // Keep the streak until the flag is stored, so a failed write is
+        // retried by the next check.
+        self.set_account_catalog(&account.id, true).await?;
+        account.preview_streak.store(0, Ordering::Relaxed);
+        self.save_preview_streak(account).await;
+        Ok(true)
+    }
+
+    async fn save_preview_streak(&self, account: &AccountState) {
+        let Some(db) = &self.db else {
+            return;
+        };
+        if let Err(error) = sqlx::query("UPDATE accounts SET preview_streak = ? WHERE id = ?")
+            .bind(account.preview_streak.load(Ordering::Relaxed))
+            .bind(&account.id)
+            .execute(db)
+            .await
+        {
+            tracing::warn!(account = %account.id, "Could not persist PREVIEW streak: {error}");
         }
     }
 
@@ -1685,6 +1751,11 @@ mod tests {
             .await
             .unwrap();
         am.set_account_catalog(&c.id, true).await.unwrap();
+        let now = chrono::Utc::now().timestamp();
+        for account in [&a, &b, &c] {
+            *account.access_token.write().await = Some("token".into());
+            account.token_expires_at.store(now + 3600, Ordering::Relaxed);
+        }
         assert_eq!(am.playback_count().await, 2);
         assert_eq!(am.playback_slots().await, 2);
         am.set_account_active(&b.id, false).await.unwrap();
@@ -1695,6 +1766,81 @@ mod tests {
             let picked = am.select_account_excluding(&[]).await.unwrap();
             assert_eq!(picked.id, a.id);
         }
+    }
+
+    #[tokio::test]
+    async fn three_preview_checks_in_a_row_move_an_account_to_catalog() {
+        use super::{AccountManager, SwitchingWeights};
+        let db = crate::db::init_pool("sqlite::memory:").await.unwrap();
+        let am = AccountManager::new(Some(db.clone()), SwitchingWeights::default());
+        let account = am
+            .add_account("a".into(), "c".into(), "s".into(), "r".into(), None)
+            .await
+            .unwrap();
+
+        assert!(!am.note_preview_check(&account).await.unwrap());
+        assert!(!am.note_preview_check(&account).await.unwrap());
+        // An inconclusive check neither counts nor clears the streak.
+        am.set_premium(&account.id, "unknown").await;
+        assert_eq!(account.preview_streak.load(Ordering::Relaxed), 2);
+        // A FULL result starts the count again.
+        am.set_premium(&account.id, "premium").await;
+        assert_eq!(account.preview_streak.load(Ordering::Relaxed), 0);
+
+        assert!(!am.note_preview_check(&account).await.unwrap());
+        assert!(!am.note_preview_check(&account).await.unwrap());
+        assert!(!account.is_catalog.load(Ordering::Relaxed));
+        let stored: (i64,) = sqlx::query_as("SELECT preview_streak FROM accounts WHERE id = ?")
+            .bind(&account.id)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(stored.0, 2);
+
+        assert!(am.note_preview_check(&account).await.unwrap());
+        assert!(account.is_catalog.load(Ordering::Relaxed));
+        assert_eq!(account.preview_streak.load(Ordering::Relaxed), 0);
+        assert_eq!(am.playback_count().await, 0);
+        let stored: (i64, i64) =
+            sqlx::query_as("SELECT is_catalog, preview_streak FROM accounts WHERE id = ?")
+                .bind(&account.id)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(stored, (1, 0));
+    }
+
+    #[tokio::test]
+    async fn playback_slots_count_only_accounts_that_can_serve_now() {
+        use super::{AccountManager, SwitchingWeights};
+        let am = AccountManager::new(None, SwitchingWeights::default());
+        let mut accounts = Vec::new();
+        for label in ["a", "b", "c", "d"] {
+            accounts.push(
+                am.add_account(label.into(), "c".into(), "s".into(), format!("rt-{label}"), None)
+                    .await
+                    .unwrap(),
+            );
+        }
+        // Enabled accounts without a token keep the floor of one slot.
+        assert_eq!(am.playback_count().await, 4);
+        assert_eq!(am.playback_slots().await, 1);
+
+        let now = chrono::Utc::now().timestamp();
+        for account in &accounts {
+            *account.access_token.write().await = Some("token".into());
+            account.token_expires_at.store(now + 3600, Ordering::Relaxed);
+        }
+        assert_eq!(am.playback_slots().await, 4);
+
+        accounts[0].token_expires_at.store(now - 1, Ordering::Relaxed);
+        assert_eq!(am.playback_slots().await, 3);
+        *accounts[1].rejected_access_token.write().await = Some("token".into());
+        assert_eq!(am.playback_slots().await, 2);
+        accounts[2].rate_limited_until.store(now + 60, Ordering::Relaxed);
+        assert_eq!(am.playback_slots().await, 1);
+        // Failover still walks every enabled account.
+        assert_eq!(am.playback_count().await, 4);
     }
 
     #[tokio::test]

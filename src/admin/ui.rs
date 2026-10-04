@@ -820,10 +820,10 @@ function playbackCard(pb, readiness) {
     if (pb.pending > 0) rows.push(metricRow('Самое долгое ожидание', esc(uptimeDuration(pb.oldest_pending_secs))));
     var note = '';
     if (readiness.enabled === 0) note = '<span>Нет включённых аккаунтов воспроизведения.</span>';
-    else if (readiness.ready < readiness.enabled) note = '<span>Лимит считается по включённым аккаунтам; к FULL сейчас готовы</span> <strong>' +
-        esc(metricNumber(readiness.ready)) + '</strong> <span>из</span> <strong>' + esc(metricNumber(readiness.enabled)) + '</strong>';
+    else if (limit < readiness.enabled) note = '<span>Обслуживать запросы могут</span> <strong>' + esc(metricNumber(readiness.metadata_ready)) +
+        '</strong> <span>из</span> <strong>' + esc(metricNumber(readiness.enabled)) + '</strong> <span>включённых аккаунтов; остальные без токена или на паузе 429.</span>';
     return metricCard('Запросы воспроизведения', esc(metricNumber(pb.active)) + ' <span class="metric-unit">выполняются</span>', [],
-        'Запросы треков, видео и лицензий, выполняемые в момент обновления. Лимит задан включёнными аккаунтами; их готовность показана отдельно.',
+        'Запросы треков, видео и лицензий, выполняемые в момент обновления. Лимит равен числу аккаунтов воспроизведения с действующим токеном и без паузы 429.',
         meter + metricRows(rows) + (note ? '<div class="stat-note">' + note + '</div>' : ''));
 }
 
@@ -1176,6 +1176,8 @@ async function fetchData() {
                         ? '<span class="card-stat access-check-time">Последняя FULL/PREVIEW проверка <strong>' + new Date(a.premium_checked_at * 1000).toLocaleString(adminLanguage === 'ru' ? 'ru-RU' : 'en-GB') + '</strong></span>'
                         : '<span class="card-stat access-check-time">Автопроверка FULL/PREVIEW <strong>' +
                             ((a.availability || {}).state === 'no_token' ? 'ожидает токен' : (!a.is_active ? 'аккаунт отключён' : 'ожидает выполнения')) + '</strong></span>');
+                if (!a.is_catalog && a.preview_streak > 0) premiumCheckStat += '<span class="card-stat" title="Автоматические проверки PREVIEW подряд. При достижении лимита аккаунт переводится только в каталог; результат FULL обнуляет счётчик.">PREVIEW подряд <strong>' +
+                    metricNumber(a.preview_streak) + ' / ' + metricNumber(a.preview_streak_limit) + '</strong></span>';
                 var catalogBtn = a.is_catalog
                     ? '<button class="btn" onclick="setCatalog(\'' + a.id + '\',false)" title="Вернуть в пул воспроизведения">Из каталога</button>'
                     : '<button class="btn" onclick="setCatalog(\'' + a.id + '\',true)" title="Использовать только для метаданных">В каталог</button>';

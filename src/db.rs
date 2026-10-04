@@ -59,6 +59,7 @@ pub async fn init_pool(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
         ("heal_next_retry", "INTEGER NOT NULL DEFAULT 0"),
         ("rejected_access_token", "TEXT"),
         ("last_refresh_error", "TEXT"),
+        ("preview_streak", "INTEGER NOT NULL DEFAULT 0"),
     ] {
         if !cols.iter().any(|c| c.1 == name) {
             sqlx::query(&format!("ALTER TABLE accounts ADD COLUMN {name} {definition}"))
