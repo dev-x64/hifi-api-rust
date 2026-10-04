@@ -25,7 +25,6 @@ body { font-family:'SF Mono','Fira Code','Cascadia Code','JetBrains Mono',Menlo,
 .header h1 { font-size:22px; color:#f0f6fc; letter-spacing:-0.3px; }
 .header .badge { font-size:11px; background:#1f6feb; color:#fff; padding:3px 10px; border-radius:10px; font-weight:500; }
 
-.stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; margin-bottom:24px; }
 .stat-card { background:#161b22; border:1px solid #30363d; border-radius:10px; padding:18px 20px; transition:border-color 0.2s; }
 .stat-card:hover { border-color:#484f58; }
 .stat-card .label { font-size:11px; color:#8b949e; text-transform:uppercase; letter-spacing:0.5px; }
@@ -163,7 +162,6 @@ body { font-family:'SF Mono','Fira Code','Cascadia Code','JetBrains Mono',Menlo,
 
 @media (max-width:768px) {
   body { padding:12px; }
-  .stats { grid-template-columns:repeat(2,1fr); gap:10px; }
   .card-header { flex-direction:column; align-items:stretch; }
   .card-footer { flex-direction:column; align-items:stretch; gap:12px; }
   .card-stats { gap:10px; }
@@ -178,7 +176,6 @@ body { font-family:'SF Mono','Fira Code','Cascadia Code','JetBrains Mono',Menlo,
 }
 
 @media (max-width:480px) {
-  .stats { grid-template-columns:1fr; }
   .modal { padding:20px; max-width:96vw; }
 }
 
@@ -260,18 +257,34 @@ button:focus-visible,input:focus-visible,select:focus-visible { outline:2px soli
 .section-head h2 { font-size:17px; letter-spacing:-.25px; }
 .section-head p { color:var(--muted); font-size:12px; margin-top:5px; line-height:1.45; }
 .section-actions { display:flex; gap:8px; flex-wrap:wrap; }
-.stats { grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; }
-.overview-proxy { display:flex; flex-wrap:wrap; align-items:center; gap:6px 10px; margin:-8px 0 22px; color:var(--muted); font:11px/1.5 Inter,sans-serif; }
-.overview-proxy strong { color:#b8c1cc; font-weight:600; }
-.overview-proxy .separator { opacity:.45; }
+.overview { display:grid; gap:24px; margin-bottom:30px; }
+.ov-title { margin-bottom:10px; color:#c5ccd6; font-size:13px; font-weight:650; }
+.ov-grid { display:grid; gap:12px; }
+.ov-4 { grid-template-columns:repeat(4,minmax(0,1fr)); }
+.ov-3 { grid-template-columns:repeat(3,minmax(0,1fr)); }
+.ov-2 { grid-template-columns:repeat(2,minmax(0,1fr)); }
 .stat-card { border-color:var(--line); background:linear-gradient(145deg,#151a22,#11161d); border-radius:12px; padding:18px; min-height:100px; }
 .stat-card:hover { border-color:#394452; }
-.stat-card .label { color:var(--muted); font-family:Inter,sans-serif; font-size:10px; font-weight:700; }
-.stat-card .value { font-family:Inter,sans-serif; color:var(--text); font-size:25px; margin-top:10px; }
-.metric-unit { font-size:14px; color:var(--muted); font-weight:500; }
-.metric-text { font-size:18px; }
-.stat-details { display:grid; gap:6px; margin-top:10px; font-size:11px; line-height:1.5; color:var(--muted); overflow-wrap:anywhere; }
+.stat-card .label { color:var(--muted); font-family:Inter,sans-serif; font-size:12px; font-weight:600; text-transform:none; letter-spacing:0; }
+.stat-card .value { font-family:Inter,sans-serif; color:var(--text); font-size:26px; margin-top:8px; font-variant-numeric:tabular-nums; }
+.metric-unit { font-size:14px; color:var(--muted); font-weight:500; letter-spacing:0; }
+.metric-text { display:inline-flex; align-items:center; gap:9px; font-size:17px; letter-spacing:-.2px; }
+.stat-details { display:grid; gap:5px; margin-top:10px; font-size:12px; line-height:1.5; color:var(--muted); overflow-wrap:anywhere; }
+.stat-details:empty { display:none; }
 .stat-details strong { color:var(--text); font-weight:600; }
+.stat-bar { display:flex; gap:2px; height:8px; margin-top:14px; border-radius:4px; overflow:hidden; }
+.stat-bar i { display:block; flex:1 1 0; min-width:4px; }
+.stat-meter { background:#222a35; }
+.stat-meter i { flex:none; min-width:0; border-radius:4px; background:var(--accent-2); }
+.stat-rows { display:grid; gap:7px; margin-top:12px; font-size:12px; line-height:1.4; color:#aab4c0; }
+.stat-row { display:flex; align-items:center; gap:8px; }
+.stat-row strong { margin-left:auto; padding-left:12px; color:var(--text); font-weight:600; font-variant-numeric:tabular-nums; white-space:nowrap; }
+.stat-card .status-dot { width:8px; height:8px; box-shadow:none; }
+.stat-card .status-ok { background:#2fa36b; }
+.stat-card .status-warn { background:#f4b860; }
+.stat-card .status-err { background:#ff6b6b; }
+.stat-note { margin-top:12px; padding:1px 0 1px 10px; border-left:2px solid #f4b860; color:var(--muted); font-size:12px; line-height:1.5; }
+.stat-note strong { color:var(--text); font-weight:600; }
 .account-card,.form-section,.test-results-section,.terminal { background:var(--panel); border-color:var(--line); border-radius:12px; box-shadow:none; }
 .account-card:hover,.form-section:hover,.test-results-section:hover { border-color:#35404d; box-shadow:0 12px 36px rgba(0,0,0,.18); }
 .card-header,.test-results-section .test-results-header { background:var(--panel-2); border-color:var(--line); }
@@ -322,7 +335,7 @@ button:focus-visible,input:focus-visible,select:focus-visible { outline:2px soli
 .minimal-login .auth-error { margin:11px 2px 0; min-height:18px; }
 .sr-only { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0; }
 @media (max-width:1150px) {
-  .stats { grid-template-columns:repeat(2,minmax(0,1fr)); }
+  .ov-4 { grid-template-columns:repeat(2,minmax(0,1fr)); }
 }
 @media (max-width:980px) {
   .system-grid { grid-template-columns:1fr; }
@@ -338,12 +351,12 @@ button:focus-visible,input:focus-visible,select:focus-visible { outline:2px soli
   .header { margin-top:4px; }
   .header h1 { font-size:24px; }
   .header-actions .btn:not(.mobile-keep) { display:none; }
-  .stats { grid-template-columns:1fr 1fr; }
+  .ov-2,.ov-3 { grid-template-columns:1fr; }
   .toolbar,.section-head { align-items:stretch; flex-direction:column; }
   .search-wrap { width:100%; }
 }
 @media (max-width:480px) {
-  .stats { grid-template-columns:1fr; }
+  .ov-4 { grid-template-columns:1fr; }
   .card-actions { width:100%; display:grid; grid-template-columns:1fr 1fr; }
   .card-actions .btn { width:100%; }
   .section-actions { display:grid; grid-template-columns:1fr 1fr; }
@@ -384,8 +397,7 @@ button:focus-visible,input:focus-visible,select:focus-visible { outline:2px soli
   <div id="error" class="error"></div><div id="success" class="success"></div>
 
   <section id="view-overview" class="view active">
-    <div id="stats" class="stats"></div>
-    <div id="overviewProxy" class="overview-proxy"><span>Прокси</span><span class="separator">·</span><span>—</span></div>
+    <div id="stats" class="overview"></div>
     <div class="section-head"><div><h2>Журнал запросов</h2><p>Последняя активность обновляется автоматически каждые 15 секунд.</p></div><div class="section-actions"><button class="btn" id="requestLogDetails" aria-pressed="false" onclick="toggleRequestLogDetails()">Доп. поля</button><button class="btn" id="requestLogMore" onclick="showMoreRequests()">Показать ещё</button><button class="btn" onclick="loadRequestLog()">Обновить журнал</button></div></div>
     <div class="terminal" id="requestLogTerminal">
       <div class="term-bar"><span class="term-dots"><i></i><i></i><i></i></span><span class="term-title">hifi-api — live request log</span><span class="term-live" id="term-live">● LIVE</span></div>
@@ -754,80 +766,127 @@ function metricPair(label, value) {
     return '<span>' + esc(label) + '</span> <strong>' + esc(metricNumber(value)) + '</strong>';
 }
 
-function metricCard(label, value, details, title) {
+function metricCard(label, value, details, title, body) {
     return '<div class="stat-card"' + (title ? ' title="' + esc(title) + '"' : '') + '><div class="label">' + esc(label) + '</div>' +
-        '<div class="value">' + value + '</div><div class="stat-details">' + (details || []).map(function(detail) {
+        '<div class="value">' + value + '</div>' + (body || '') + '<div class="stat-details">' + (details || []).map(function(detail) {
             return '<div>' + detail + '</div>';
         }).join('') + '</div></div>';
+}
+
+function metricRow(label, value, tone) {
+    return '<div class="stat-row">' + (tone ? '<span class="status-dot ' + tone + '"></span>' : '') +
+        '<span>' + esc(label) + '</span><strong>' + value + '</strong></div>';
+}
+
+function metricRows(rows) {
+    return rows.length ? '<div class="stat-rows">' + rows.join('') + '</div>' : '';
+}
+
+function metricStatus(label, tone) {
+    return '<span class="metric-text"><span class="status-dot ' + tone + '"></span><span>' + esc(label) + '</span></span>';
+}
+
+function overviewGroup(title, columns, cards) {
+    return '<section><h2 class="ov-title">' + esc(title) + '</h2><div class="ov-grid ov-' + columns + '">' + cards + '</div></section>';
 }
 
 function accountsCard(stats) {
     var counts = stats.account_readiness || {};
     var playback = stats.playback_readiness || {}, catalog = stats.catalog_readiness || {};
-    var reasons = [];
-    [['no_token', 'Без токена:'], ['needs_check', 'Нужна FULL-проверка:'], ['preview_only', 'Только PREVIEW:'], ['rate_limited', 'Пауза 429:']].forEach(function(item) {
-        if (counts[item[0]]) reasons.push(metricPair(item[1], counts[item[0]]));
+    var total = counts.total || 0, ready = counts.ready || 0, disabled = counts.disabled || 0;
+    var waiting = Math.max(0, total - ready - disabled);
+    var bar = total > 0 ? '<div class="stat-bar" aria-hidden="true">' +
+        [['status-ok', ready], ['status-warn', waiting], ['status-err', disabled]].map(function(segment) {
+            return segment[1] > 0 ? '<i class="' + segment[0] + '" style="flex-grow:' + segment[1] + '"></i>' : '';
+        }).join('') + '</div>' : '';
+    var rows = [metricRow('Готовы к FULL', esc(metricNumber(playback.ready)), 'status-ok')];
+    if (catalog.total > 0) rows.push(metricRow('Готовы к каталогу', esc(metricNumber(catalog.ready)), 'status-ok'));
+    [['no_token', 'Без токена'], ['needs_check', 'Нужна FULL-проверка'], ['preview_only', 'Только PREVIEW'], ['rate_limited', 'Пауза 429']].forEach(function(item) {
+        if (counts[item[0]]) rows.push(metricRow(item[1], esc(metricNumber(counts[item[0]])), 'status-warn'));
     });
-    var details = [metricPair('Включено:', counts.enabled) + ' · ' + metricPair('Отключено:', counts.disabled),
-        metricPair('Готовы FULL:', playback.ready) + ' · ' + metricPair('Каталог:', catalog.ready)];
-    if (reasons.length) details.push(reasons.join(' · '));
-    if (counts.total === 0) details.push('Добавьте аккаунт для доступа к Tidal.');
-    return metricCard('Готовые аккаунты', esc(metricNumber(counts.ready)) + ' <span class="metric-unit"><span>из</span> ' + esc(metricNumber(counts.total)) + '</span>', details,
-        'Готовность: действующий токен и отсутствие паузы 429. Для воспроизведения нужна подтверждённая FULL-проверка не старше 8 часов.');
+    if (disabled) rows.push(metricRow('Отключены', esc(metricNumber(disabled)), 'status-err'));
+    return metricCard('Готовые аккаунты', esc(metricNumber(ready)) + ' <span class="metric-unit"><span>из</span> ' + esc(metricNumber(total)) + '</span>',
+        total === 0 ? ['Добавьте аккаунт для доступа к Tidal.'] : [],
+        'Готовность: действующий токен и отсутствие паузы 429. Для воспроизведения нужна подтверждённая FULL-проверка не старше 8 часов.',
+        total > 0 ? bar + metricRows(rows) : '');
 }
 
 function playbackCard(pb, readiness) {
     pb = pb || {}; readiness = readiness || {};
-    var details = [metricPair('В очереди:', pb.pending), metricPair('Лимит одновременно:', pb.pool_size),
-        metricPair('Включено аккаунтов:', readiness.enabled) + ' · ' + metricPair('Готовы FULL:', readiness.ready)];
-    if (readiness.enabled === 0) details.push('Нет включённых аккаунтов воспроизведения.');
-    if (pb.pending > 0) details.push('<span>Самое долгое ожидание:</span> <strong>' + esc(uptimeDuration(pb.oldest_pending_secs)) + '</strong>');
-    return metricCard('Запросы воспроизведения', esc(metricNumber(pb.active)) + ' <span class="metric-unit">выполняются</span>', details,
-        'Запросы треков, видео и лицензий, выполняемые в момент обновления. Лимит задан включёнными аккаунтами; их готовность показана отдельно.');
+    var limit = pb.pool_size || 0, active = pb.active || 0;
+    var meter = '<div class="stat-bar stat-meter" aria-hidden="true"><i style="width:' +
+        (limit > 0 ? Math.min(100, active * 100 / limit) : 0).toFixed(1) + '%"></i></div>';
+    var rows = [metricRow('Лимит одновременно', esc(metricNumber(pb.pool_size))), metricRow('В очереди', esc(metricNumber(pb.pending)))];
+    if (pb.pending > 0) rows.push(metricRow('Самое долгое ожидание', esc(uptimeDuration(pb.oldest_pending_secs))));
+    var note = '';
+    if (readiness.enabled === 0) note = '<span>Нет включённых аккаунтов воспроизведения.</span>';
+    else if (readiness.ready < readiness.enabled) note = '<span>Лимит считается по включённым аккаунтам; к FULL сейчас готовы</span> <strong>' +
+        esc(metricNumber(readiness.ready)) + '</strong> <span>из</span> <strong>' + esc(metricNumber(readiness.enabled)) + '</strong>';
+    return metricCard('Запросы воспроизведения', esc(metricNumber(pb.active)) + ' <span class="metric-unit">выполняются</span>', [],
+        'Запросы треков, видео и лицензий, выполняемые в момент обновления. Лимит задан включёнными аккаунтами; их готовность показана отдельно.',
+        meter + metricRows(rows) + (note ? '<div class="stat-note">' + note + '</div>' : ''));
 }
 
 function catalogCard(cat, playback, catalog) {
     cat = cat || {}; playback = playback || {}; catalog = catalog || {};
     var mode = cat.mode || 'pool';
     var label = mode === 'static_token' ? 'Статичный токен' : (mode === 'account' ? 'Аккаунты каталога' : 'Пул воспроизведения');
-    var details;
+    var details, tone = 'status-unknown';
     if (mode === 'static_token') {
         details = ['Токен настроен; доступ проверяется при запросе.', metricPair('Резервных аккаунтов каталога:', catalog.enabled)];
     } else {
         var source = mode === 'account' ? catalog : playback;
+        tone = !source.metadata_ready ? 'status-err' : (source.metadata_ready < source.enabled ? 'status-warn' : 'status-ok');
         details = [metricPair('С действующим токеном:', source.metadata_ready) + ' <span>из</span> ' + esc(metricNumber(source.enabled)) + ' <span>включённых</span>',
             'Для метаданных FULL-проверка не требуется.'];
         if (!source.enabled) details.push('Нет включённых аккаунтов для метаданных.');
         else if (!source.metadata_ready) details.push('Нет готовых токенов; требуется обновление или завершение паузы.');
         if (mode === 'pool' && catalog.total > 0) details.push('Аккаунты каталога отключены или на паузе 429.');
     }
-    return metricCard('Источник метаданных', '<span class="metric-text">' + esc(label) + '</span>', details,
+    return metricCard('Источник метаданных', metricStatus(label, tone), details,
         'Приоритет источников: статичный токен → аккаунты каталога → пул воспроизведения.');
 }
 
 function redisCard(redis) {
     redis = redis || {};
     var label = !redis.configured ? 'Не настроена' : (redis.status === 'ok' ? 'Redis доступен' : 'Нет связи с Redis');
+    var tone = !redis.configured ? 'status-unknown' : (redis.status === 'ok' ? 'status-ok' : 'status-err');
     var detail = !redis.configured ? 'Общие данные между серверами не синхронизируются.' :
         (redis.status === 'ok' ? 'Redis отвечает; общие данные синхронизируются.' : 'Сервис использует локальное состояние.');
     var details = [detail];
     if (redis.endpoint) details.push('<span data-no-i18n>' + esc(redis.endpoint) + '</span>');
-    return metricCard('Синхронизация данных', '<span class="metric-text">' + esc(label) + '</span>', details);
+    return metricCard('Синхронизация данных', metricStatus(label, tone), details);
+}
+
+// Filled by loadProxyStatus(); the overview re-renders on every stats refresh.
+var overviewProxy = null;
+
+function proxyCard(proxy) {
+    if (!proxy) return metricCard('Прокси', '<span class="metric-text">—</span>', []);
+    if (!proxy.enabled) return metricCard('Прокси', metricStatus(proxy.status, proxy.tone), ['Запросы к Tidal идут без прокси.']);
+    return metricCard('Прокси', metricStatus(proxy.status, proxy.tone), [], '',
+        metricRows([metricRow('Проверено назначений', esc(metricNumber(proxy.verified)) + ' / ' + esc(metricNumber(proxy.assigned))),
+            metricRow('В пуле', esc(metricNumber(proxy.pool_size)))]));
 }
 
 function overviewCards(stats) {
     var sample = stats.recent_requests;
-    var sampleDetail = metricPair('Запросов в выборке:', sample);
+    var noRequests = 'Пока нет завершённых запросов.';
     var errorValue = sample > 0 ? metricNumber(stats.recent_error_rate_percent, 2) + '%' : '—';
-    return metricCard('Завершённые API-запросы', esc(metricNumber(stats.total_requests)), ['С момента запуска сервера.'],
-            'Один входящий API-запрос считается один раз, включая внутренние повторы через другие аккаунты.') +
-        metricCard('Запросов в секунду', esc(metricNumber(stats.requests_per_second_60s, 2)), ['Среднее за последние 60 секунд.']) +
-        metricCard('Время ответа · p95', esc(metricNumber(stats.recent_p95_ms)) + (stats.recent_p95_ms != null ? ' <span class="metric-unit">мс</span>' : ''),
-            [sampleDetail, sample > 0 ? '95% ответов укладываются в это время.' : 'Пока нет завершённых запросов.']) +
-        metricCard('Ответы с ошибками', esc(errorValue), [sampleDetail, sample > 0 ? metricPair('HTTP 4xx/5xx:', stats.total_errors) : 'Пока нет завершённых запросов.'],
-            'Доля ответов HTTP 4xx/5xx, включая 404 и 429, среди последних завершённых запросов. Журнал хранит до 5000 записей.') +
-        accountsCard(stats) + playbackCard(stats.playback, stats.playback_readiness) +
-        catalogCard(stats.catalog, stats.playback_readiness, stats.catalog_readiness) + redisCard(stats.redis);
+    return overviewGroup('Трафик', 4,
+            metricCard('Запросов в секунду', esc(metricNumber(stats.requests_per_second_60s, 2)), ['Среднее за последние 60 секунд.']) +
+            metricCard('Время ответа · p95', esc(metricNumber(stats.recent_p95_ms)) + (stats.recent_p95_ms != null ? ' <span class="metric-unit">мс</span>' : ''),
+                [sample > 0 ? '95% ответов укладываются в это время.' : noRequests],
+                'Считается по последним завершённым запросам. Журнал хранит до 5000 записей.') +
+            metricCard('Ответы с ошибками', esc(errorValue),
+                [sample > 0 ? '<strong>' + esc(metricNumber(stats.total_errors)) + '</strong> <span>из</span> <strong>' + esc(metricNumber(sample)) + '</strong> <span>последних запросов</span>' : noRequests],
+                'Доля ответов HTTP 4xx/5xx, включая 404 и 429, среди последних завершённых запросов. Журнал хранит до 5000 записей.') +
+            metricCard('Завершённые API-запросы', esc(metricNumber(stats.total_requests)), ['С момента запуска сервера.'],
+                'Один входящий API-запрос считается один раз, включая внутренние повторы через другие аккаунты.')) +
+        overviewGroup('Аккаунты и воспроизведение', 2,
+            accountsCard(stats) + playbackCard(stats.playback, stats.playback_readiness)) +
+        overviewGroup('Инфраструктура', 3,
+            catalogCard(stats.catalog, stats.playback_readiness, stats.catalog_readiness) + redisCard(stats.redis) + proxyCard(overviewProxy));
 }
 
 var _testResults = {};
@@ -1742,10 +1801,10 @@ async function loadProxyStatus() {
         document.getElementById('px-pool').textContent = p.pool_size != null ? p.pool_size : '—';
         document.getElementById('px-verified').textContent = p.enabled ? verified + ' / ' + assignments.length : '—';
         document.getElementById('px-fails').textContent = assignments.reduce(function(sum, a) { return sum + (a.consecutive_fails || 0); }, 0);
-        document.getElementById('overviewProxy').innerHTML = '<span>Прокси</span><span class="separator">·</span><span>' + status + '</span>' +
-            (p.enabled ? '<span class="separator">·</span><span>Назначено <strong>' + assignments.length + '</strong></span>' +
-                '<span class="separator">·</span><span>Проверено назначений <strong>' + verified + ' / ' + assignments.length + '</strong></span>' +
-                '<span class="separator">·</span><span>В пуле <strong>' + (p.pool_size != null ? p.pool_size : '—') + '</strong></span>' : '');
+        overviewProxy = { enabled: !!p.enabled, status: status, verified: verified, assigned: assignments.length, pool_size: p.pool_size,
+            tone: !p.enabled ? 'status-unknown' : (verified > 0 ? (verified === assignments.length ? 'status-ok' : 'status-warn')
+                : (p.ready ? 'status-ok' : (!p.last_try || trying ? 'status-warn' : 'status-err'))) };
+        if (window._stats) document.getElementById('stats').innerHTML = overviewCards(window._stats);
         document.getElementById('px-assignments').textContent = p.enabled ? assignments.map(function(a) {
             var account = (window._accounts || []).find(function(item) { return item.id === a.account_id; });
             return (account ? account.label : a.account_id.slice(0, 8)) + ' → ' + a.proxy + (a.verified ? '' : ' · проверяется');
