@@ -73,7 +73,7 @@ Commit `Cargo.toml` and the updated `Cargo.lock` together. The API response, sta
 
 ## Configuration
 
-Token renewal and auto-heal are always enabled. Legacy `AUTO_HEAL` and persisted `auto_heal` settings are ignored. Recovery retries use backoff and respect `Retry-After`; manually disabled accounts stay off.
+Token renewal and auto-heal are always enabled. Legacy `AUTO_HEAL` and persisted `auto_heal` settings are ignored. Recovery retries use backoff and respect `Retry-After`; manually disabled accounts stay off. SQLite preserves the token-refresh retry deadline, failure count, failure cause, and rejected-token marker across restarts and backups. Restarting waits out the remaining cooldown; an expired deadline allows the next retry without resetting backoff. Successful renewal or an explicit account toggle clears the cooldown; changing OAuth credentials also clears the rejected-token marker. These recovery fields remain local to each instance and are not persisted in database-free mode.
 
 Refresh uses the account's assigned proxy and a separate HTTP/1.1 auth client. API connections negotiate HTTP normally. Requests have connect/read/total deadlines of 5/15/25 seconds; each refresh operation has a 45-second deadline, and at most two account refreshes contact auth concurrently. The first recovery cycle makes up to four attempts for transient `403`, `408`, `425`, `429`, selected `5xx`, and network failures, using roughly `1.5 → 3 → 6` second delays with jitter and honoring `Retry-After`. Later recovery cycles send one probe per pause. Temporary auth failures then back off from roughly 30 seconds to one hour; explicit OAuth credential errors start at five minutes. Revoked credentials can still require reauthorization.
 

@@ -230,6 +230,10 @@ pub async fn restore_backup(
                 ("notes", Text),
                 ("created_at", Int),
                 ("updated_at", Int),
+                ("heal_failures", Int),
+                ("heal_next_retry", Int),
+                ("rejected_access_token", NullableText),
+                ("last_refresh_error", NullableText),
             ][..],
         ),
         (

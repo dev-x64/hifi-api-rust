@@ -52,6 +52,20 @@ pub async fn init_pool(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
             .await?;
         tracing::info!("Migrated accounts table: added is_catalog");
     }
+    // Recovery deadlines are absolute timestamps so restarts keep the
+    // remaining cooldown, rather than starting a new retry cycle.
+    for (name, definition) in [
+        ("heal_failures", "INTEGER NOT NULL DEFAULT 0"),
+        ("heal_next_retry", "INTEGER NOT NULL DEFAULT 0"),
+        ("rejected_access_token", "TEXT"),
+        ("last_refresh_error", "TEXT"),
+    ] {
+        if !cols.iter().any(|c| c.1 == name) {
+            sqlx::query(&format!("ALTER TABLE accounts ADD COLUMN {name} {definition}"))
+                .execute(&pool)
+                .await?;
+        }
+    }
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS tokens (
@@ -140,4 +154,51 @@ pub async fn init_pool(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
     .await?;
 
     Ok(pool)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn legacy_database_gains_refresh_state_without_changing_credentials() {
+        let path = std::env::temp_dir().join(format!("hifi-migrate-{}.db", uuid::Uuid::new_v4()));
+        let url = format!("sqlite://{}", path.display());
+        let db = SqlitePool::connect_with(
+            SqliteConnectOptions::from_str(&url)
+                .unwrap()
+                .create_if_missing(true),
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE accounts (
+                id TEXT PRIMARY KEY, label TEXT NOT NULL DEFAULT '', client_id TEXT NOT NULL,
+                client_secret TEXT NOT NULL, refresh_token TEXT NOT NULL, user_id TEXT,
+                is_active INTEGER NOT NULL DEFAULT 1, notes TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+            )",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO accounts (id, client_id, client_secret, refresh_token, created_at, updated_at)
+            VALUES ('a', 'c', 's', 'r', 1, 1)").execute(&db).await.unwrap();
+        db.close().await;
+        let db = init_pool(&url).await.unwrap();
+        let state: (String, i64, i64, Option<String>) = sqlx::query_as(
+            "SELECT refresh_token, heal_failures, heal_next_retry, rejected_access_token FROM accounts WHERE id = 'a'",
+        ).fetch_one(&db).await.unwrap();
+        assert_eq!(state, ("r".into(), 0, 0, None));
+        sqlx::query("UPDATE accounts SET heal_failures = 3, heal_next_retry = 123456, rejected_access_token = 'bad'")
+            .execute(&db).await.unwrap();
+        db.close().await;
+        let db = init_pool(&url).await.unwrap();
+        let state: (i64, i64, Option<String>) = sqlx::query_as(
+            "SELECT heal_failures, heal_next_retry, rejected_access_token FROM accounts WHERE id = 'a'",
+        ).fetch_one(&db).await.unwrap();
+        assert_eq!(state, (3, 123456, Some("bad".into())));
+        db.close().await;
+        std::fs::remove_file(path).unwrap();
+    }
 }

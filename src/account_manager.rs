@@ -31,7 +31,8 @@ impl Default for SwitchingWeights {
 
 pub struct AccountState {
     uptime: OnceLock<Arc<Mutex<crate::account_uptime::AccountUptime>>>,
-    uptime_db: OnceLock<SqlitePool>,
+    db: OnceLock<SqlitePool>,
+    refresh_state_lock: Mutex<()>,
     pub id: String,
     pub label: String,
     pub client_id: String,
@@ -90,7 +91,8 @@ impl AccountState {
     ) -> Self {
         Self {
             uptime: OnceLock::new(),
-            uptime_db: OnceLock::new(),
+            db: OnceLock::new(),
+            refresh_state_lock: Mutex::new(()),
             id,
             label,
             client_id,
@@ -125,8 +127,8 @@ impl AccountState {
     /// edits and cross-instance merges never wipe stats or tokens.
     pub fn carry_over(new: &AccountState, old: &AccountState) {
         let _ = new.uptime.set(old.uptime_history().clone());
-        if let Some(db) = old.uptime_db.get() {
-            let _ = new.uptime_db.set(db.clone());
+        if let Some(db) = old.db.get() {
+            new.attach_db(db);
         }
         new.last_used
             .store(old.last_used.load(Ordering::Relaxed), Ordering::Relaxed);
@@ -215,7 +217,7 @@ impl AccountState {
             && self.rejected_access_token.read().await.as_deref() != token.as_deref();
         drop(token);
         if let Err(error) = history.observe(
-            self.uptime_db.get(), &self.id, active, token_ready,
+            self.db.get(), &self.id, active, token_ready,
             token_ready.then_some(expires), now,
         ).await {
             tracing::warn!(account = %self.id, "Could not persist account uptime: {error}");
@@ -236,6 +238,34 @@ impl AccountState {
 
     pub(crate) fn replace_refresh_token(&self, token: String) {
         *self.refresh_token.write().unwrap_or_else(|e| e.into_inner()) = token;
+    }
+
+    pub(crate) fn attach_db(&self, db: &SqlitePool) {
+        let _ = self.db.set(db.clone());
+    }
+
+    pub(crate) async fn persist_refresh_state(&self) -> Result<(), sqlx::Error> {
+        let Some(db) = self.db.get() else {
+            return Ok(());
+        };
+        let _guard = self.refresh_state_lock.lock().await;
+        // A late result from credentials replaced by an admin must not put
+        // the replacement credentials into the old cooldown.
+        sqlx::query(
+            "UPDATE accounts SET heal_failures = ?, heal_next_retry = ?, rejected_access_token = ?, last_refresh_error = ?
+             WHERE id = ? AND client_id = ? AND client_secret = ? AND refresh_token = ?",
+        )
+        .bind(i64::try_from(self.heal_failures.load(Ordering::Relaxed)).unwrap_or(i64::MAX))
+        .bind(self.heal_next_retry.load(Ordering::Relaxed))
+        .bind(self.rejected_access_token.read().await.clone())
+        .bind(self.last_refresh_error())
+        .bind(&self.id)
+        .bind(&self.client_id)
+        .bind(&self.client_secret)
+        .bind(self.refresh_token())
+        .execute(db)
+        .await?;
+        Ok(())
     }
 }
 
@@ -269,6 +299,10 @@ pub struct DbAccountRow {
     pub expires_at: Option<i64>,
     pub updated_at: Option<i64>,
     pub created_at: i64,
+    pub heal_failures: i64,
+    pub heal_next_retry: i64,
+    pub rejected_access_token: Option<String>,
+    pub last_refresh_error: Option<String>,
 }
 
 /// Extract a numeric user id from an auto-generated "Tidal Account (<id>)" label.
@@ -363,7 +397,7 @@ impl AccountManager {
 
     async fn observe_uptime(&self, account: &AccountState) {
         if let Some(db) = &self.db {
-            let _ = account.uptime_db.set(db.clone());
+            account.attach_db(db);
         }
         account.observe_uptime(Utc::now().timestamp()).await;
     }
@@ -387,7 +421,8 @@ impl AccountManager {
         let rows: Vec<DbAccountRow> = sqlx::query_as::<_, DbAccountRow>(
             "SELECT a.id, a.label, a.client_id, a.client_secret, a.refresh_token,
              a.user_id, a.is_active, a.auto_disabled, a.disabled_at, a.is_catalog, a.notes,
-             t.access_token, t.expires_at, a.updated_at, a.created_at
+             t.access_token, t.expires_at, a.updated_at, a.created_at,
+             a.heal_failures, a.heal_next_retry, a.rejected_access_token, a.last_refresh_error
              FROM accounts a
              LEFT JOIN tokens t ON t.account_id = a.id
              ORDER BY a.created_at ASC",
@@ -450,6 +485,10 @@ impl AccountManager {
             state
                 .updated_at
                 .store(row.updated_at.unwrap_or(0), Ordering::Relaxed);
+            state.heal_failures.store(row.heal_failures.max(0) as u64, Ordering::Relaxed);
+            state.heal_next_retry.store(row.heal_next_retry.max(0), Ordering::Relaxed);
+            *state.rejected_access_token.write().await = row.rejected_access_token;
+            state.set_last_refresh_error(row.last_refresh_error);
             self.load_uptime(&state).await?;
             accounts.push(state);
         }
@@ -872,7 +911,8 @@ impl AccountManager {
             let now = Utc::now().timestamp();
             let mut tx = db.begin().await?;
             sqlx::query(
-                "UPDATE accounts SET label = ?, client_id = ?, client_secret = ?, refresh_token = ?, user_id = ?, updated_at = ? WHERE id = ?",
+                "UPDATE accounts SET label = ?, client_id = ?, client_secret = ?, refresh_token = ?, user_id = ?, updated_at = ?,
+                 heal_failures = ?, heal_next_retry = ?, rejected_access_token = ?, last_refresh_error = ? WHERE id = ?",
             )
             .bind(&updated.label)
             .bind(&updated.client_id)
@@ -880,6 +920,10 @@ impl AccountManager {
             .bind(updated.refresh_token())
             .bind(&new_user_id)
             .bind(now)
+            .bind(i64::try_from(updated.heal_failures.load(Ordering::Relaxed)).unwrap_or(i64::MAX))
+            .bind(updated.heal_next_retry.load(Ordering::Relaxed))
+            .bind(updated.rejected_access_token.read().await.clone())
+            .bind(updated.last_refresh_error())
             .bind(&old.id)
             .execute(&mut *tx)
             .await?;
@@ -907,6 +951,7 @@ impl AccountManager {
                 account.heal_failures.store(0, Ordering::Relaxed);
                 account.heal_next_retry.store(0, Ordering::Relaxed);
                 account.auth_forbidden_streak.store(0, Ordering::Relaxed);
+                account.persist_refresh_state().await?;
             }
             let now = Utc::now().timestamp();
             account.updated_at.store(now, Ordering::Relaxed);
@@ -947,7 +992,7 @@ impl AccountManager {
             account.updated_at.store(now, Ordering::Relaxed);
             self.observe_uptime(account).await;
             if let Some(db) = &self.db {
-                sqlx::query("UPDATE accounts SET is_active = ?, auto_disabled = 0, disabled_at = ?, updated_at = ? WHERE id = ?")
+                sqlx::query("UPDATE accounts SET is_active = ?, auto_disabled = 0, disabled_at = ?, updated_at = ?, heal_failures = 0, heal_next_retry = 0 WHERE id = ?")
                     .bind(active as i32)
                     .bind(disabled_at)
                     .bind(now)
@@ -1134,7 +1179,8 @@ impl AccountManager {
                         let _ = sqlx::query(
                             "UPDATE accounts SET label = ?, client_id = ?, client_secret = ?,
                              refresh_token = ?, user_id = ?, is_active = ?, auto_disabled = ?, disabled_at = ?,
-                             is_catalog = ?, notes = ?, updated_at = ? WHERE id = ?",
+                             is_catalog = ?, notes = ?, updated_at = ?,
+                             heal_failures = ?, heal_next_retry = ?, rejected_access_token = ?, last_refresh_error = ? WHERE id = ?",
                         )
                         .bind(&rebuilt.label)
                         .bind(&rebuilt.client_id)
@@ -1147,6 +1193,10 @@ impl AccountManager {
                         .bind(is_catalog as i32)
                         .bind(&notes)
                         .bind(remote_updated)
+                        .bind(i64::try_from(rebuilt.heal_failures.load(Ordering::Relaxed)).unwrap_or(i64::MAX))
+                        .bind(rebuilt.heal_next_retry.load(Ordering::Relaxed))
+                        .bind(rebuilt.rejected_access_token.read().await.clone())
+                        .bind(rebuilt.last_refresh_error())
                         .bind(&rebuilt.id)
                         .execute(db)
                         .await;

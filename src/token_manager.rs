@@ -96,13 +96,14 @@ impl TokenManager {
             *account.rejected_access_token.write().await = Some(rejected.into());
         }
         drop(current);
+        Self::save_refresh_state(account).await;
         account.observe_uptime(Utc::now().timestamp()).await;
     }
 
     pub(crate) async fn reject_refreshed_token(account: &AccountState, rejected: &str) {
         Self::reject_access_token(account, rejected).await;
         account.set_last_refresh_error(Some("Tidal HTTP 401: refreshed access token rejected".into()));
-        Self::defer_retry(account, 30);
+        Self::defer_retry(account, 30).await;
     }
 
     /// Do not reuse a token rejected by Tidal, even if Redis still advertises it.
@@ -125,6 +126,7 @@ impl TokenManager {
         *account.access_token.write().await = Some(token.into());
         account.token_expires_at.store(expires, Ordering::Relaxed);
         account.set_last_refresh_error(None);
+        Self::save_refresh_state(account).await;
         account.observe_uptime(Utc::now().timestamp()).await;
         Some(token.into())
     }
@@ -167,7 +169,13 @@ impl TokenManager {
         self.refresh(account, client, Some(rejected), true).await
     }
 
-    pub(crate) fn defer_retry(account: &AccountState, minimum: u64) -> u64 {
+    async fn save_refresh_state(account: &AccountState) {
+        if let Err(error) = account.persist_refresh_state().await {
+            tracing::warn!(account = %account.id, "Could not persist token refresh cooldown: {error}");
+        }
+    }
+
+    pub(crate) async fn defer_retry(account: &AccountState, minimum: u64) -> u64 {
         let failures = account
             .heal_failures
             .fetch_add(1, Ordering::Relaxed)
@@ -182,6 +190,7 @@ impl TokenManager {
                 .saturating_add(i64::try_from(delay).unwrap_or(i64::MAX)),
             Ordering::Relaxed,
         );
+        Self::save_refresh_state(account).await;
         delay
     }
 
@@ -192,6 +201,9 @@ impl TokenManager {
         previous: Option<&str>,
         force: bool,
     ) -> Result<String, AppError> {
+        if let Some(db) = &self.db {
+            account.attach_db(db);
+        }
         let lock = self
             .refresh_locks
             .get_with(account.id.clone(), async { Arc::new(Mutex::new(())) })
@@ -272,7 +284,7 @@ impl TokenManager {
                     _ => 0,
                 };
                 account.set_last_refresh_error(Some(error.to_string()));
-                let delay = Self::defer_retry(account, minimum);
+                let delay = Self::defer_retry(account, minimum).await;
                 tracing::warn!(account = %account.label, retry_in = delay, "Token refresh failed: {}", error);
                 Err(error)
             }
@@ -571,7 +583,8 @@ pub(crate) async fn persist_token(
 ) -> Result<(), AppError> {
     let mut tx = db.begin().await?;
     let changed = sqlx::query(
-        "UPDATE accounts SET refresh_token = ?, updated_at = ? WHERE id = ? AND refresh_token = ? AND client_id = ? AND client_secret = ?",
+        "UPDATE accounts SET refresh_token = ?, updated_at = ?, heal_failures = 0, heal_next_retry = 0, last_refresh_error = NULL
+         WHERE id = ? AND refresh_token = ? AND client_id = ? AND client_secret = ?",
     ).bind(rotated.unwrap_or(old_refresh)).bind(Utc::now().timestamp()).bind(&account.id)
         .bind(old_refresh).bind(&account.client_id).bind(&account.client_secret).execute(&mut *tx).await?;
     if changed.rows_affected() == 0 {
@@ -709,6 +722,230 @@ mod tests {
             "new"
         );
         assert_eq!(mock.calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn refresh_cooldown_survives_database_reopen() {
+        for status in [StatusCode::TOO_MANY_REQUESTS, StatusCode::BAD_REQUEST] {
+            let mock = MockAuth::with_retry_after(
+                status,
+                serde_json::json!({"error":"invalid_grant"}),
+                Some("120"),
+            )
+            .await;
+            let path =
+                std::env::temp_dir().join(format!("hifi-cooldown-{}.db", uuid::Uuid::new_v4()));
+            let url = format!("sqlite://{}", path.display());
+            let db = crate::db::init_pool(&url).await.unwrap();
+            let am = Arc::new(AccountManager::new(
+                Some(db.clone()),
+                SwitchingWeights::default(),
+            ));
+            let account = am
+                .add_account("test".into(), "c".into(), "s".into(), "r".into(), None)
+                .await
+                .unwrap();
+            let mut tm = TokenManager::new(Some(db.clone()));
+            tm.token_url = mock.url.clone();
+            tm.set_account_manager(am.clone());
+            assert!(tm.get_token(&account, &Client::new()).await.is_err());
+            let id = account.id.clone();
+            let deadline = account.heal_next_retry.load(Ordering::Relaxed);
+            let cause = account.last_refresh_error();
+            assert!(cause.is_some());
+            assert!(deadline >= Utc::now().timestamp() + 119);
+            assert_eq!(mock.calls.load(Ordering::Relaxed), 1);
+            drop((tm, am, account));
+            db.close().await;
+
+            // Use a fresh pool and both fresh managers, just like a server restart.
+            let db = crate::db::init_pool(&url).await.unwrap();
+            let am = Arc::new(AccountManager::new(
+                Some(db.clone()),
+                SwitchingWeights::default(),
+            ));
+            am.load_from_db().await.unwrap();
+            let account = am.get_account_by_id(&id).await.unwrap();
+            assert_eq!(account.heal_next_retry.load(Ordering::Relaxed), deadline);
+            assert_eq!(account.heal_failures.load(Ordering::Relaxed), 1);
+            assert_eq!(account.last_refresh_error(), cause);
+            assert_eq!(
+                account.auto_disabled.load(Ordering::Relaxed),
+                status == StatusCode::BAD_REQUEST
+            );
+            let mut tm = TokenManager::new(Some(db.clone()));
+            tm.token_url = mock.url.clone();
+            tm.set_account_manager(am);
+            let client = Client::new();
+            for result in [
+                tm.get_token(&account, &client).await,
+                tm.refresh_token(&account, &client).await,
+            ] {
+                assert!(
+                    matches!(result, Err(AppError::ServiceUnavailableRetry(_, remaining))
+                    if remaining > 0 && remaining <= (deadline - Utc::now().timestamp() + 1) as u64)
+                );
+            }
+            assert_eq!(mock.calls.load(Ordering::Relaxed), 1);
+            drop((tm, account));
+            db.close().await;
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_cooldown_keeps_backoff_and_success_clears_it_durably() {
+        let db = crate::db::init_pool("sqlite::memory:").await.unwrap();
+        let am = Arc::new(AccountManager::new(
+            Some(db.clone()),
+            SwitchingWeights::default(),
+        ));
+        let account = am
+            .add_account("test".into(), "c".into(), "s".into(), "r".into(), None)
+            .await
+            .unwrap();
+        for _ in 0..4 {
+            TokenManager::defer_retry(&account, 0).await;
+        }
+        account
+            .heal_next_retry
+            .store(Utc::now().timestamp() - 1, Ordering::Relaxed);
+        account.persist_refresh_state().await.unwrap();
+        let am = Arc::new(AccountManager::new(
+            Some(db.clone()),
+            SwitchingWeights::default(),
+        ));
+        am.load_from_db().await.unwrap();
+        let account = am.get_account_by_id(&account.id).await.unwrap();
+        let mock = MockAuth::new(StatusCode::FORBIDDEN, Value::Null).await;
+        let mut tm = TokenManager::new(Some(db.clone()));
+        tm.token_url = mock.url.clone();
+        tm.set_account_manager(am);
+        assert!(tm.get_token(&account, &Client::new()).await.is_err());
+        assert_eq!(mock.calls.load(Ordering::Relaxed), 1); // No initial four-attempt burst.
+        assert_eq!(account.heal_failures.load(Ordering::Relaxed), 5);
+        assert!(account.heal_next_retry.load(Ordering::Relaxed) >= Utc::now().timestamp() + 479);
+
+        let success = MockAuth::new(
+            StatusCode::OK,
+            serde_json::json!({"access_token":"new", "refresh_token":"rotated", "expires_in":3600}),
+        )
+        .await;
+        account
+            .heal_next_retry
+            .store(Utc::now().timestamp() - 1, Ordering::Relaxed);
+        account.persist_refresh_state().await.unwrap();
+        tm.token_url = success.url.clone();
+        assert_eq!(tm.get_token(&account, &Client::new()).await.unwrap(), "new");
+        let reloaded = AccountManager::new(Some(db), SwitchingWeights::default());
+        reloaded.load_from_db().await.unwrap();
+        let restored = reloaded.get_account_by_id(&account.id).await.unwrap();
+        assert_eq!(restored.heal_failures.load(Ordering::Relaxed), 0);
+        assert_eq!(restored.heal_next_retry.load(Ordering::Relaxed), 0);
+        assert_eq!(restored.refresh_token(), "rotated");
+        assert!(restored.last_refresh_error().is_none());
+    }
+
+    #[tokio::test]
+    async fn rejected_token_and_its_cooldown_survive_reload() {
+        let db = crate::db::init_pool("sqlite::memory:").await.unwrap();
+        let am = Arc::new(AccountManager::new(
+            Some(db.clone()),
+            SwitchingWeights::default(),
+        ));
+        let account = am
+            .add_account("test".into(), "c".into(), "s".into(), "r".into(), None)
+            .await
+            .unwrap();
+        let mock = MockAuth::new(
+            StatusCode::OK,
+            serde_json::json!({"access_token":"rejected", "expires_in":3600}),
+        )
+        .await;
+        let mut tm = TokenManager::new(Some(db.clone()));
+        tm.token_url = mock.url.clone();
+        tm.set_account_manager(am);
+        tm.get_token(&account, &Client::new()).await.unwrap();
+        TokenManager::reject_refreshed_token(&account, "rejected").await;
+        let deadline = account.heal_next_retry.load(Ordering::Relaxed);
+        let am = Arc::new(AccountManager::new(
+            Some(db.clone()),
+            SwitchingWeights::default(),
+        ));
+        am.load_from_db().await.unwrap();
+        let account = am.get_account_by_id(&account.id).await.unwrap();
+        assert_eq!(
+            account.rejected_access_token.read().await.as_deref(),
+            Some("rejected")
+        );
+        assert!(TokenManager::cached_token(&account).await.is_none());
+        assert_eq!(
+            account
+                .uptime_summary(Utc::now().timestamp())
+                .await
+                .current_status,
+            Some(crate::account_uptime::UptimeStatus::Waiting)
+        );
+        assert_eq!(account.heal_next_retry.load(Ordering::Relaxed), deadline);
+        let mut tm = TokenManager::new(Some(db));
+        tm.token_url = mock.url.clone();
+        tm.set_account_manager(am);
+        assert!(matches!(
+            tm.get_token(&account, &Client::new()).await,
+            Err(AppError::ServiceUnavailableRetry(_, _))
+        ));
+        assert_eq!(mock.calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn account_edits_preserve_or_clear_persisted_cooldown_as_appropriate() {
+        let db = crate::db::init_pool("sqlite::memory:").await.unwrap();
+        let am = AccountManager::new(Some(db.clone()), SwitchingWeights::default());
+        let account = am
+            .add_account("test".into(), "c".into(), "s".into(), "r".into(), None)
+            .await
+            .unwrap();
+        TokenManager::defer_retry(&account, 120).await;
+        let deadline = account.heal_next_retry.load(Ordering::Relaxed);
+        am.update_account(&account.id, Some("renamed".into()), None, None, None, None)
+            .await
+            .unwrap();
+        let reloaded = AccountManager::new(Some(db.clone()), SwitchingWeights::default());
+        reloaded.load_from_db().await.unwrap();
+        let restored = reloaded.get_account_by_id(&account.id).await.unwrap();
+        assert_eq!(restored.heal_next_retry.load(Ordering::Relaxed), deadline);
+        reloaded
+            .set_account_active(&account.id, false)
+            .await
+            .unwrap();
+        let reloaded = AccountManager::new(Some(db.clone()), SwitchingWeights::default());
+        reloaded.load_from_db().await.unwrap();
+        let restored = reloaded.get_account_by_id(&account.id).await.unwrap();
+        assert_eq!(restored.heal_next_retry.load(Ordering::Relaxed), 0);
+        assert_eq!(restored.heal_failures.load(Ordering::Relaxed), 0);
+
+        TokenManager::defer_retry(&restored, 120).await;
+        *restored.rejected_access_token.write().await = Some("bad".into());
+        restored.persist_refresh_state().await.unwrap();
+        reloaded
+            .update_account(
+                &account.id,
+                None,
+                None,
+                None,
+                Some("replacement".into()),
+                None,
+            )
+            .await
+            .unwrap();
+        // A late failure from the retired credential must not undo the edit.
+        TokenManager::defer_retry(&restored, 120).await;
+        let reloaded = AccountManager::new(Some(db), SwitchingWeights::default());
+        reloaded.load_from_db().await.unwrap();
+        let restored = reloaded.get_account_by_id(&account.id).await.unwrap();
+        assert_eq!(restored.heal_next_retry.load(Ordering::Relaxed), 0);
+        assert_eq!(restored.heal_failures.load(Ordering::Relaxed), 0);
+        assert!(restored.rejected_access_token.read().await.is_none());
     }
 
     #[tokio::test]
