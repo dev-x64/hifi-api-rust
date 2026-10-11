@@ -305,7 +305,7 @@ pub async fn test_all_accounts(State(state): State<AppState>) -> Result<Json<Val
                                 AccountManager::pause_account(
                                     &acc,
                                     resp.headers().get(reqwest::header::RETRY_AFTER).and_then(|v| v.to_str().ok()),
-                                );
+                                ).await;
                                 am.mark_account_error(&id, "Tidal admin test HTTP 429").await;
                             }
                             let body = resp.text().await.unwrap_or_default();
@@ -508,7 +508,7 @@ pub async fn test_account(
                         AccountManager::pause_account(
                             &account,
                             r.headers().get(reqwest::header::RETRY_AFTER).and_then(|v| v.to_str().ok()),
-                        );
+                        ).await;
                         state.account_manager.mark_account_error(&account.id, "Tidal admin test HTTP 429").await;
                     }
                     let body_text = r.text().await.unwrap_or_default();

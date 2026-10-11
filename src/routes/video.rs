@@ -54,14 +54,15 @@ pub(crate) async fn fetch_video_playback(
         if first_rate_limit_try.is_some_and(|first| account_try > first + 1) {
             break;
         }
-        let account = match state
+        let lease = match state
             .account_manager
-            .select_account_excluding(&failed_ids)
+            .lease_account_excluding(&failed_ids)
             .await
         {
             Ok(a) => a,
             Err(e) => return Err(last_err.unwrap_or(e)),
         };
+        let account = lease.account().clone();
         let hc = state.tidal_client.working_client_for(&account.id).await?;
         let token = match state.token_manager.get_token(&account, &hc).await {
             Ok(t) => t,

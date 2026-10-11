@@ -174,6 +174,9 @@ for (const language of ['en', 'ru']) {
         assert.match(html, /uptime-span uptime-up" style="height:50%/);
         assert.match(html, /uptime-span uptime-waiting" style="height:50%/);
         assert.match(html, /uptime-span uptime-down" style="height:50%/);
+        // Every bar stacks in the same order, so the valid-token share reads as one chart.
+        assert.match(html, /uptime-up" style="height:50%"><\/span><span class="uptime-span uptime-waiting"/);
+        assert.match(html, /uptime-waiting" style="height:50%"><\/span><span class="uptime-span uptime-down"/);
         if (language === 'en') assert.doesNotMatch(html, /[А-Яа-яЁё]/);
     });
 

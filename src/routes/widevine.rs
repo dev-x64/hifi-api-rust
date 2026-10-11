@@ -49,9 +49,9 @@ pub(crate) async fn fetch_widevine_license(
         if first_rate_limit_try.is_some_and(|first| account_try > first + 1) {
             break;
         }
-        let account = match state
+        let lease = match state
             .account_manager
-            .select_account_excluding(&failed_ids)
+            .lease_account_excluding(&failed_ids)
             .await
         {
             Ok(a) => a,
@@ -65,6 +65,7 @@ pub(crate) async fn fetch_widevine_license(
                 };
             }
         };
+        let account = lease.account().clone();
         let mut hc = state.tidal_client.working_client_for(&account.id).await?;
         let token = match state.token_manager.get_token(&account, &hc).await {
             Ok(t) => t,
@@ -189,7 +190,7 @@ pub(crate) async fn fetch_widevine_license(
                 resp.headers()
                     .get(reqwest::header::RETRY_AFTER)
                     .and_then(|v| v.to_str().ok()),
-            );
+            ).await;
             state
                 .account_manager
                 .mark_account_error(&account.id, "Tidal HTTP 429")

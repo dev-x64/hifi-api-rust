@@ -53,23 +53,33 @@ body { font-family:'SF Mono','Fira Code','Cascadia Code','JetBrains Mono',Menlo,
 .card-stat { font-size:11px; color:#8b949e; white-space:nowrap; }
 .card-stat strong { color:#c9d1d9; }
 .account-uptime { padding:16px 20px; border-top:1px solid #30363d; }
-.uptime-heading { display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px; margin-bottom:12px; font-size:12px; color:#8b949e; }
-.uptime-heading strong { color:#c9d1d9; }
+.uptime-heading { display:flex; align-items:center; flex-wrap:wrap; gap:6px 10px; margin-bottom:12px; font-size:12px; color:var(--muted); }
+.uptime-heading strong { color:var(--text); font-weight:600; }
+.uptime-current { padding:2px 8px; border-radius:999px; background:rgba(244,184,96,.12); color:var(--amber); font-size:11px; }
+.uptime-score { margin-left:auto; }
+.uptime-score strong { margin-left:6px; font-size:15px; font-variant-numeric:tabular-nums; }
 .uptime-chart { display:flex; gap:3px; }
-.uptime-bar { display:flex; flex-direction:column; flex:1; min-width:0; height:28px; overflow:hidden; border-radius:3px; background:#30363d; }
+.uptime-bar { position:relative; flex:1; min-width:0; height:36px; border-radius:3px; }
 .uptime-bar:focus-visible { outline:2px solid #7c6cff; outline-offset:2px; }
+.uptime-stack { display:flex; flex-direction:column-reverse; height:100%; overflow:hidden; border-radius:3px; background:var(--panel-2); transition:filter .12s; }
+.uptime-bar:hover .uptime-stack, .uptime-bar:focus-visible .uptime-stack { filter:brightness(1.3); }
+.uptime-bar::after { content:attr(data-tip); position:absolute; bottom:calc(100% + 8px); left:50%; z-index:20; transform:translateX(-50%); padding:8px 10px; border:1px solid var(--line); border-radius:8px; background:var(--bg); box-shadow:0 8px 24px rgba(0,0,0,.45); color:var(--text); font-size:11px; line-height:1.6; white-space:pre; pointer-events:none; opacity:0; visibility:hidden; transition:opacity .12s; }
+.uptime-bar:hover::after, .uptime-bar:focus-visible::after { opacity:1; visibility:visible; }
+.uptime-bar[data-edge="start"]::after { left:0; transform:none; }
+.uptime-bar[data-edge="end"]::after { left:auto; right:0; transform:none; }
 .uptime-span { width:100%; flex-shrink:0; }
-.uptime-up { background:#3fb950; }
-.uptime-down { background:#f85149; }
-.uptime-waiting { background:#d29922; }
-.uptime-current { display:inline-flex; align-items:center; gap:6px; }
-.uptime-unknown { background:repeating-linear-gradient(135deg,#30363d,#30363d 4px,#3c444f 4px,#3c444f 8px); }
+.uptime-up { background:var(--green); }
+.uptime-down { background:var(--red); }
+.uptime-waiting { background:rgba(244,184,96,.5); }
+.uptime-unknown { background:repeating-linear-gradient(135deg,transparent,transparent 4px,rgba(139,150,165,.2) 4px,rgba(139,150,165,.2) 8px); }
+.uptime-axis { display:flex; justify-content:space-between; margin-top:6px; font-size:10px; color:var(--muted); }
 .token-refresh-error { margin-top:12px; font-size:12px; line-height:1.5; color:#d29922; overflow-wrap:anywhere; }
-.uptime-totals { display:flex; flex-wrap:wrap; gap:8px 18px; margin-top:12px; color:#8b949e; font-size:11px; }
+.uptime-totals { display:flex; flex-wrap:wrap; gap:6px 18px; margin-top:10px; color:var(--muted); font-size:11px; }
 .uptime-totals span { display:inline-flex; align-items:center; gap:6px; }
-.uptime-totals strong { color:#c9d1d9; }
+.uptime-totals strong { color:var(--text); font-weight:600; }
 .uptime-key { display:inline-block; width:8px; height:8px; border-radius:2px; }
-.uptime-note { margin-top:8px; font-size:10px; line-height:1.5; color:#8b949e; }
+.uptime-key.uptime-unknown { box-shadow:inset 0 0 0 1px var(--muted); }
+.uptime-note { margin-top:8px; font-size:10px; line-height:1.5; color:var(--muted); }
 .test-badge { cursor:pointer; text-decoration:underline; text-decoration-style:dotted; text-underline-offset:2px; }
 .test-badge:hover { color:#f0f6fc; }
 
@@ -678,40 +688,54 @@ function uptimeCard(uptime) {
     var span = uptime.window_end - uptime.window_start;
     if (!(span > 0)) return '';
     var locale = adminLanguage === 'ru' ? 'ru-RU' : 'en-GB';
-    var labels = [tr('Нет данных'), tr('Работал'), tr('Простой'), tr('Без токена')];
+    var labels = [tr('Нет данных'), tr('Токен действует'), tr('Аккаунт отключён'), tr('Без токена')];
     var classes = ['uptime-unknown', 'uptime-up', 'uptime-down', 'uptime-waiting'];
+    // Bottom to top, the same in every bar: the valid-token share always
+    // grows from the baseline, so the strip reads as one chart.
+    var order = [1, 3, 2, 0];
     var segments = uptime.segments || [];
     var chart = '';
-    function stamp(ts) { return new Date(ts * 1000).toLocaleString(locale); }
+    function day(ts) { return new Date(ts * 1000).toLocaleDateString(locale, {day:'numeric', month:'short'}); }
+    function clock(ts) { return new Date(ts * 1000).toLocaleTimeString(locale, {hour:'2-digit', minute:'2-digit'}); }
+    function range(from, to) {
+        return day(from) + ', ' + clock(from) + ' — ' + (day(to) === day(from) ? '' : day(to) + ', ') + clock(to);
+    }
     var barCount = 60;
     for (var bar = 0; bar < barCount; bar++) {
         var start = uptime.window_start + bar * span / barCount;
         var end = uptime.window_start + (bar + 1) * span / barCount;
-        var totals = [0, 0, 0, 0], bars = '';
+        var totals = [0, 0, 0, 0];
         segments.forEach(function(segment) {
             var from = Math.max(start, segment.start), to = Math.min(end, segment.end);
             if (to <= from) return;
             var kind = segment.status === 'waiting' ? 3 : (segment.active == null ? 0 : (segment.active ? 1 : 2));
             totals[kind] += to - from;
-            var tooltip = labels[kind] + ': ' + uptimeDuration(to - from) + '\n' + stamp(from) + ' — ' + stamp(to);
-            bars += '<span class="uptime-span ' + classes[kind] + '" style="height:' + ((to - from) * 100 / (end - start)) + '%" title="' + esc(tooltip) + '"></span>';
         });
-        var barTitle = stamp(start) + ' — ' + stamp(end) + '\n' + labels[1] + ': ' + uptimeDuration(totals[1]) + '\n' + labels[2] + ': ' + uptimeDuration(totals[2]) + '\n' + labels[3] + ': ' + uptimeDuration(totals[3]) + '\n' + labels[0] + ': ' + uptimeDuration(totals[0]);
-        chart += '<div class="uptime-bar" tabindex="0" role="img" aria-label="' + esc(barTitle) + '" title="' + esc(barTitle) + '">' + bars + '</div>';
+        var spans = '', tip = range(start, end);
+        order.forEach(function(kind) {
+            if (!totals[kind]) return;
+            spans += '<span class="uptime-span ' + classes[kind] + '" style="height:' + (totals[kind] * 100 / (end - start)) + '%"></span>';
+            tip += '\n' + labels[kind] + ': ' + uptimeDuration(totals[kind]);
+        });
+        // Keep the tooltip inside the card at both ends of the strip.
+        var edge = bar < barCount / 3 ? ' data-edge="start"' : (bar >= barCount * 2 / 3 ? ' data-edge="end"' : '');
+        chart += '<div class="uptime-bar" tabindex="0" role="img" aria-label="' + esc(tip) + '" data-tip="' + esc(tip) + '"' + edge + '><div class="uptime-stack">' + spans + '</div></div>';
     }
     var percentage = uptime.percentage == null ? '—' : Number(uptime.percentage).toLocaleString(locale, {minimumFractionDigits:2, maximumFractionDigits:2}) + '%';
     var totalsHtml = '';
-    [1, 3, 2, 0].forEach(function(kind) {
+    order.forEach(function(kind) {
         var seconds = [uptime.unknown_seconds, uptime.up_seconds, uptime.down_seconds, uptime.waiting_seconds || 0][kind];
-        if (kind === 0 && !seconds) return;
+        if (kind !== 1 && !seconds) return;
         totalsHtml += '<span><i class="uptime-key ' + classes[kind] + '" aria-hidden="true"></i>' + labels[kind] + ' <strong>' + esc(uptimeDuration(seconds)) + '</strong></span>';
     });
     var current = uptime.current_status === 'waiting'
-        ? '<span class="uptime-current"><i class="uptime-key uptime-waiting" aria-hidden="true"></i>' + tr('Нет действующего токена') + '</span>' : '';
-    return '<div class="uptime-heading"><strong>' + tr('Аптайм · последние 7 дней') + '</strong>' + current + '<span title="' + esc(tr('Процент за период с известным статусом')) + '">' + tr('Доступность токена') + ' <strong>' + percentage + '</strong></span></div>' +
-        '<div class="uptime-chart">' + chart + '</div><div class="uptime-totals">' + totalsHtml + '</div>' +
-        '<p class="uptime-note">' + tr('Зелёный — действующий токен. Жёлтый — токен отсутствует, истёк или отклонён. Красный — аккаунт отключён.') +
-        (uptime.unknown_seconds > 0 ? ' ' + tr('До начала наблюдения история недоступна.') : '') + '</p>';
+        ? '<span class="uptime-current">' + tr('Нет действующего токена') + '</span>' : '';
+    return '<div class="uptime-heading"><strong>' + tr('Аптайм · последние 7 дней') + '</strong>' + current +
+        '<span class="uptime-score" title="' + esc(tr('Процент за период с известным статусом')) + '">' + tr('Доступность токена') + '<strong>' + percentage + '</strong></span></div>' +
+        '<div class="uptime-chart">' + chart + '</div>' +
+        '<div class="uptime-axis"><span>' + tr('7 дней назад') + '</span><span>' + tr('Сейчас') + '</span></div>' +
+        '<div class="uptime-totals">' + totalsHtml + '</div>' +
+        (uptime.unknown_seconds > 0 ? '<p class="uptime-note">' + tr('До начала наблюдения история недоступна.') + '</p>' : '');
 }
 
 function refreshUptimeCharts() {

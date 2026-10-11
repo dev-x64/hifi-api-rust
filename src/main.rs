@@ -128,6 +128,9 @@ async fn main() {
         // (Local DB/env already loaded above as the fallback/seed source.)
         settings.set_upstash(Some(store.clone()));
         settings.seed_and_load().await;
+        // One account should leave through one address on every instance.
+        proxy_manager.set_upstash(Some(store.clone()));
+        proxy_manager.sync_shared_assignments().await;
     }
 
     let account_manager = Arc::new(AccountManager::new(db.clone(), switching_weights));
@@ -239,6 +242,7 @@ async fn main() {
     {
         let am = account_manager.clone();
         let ak = api_keys.clone();
+        let pm = proxy_manager.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
             loop {
@@ -246,6 +250,7 @@ async fn main() {
                 ak.sync_usage_from_redis().await;
                 am.merge_accounts_from_redis().await;
                 ak.merge_keys_from_redis().await;
+                pm.sync_shared_assignments().await;
             }
         });
     }

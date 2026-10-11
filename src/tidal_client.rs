@@ -143,27 +143,27 @@ impl TidalClient {
             {
                 break;
             }
-            let account = if account_try == 0 && failed_ids.is_empty() {
+            // Held for every attempt on this account; released on failover.
+            let lease = if account_try == 0 && failed_ids.is_empty() {
                 match preferred_account.clone() {
                     Some(a) => {
                         if let Some(seconds) = AccountManager::rate_limit_remaining(&a) {
                             failed_ids.push(a.id.clone());
                             first_rate_limit_try = Some(account_try);
                             preferred_cooldown_consumed = true;
-                            match self.account_manager.select_account_excluding(&failed_ids).await {
+                            match self.account_manager.lease_account_excluding(&failed_ids).await {
                                 Ok(alternative) => alternative,
                                 Err(_) => return Err(AppError::RateLimited(seconds)),
                             }
                         } else {
                             // Account the preferred pick like any selection so
                             // the balancer sees its true load.
-                            AccountManager::note_selection(&a);
-                            a
+                            AccountManager::lease(&a)
                         }
                     }
                     None => match self
                         .account_manager
-                        .select_account_excluding(&failed_ids)
+                        .lease_account_excluding(&failed_ids)
                         .await
                     {
                         Ok(a) => a,
@@ -176,7 +176,7 @@ impl TidalClient {
             } else {
                 match self
                     .account_manager
-                    .select_account_excluding(&failed_ids)
+                    .lease_account_excluding(&failed_ids)
                     .await
                 {
                     Ok(a) => a,
@@ -186,6 +186,7 @@ impl TidalClient {
                     }
                 }
             };
+            let account = lease.account().clone();
 
             let mut http = self.working_client_for(&account.id).await?;
 
@@ -301,7 +302,7 @@ impl TidalClient {
                             resp.headers()
                                 .get(reqwest::header::RETRY_AFTER)
                                 .and_then(|v| v.to_str().ok()),
-                        );
+                        ).await;
                         self.account_manager
                             .mark_account_error(&account.id, "Tidal HTTP 429")
                             .await;
@@ -455,7 +456,7 @@ impl TidalClient {
                     resp.headers()
                         .get(reqwest::header::RETRY_AFTER)
                         .and_then(|v| v.to_str().ok()),
-                ),
+                ).await,
                 None => AccountManager::retry_after_secs(
                     resp.headers()
                         .get(reqwest::header::RETRY_AFTER)
@@ -754,7 +755,7 @@ impl TidalClient {
                     resp.headers()
                         .get(reqwest::header::RETRY_AFTER)
                         .and_then(|v| v.to_str().ok()),
-                );
+                ).await;
                 self.account_manager
                     .mark_account_error(&account.id, "Tidal HTTP 429")
                     .await;
@@ -935,7 +936,7 @@ impl TidalClient {
                                 .headers()
                                 .get(reqwest::header::RETRY_AFTER)
                                 .and_then(|v| v.to_str().ok()),
-                        );
+                        ).await;
                         self.account_manager
                             .mark_account_error(&account.id, "Tidal probe HTTP 429")
                             .await;

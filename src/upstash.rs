@@ -634,6 +634,12 @@ impl UpstashStore {
         format!("{PREFIX}:token:{account_id}")
     }
 
+    /// Fingerprint of the proxy an account is bound to (never the URL,
+    /// which carries the proxy credentials).
+    pub fn k_proxy(account_id: &str) -> String {
+        format!("{PREFIX}:proxy:{account_id}")
+    }
+
     pub fn k_apikey(key_id: &str) -> String {
         format!("{PREFIX}:apikey:{key_id}")
     }

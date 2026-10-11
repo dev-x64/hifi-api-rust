@@ -429,7 +429,7 @@ impl TokenManager {
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
         if status.as_u16() == 429 {
-            let seconds = AccountManager::pause_account(account, retry_after.as_deref());
+            let seconds = AccountManager::pause_account(account, retry_after.as_deref()).await;
             return Err(TokenAttemptFailure {
                 error: AppError::RateLimited(seconds),
                 retryable: true,
@@ -781,9 +781,16 @@ mod tests {
                 tm.get_token(&account, &client).await,
                 tm.refresh_token(&account, &client).await,
             ] {
+                // A 429 pause survives the restart as well as the cooldown.
+                let remaining = match result {
+                    Err(AppError::RateLimited(remaining))
+                        if status == StatusCode::TOO_MANY_REQUESTS => remaining,
+                    Err(AppError::ServiceUnavailableRetry(_, remaining))
+                        if status == StatusCode::BAD_REQUEST => remaining,
+                    other => panic!("unexpected result after {status}: {other:?}"),
+                };
                 assert!(
-                    matches!(result, Err(AppError::ServiceUnavailableRetry(_, remaining))
-                    if remaining > 0 && remaining <= (deadline - Utc::now().timestamp() + 1) as u64)
+                    remaining > 0 && remaining <= (deadline - Utc::now().timestamp() + 1) as u64
                 );
             }
             assert_eq!(mock.calls.load(Ordering::Relaxed), 1);

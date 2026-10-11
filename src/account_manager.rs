@@ -70,6 +70,14 @@ pub struct AccountState {
     pub error_count: AtomicU64,
     /// Metadata requests this catalog account is serving right now.
     pub catalog_inflight: AtomicUsize,
+    /// Playback requests this account is serving right now.
+    pub playback_inflight: AtomicUsize,
+    /// Selections counted for balancing. Unlike `request_count` it is
+    /// levelled with the pool when the account (re)joins, so a new or
+    /// returning account is not handed every request until it catches up.
+    pub balance_usage: AtomicU64,
+    /// Whether the selector saw this account as selectable on its last pass.
+    in_pool: AtomicBool,
     /// Temporary upstream 429 pause. Kept separate from account health so
     /// rate limiting never disables a valid credential.
     pub rate_limited_until: AtomicI64,
@@ -125,6 +133,9 @@ impl AccountState {
             request_count: AtomicU64::new(0),
             error_count: AtomicU64::new(0),
             catalog_inflight: AtomicUsize::new(0),
+            playback_inflight: AtomicUsize::new(0),
+            balance_usage: AtomicU64::new(0),
+            in_pool: AtomicBool::new(false),
             rate_limited_until: AtomicI64::new(0),
             premium_status: RwLock::new("unknown".to_string()),
             premium_checked_at: AtomicI64::new(0),
@@ -147,6 +158,10 @@ impl AccountState {
             .store(old.request_count.load(Ordering::Relaxed), Ordering::Relaxed);
         new.error_count
             .store(old.error_count.load(Ordering::Relaxed), Ordering::Relaxed);
+        new.balance_usage
+            .store(old.balance_usage.load(Ordering::Relaxed), Ordering::Relaxed);
+        new.in_pool
+            .store(old.in_pool.load(Ordering::Relaxed), Ordering::Relaxed);
         new.rate_limited_until.store(
             old.rate_limited_until.load(Ordering::Relaxed),
             Ordering::Relaxed,
@@ -327,6 +342,21 @@ impl Drop for CatalogSlot {
     }
 }
 
+/// One in-flight playback request on an account; released on drop.
+pub struct PlaybackLease(Arc<AccountState>);
+
+impl PlaybackLease {
+    pub fn account(&self) -> &Arc<AccountState> {
+        &self.0
+    }
+}
+
+impl Drop for PlaybackLease {
+    fn drop(&mut self) {
+        self.0.playback_inflight.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 pub enum CatalogClaim {
     Slot(CatalogSlot),
     /// Usable catalog accounts exist, but all are at the concurrency limit.
@@ -370,6 +400,7 @@ pub struct DbAccountRow {
     pub rejected_access_token: Option<String>,
     pub last_refresh_error: Option<String>,
     pub preview_streak: i64,
+    pub rate_limited_until: i64,
 }
 
 /// Extract a numeric user id from an auto-generated "Tidal Account (<id>)" label.
@@ -426,11 +457,25 @@ impl AccountManager {
         (remaining > 0).then_some(remaining as u64)
     }
 
-    pub(crate) fn pause_account(account: &AccountState, retry_after: Option<&str>) -> u64 {
+    pub(crate) async fn pause_account(account: &AccountState, retry_after: Option<&str>) -> u64 {
         let now = Utc::now().timestamp();
         let seconds = Self::retry_after_secs(retry_after);
         let until = now.saturating_add(i64::try_from(seconds).unwrap_or(i64::MAX));
         account.rate_limited_until.fetch_max(until, Ordering::Relaxed);
+        // The deadline is absolute, so a restart keeps the remaining pause
+        // instead of sending the account straight back to Tidal.
+        if let Some(db) = account.db.get() {
+            if let Err(error) = sqlx::query(
+                "UPDATE accounts SET rate_limited_until = MAX(rate_limited_until, ?) WHERE id = ?",
+            )
+            .bind(until)
+            .bind(&account.id)
+            .execute(db)
+            .await
+            {
+                tracing::warn!(account = %account.id, "Could not persist rate limit pause: {error}");
+            }
+        }
         Self::rate_limit_remaining(account).unwrap_or(seconds)
     }
 
@@ -490,7 +535,7 @@ impl AccountManager {
              a.user_id, a.is_active, a.auto_disabled, a.disabled_at, a.is_catalog, a.notes,
              t.access_token, t.expires_at, a.updated_at, a.created_at,
              a.heal_failures, a.heal_next_retry, a.rejected_access_token, a.last_refresh_error,
-             a.preview_streak
+             a.preview_streak, a.rate_limited_until
              FROM accounts a
              LEFT JOIN tokens t ON t.account_id = a.id
              ORDER BY a.created_at ASC",
@@ -558,6 +603,7 @@ impl AccountManager {
             *state.rejected_access_token.write().await = row.rejected_access_token;
             state.set_last_refresh_error(row.last_refresh_error);
             state.preview_streak.store(row.preview_streak.max(0), Ordering::Relaxed);
+            state.rate_limited_until.store(row.rate_limited_until.max(0), Ordering::Relaxed);
             self.load_uptime(&state).await?;
             accounts.push(state);
         }
@@ -670,6 +716,7 @@ impl AccountManager {
         let now = Utc::now().timestamp();
         account.last_used.store(now, Ordering::Relaxed);
         account.request_count.fetch_add(1, Ordering::Relaxed);
+        account.balance_usage.fetch_add(1, Ordering::Relaxed);
         crate::request_log::note_account(
             &account.id,
             &account.label,
@@ -709,10 +756,19 @@ impl AccountManager {
         usage_score + recency_score + error_score
     }
 
-    pub async fn select_account_excluding(
+    /// Claim one in-flight playback request on an already chosen account.
+    pub(crate) fn lease(account: &Arc<AccountState>) -> PlaybackLease {
+        account.playback_inflight.fetch_add(1, Ordering::SeqCst);
+        Self::note_selection(account);
+        PlaybackLease(account.clone())
+    }
+
+    /// Pick a playback account and hold one of its in-flight slots until the
+    /// returned lease is dropped.
+    pub async fn lease_account_excluding(
         &self,
         exclude_ids: &[String],
-    ) -> Result<Arc<AccountState>, AppError> {
+    ) -> Result<PlaybackLease, AppError> {
         // Serialize select+account: without this, N concurrent requests read
         // the same counters and all pick the same (currently-best) account,
         // leaving the rest idle under load.
@@ -725,25 +781,49 @@ impl AccountManager {
         }
 
         let now = Utc::now().timestamp();
-        let mut eligible: Vec<usize> = Vec::new();
+        let mut pool: Vec<usize> = Vec::new();
         let mut shortest_pause: Option<u64> = None;
         for (i, account) in accounts.iter().enumerate() {
-            if exclude_ids.contains(&account.id) {
-                continue;
-            }
-            if !account.is_active.load(Ordering::Relaxed) {
-                continue;
-            }
             // Catalog-only credentials never serve playback.
-            if account.is_catalog.load(Ordering::Relaxed) {
+            if !account.is_active.load(Ordering::Relaxed)
+                || account.is_catalog.load(Ordering::Relaxed)
+            {
+                account.in_pool.store(false, Ordering::Relaxed);
                 continue;
             }
             if let Some(seconds) = Self::rate_limit_remaining(account) {
-                shortest_pause = Some(shortest_pause.map_or(seconds, |old| old.min(seconds)));
+                account.in_pool.store(false, Ordering::Relaxed);
+                if !exclude_ids.contains(&account.id) {
+                    shortest_pause = Some(shortest_pause.map_or(seconds, |old| old.min(seconds)));
+                }
                 continue;
             }
-            eligible.push(i);
+            pool.push(i);
         }
+
+        // An account that just (re)joined the pool (added, re-enabled or back
+        // from a 429 pause) starts level with the busiest account already in
+        // it. Left with its lower counter it would win every pick until it
+        // caught up, taking the whole load right after a pause.
+        let level = pool
+            .iter()
+            .map(|&i| &accounts[i])
+            .filter(|account| account.in_pool.load(Ordering::Relaxed))
+            .map(|account| account.balance_usage.load(Ordering::Relaxed))
+            .max();
+        for &i in &pool {
+            let account = &accounts[i];
+            if !account.in_pool.swap(true, Ordering::Relaxed) {
+                if let Some(level) = level {
+                    account.balance_usage.fetch_max(level, Ordering::Relaxed);
+                }
+            }
+        }
+
+        let eligible: Vec<usize> = pool
+            .into_iter()
+            .filter(|&i| !exclude_ids.contains(&accounts[i].id))
+            .collect();
 
         if eligible.is_empty() {
             if let Some(seconds) = shortest_pause {
@@ -756,15 +836,15 @@ impl AccountManager {
 
         let max_usage = eligible
             .iter()
-            .map(|&i| accounts[i].request_count.load(Ordering::Relaxed))
+            .map(|&i| accounts[i].balance_usage.load(Ordering::Relaxed))
             .max()
             .unwrap_or(0);
 
-        let mut scored: Vec<(f64, usize)> = eligible
+        let mut scored: Vec<(usize, f64, usize)> = eligible
             .into_iter()
             .map(|i| {
                 let account = &accounts[i];
-                let usage = account.request_count.load(Ordering::Relaxed);
+                let usage = account.balance_usage.load(Ordering::Relaxed);
                 let last_used = account.last_used.load(Ordering::Relaxed);
                 let recency = if last_used > 0 {
                     (now - last_used).max(0) as f64
@@ -775,7 +855,7 @@ impl AccountManager {
                 let total = account.request_count.load(Ordering::Relaxed);
                 let score =
                     Self::score_candidate(&self.weights, usage, max_usage, recency, errors, total);
-                (score, i)
+                (account.playback_inflight.load(Ordering::SeqCst), score, i)
             })
             .collect();
 
@@ -787,10 +867,22 @@ impl AccountManager {
             let rot = (seq as usize) % scored.len();
             scored.rotate_left(rot);
         }
-        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        let best = &accounts[scored[0].1];
-        Self::note_selection(best);
-        Ok(best.clone())
+        // Fewest requests in flight first: parallel requests take one account
+        // each before any account gets a second. The weighted score orders
+        // accounts that are equally busy.
+        scored.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then(b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
+        });
+        Ok(Self::lease(&accounts[scored[0].2]))
+    }
+
+    pub async fn select_account_excluding(
+        &self,
+        exclude_ids: &[String],
+    ) -> Result<Arc<AccountState>, AppError> {
+        let lease = self.lease_account_excluding(exclude_ids).await?;
+        Ok(lease.account().clone())
     }
 
     pub async fn select_account(&self) -> Result<Arc<AccountState>, AppError> {
@@ -1532,11 +1624,11 @@ mod tests {
             .add_account("b".into(), "c".into(), "s".into(), "rt-b".into(), None)
             .await
             .unwrap();
-        AccountManager::pause_account(&a, Some("120"));
-        AccountManager::pause_account(&a, Some("5"));
+        AccountManager::pause_account(&a, Some("120")).await;
+        AccountManager::pause_account(&a, Some("5")).await;
         assert!(AccountManager::rate_limit_remaining(&a).unwrap() >= 119);
         assert_eq!(am.select_account().await.unwrap().id, b.id);
-        AccountManager::pause_account(&b, Some("60"));
+        AccountManager::pause_account(&b, Some("60")).await;
         assert!(matches!(am.select_account().await, Err(AppError::RateLimited(1..=60))));
         a.rate_limited_until.store(0, Ordering::Relaxed);
         assert_eq!(am.select_account().await.unwrap().id, a.id);
@@ -1553,7 +1645,7 @@ mod tests {
             .await
             .unwrap();
         am.set_account_catalog(&catalog.id, true).await.unwrap();
-        AccountManager::pause_account(&catalog, Some("90"));
+        AccountManager::pause_account(&catalog, Some("90")).await;
         assert!(matches!(am.select_catalog_account().await, Err(AppError::RateLimited(_))));
     }
 
@@ -2150,5 +2242,104 @@ mod tests {
             vec![c1.id.clone(), c2.id.clone(), c1.id.clone(), c2.id.clone()]
         );
         assert!(am.next_active_catalog().await.is_some());
+    }
+
+    async fn picks(am: &AccountManager, count: usize, id: &str) -> usize {
+        let mut hits = 0;
+        for _ in 0..count {
+            if am.select_account().await.unwrap().id == id {
+                hits += 1;
+            }
+        }
+        hits
+    }
+
+    #[tokio::test]
+    async fn new_account_joins_level_instead_of_taking_every_request() {
+        let am = AccountManager::new(None, SwitchingWeights::default());
+        for label in ["a", "b"] {
+            am.add_account(label.into(), "c".into(), "s".into(), format!("rt-{label}"), None)
+                .await
+                .unwrap();
+        }
+        for _ in 0..60 {
+            am.select_account().await.unwrap();
+        }
+        let late = am
+            .add_account("late".into(), "c".into(), "s".into(), "rt-late".into(), None)
+            .await
+            .unwrap();
+        let hits = picks(&am, 30, &late.id).await;
+        assert!((8..=12).contains(&hits), "newcomer took {hits} of 30 requests");
+    }
+
+    #[tokio::test]
+    async fn account_back_from_a_pause_does_not_catch_up() {
+        let am = AccountManager::new(None, SwitchingWeights::default());
+        let mut accounts = Vec::new();
+        for label in ["a", "b", "c"] {
+            accounts.push(
+                am.add_account(label.into(), "c".into(), "s".into(), format!("rt-{label}"), None)
+                    .await
+                    .unwrap(),
+            );
+        }
+        let paused = &accounts[0];
+        AccountManager::pause_account(paused, Some("120")).await;
+        assert_eq!(picks(&am, 60, &paused.id).await, 0);
+        paused.rate_limited_until.store(0, Ordering::Relaxed);
+        let hits = picks(&am, 30, &paused.id).await;
+        assert!((8..=12).contains(&hits), "returning account took {hits} of 30 requests");
+        // The counter shown in the admin panel still reports real use.
+        assert_eq!(paused.request_count.load(Ordering::Relaxed), hits as u64);
+    }
+
+    #[tokio::test]
+    async fn parallel_requests_take_idle_accounts_before_busy_ones() {
+        let am = AccountManager::new(None, SwitchingWeights::default());
+        let mut accounts = Vec::new();
+        for label in ["a", "b", "c"] {
+            accounts.push(
+                am.add_account(label.into(), "c".into(), "s".into(), format!("rt-{label}"), None)
+                    .await
+                    .unwrap(),
+            );
+        }
+        am.select_account().await.unwrap();
+        // The weighted score alone would send every request to the first account.
+        accounts[1].balance_usage.store(1000, Ordering::Relaxed);
+        accounts[2].balance_usage.store(1000, Ordering::Relaxed);
+        let mut leases = Vec::new();
+        for _ in 0..3 {
+            leases.push(am.lease_account_excluding(&[]).await.unwrap());
+        }
+        let mut ids: Vec<&str> = leases.iter().map(|lease| lease.account().id.as_str()).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 3, "each parallel request must get its own account");
+        assert!(accounts.iter().all(|a| a.playback_inflight.load(Ordering::SeqCst) == 1));
+        drop(leases);
+        assert!(accounts.iter().all(|a| a.playback_inflight.load(Ordering::SeqCst) == 0));
+    }
+
+    #[tokio::test]
+    async fn rate_limit_pause_survives_reload() {
+        let db = crate::db::init_pool("sqlite::memory:").await.unwrap();
+        let am = AccountManager::new(Some(db.clone()), SwitchingWeights::default());
+        let account = am
+            .add_account("a".into(), "c".into(), "s".into(), "rt".into(), None)
+            .await
+            .unwrap();
+        AccountManager::pause_account(&account, Some("120")).await;
+        // A shorter pause must not shorten the stored one.
+        AccountManager::pause_account(&account, Some("5")).await;
+        let reloaded = AccountManager::new(Some(db), SwitchingWeights::default());
+        reloaded.load_from_db().await.unwrap();
+        let restored = reloaded.get_account_by_id(&account.id).await.unwrap();
+        assert!(AccountManager::rate_limit_remaining(&restored).unwrap() >= 119);
+        assert!(matches!(
+            reloaded.select_account().await,
+            Err(AppError::RateLimited(_))
+        ));
     }
 }
