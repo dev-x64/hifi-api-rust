@@ -11,6 +11,7 @@ use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, HeaderValue, Request, StatusCode, header::RETRY_AFTER};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
+use serde::Serialize;
 use serde_json::{Value, json};
 use std::net::{IpAddr, SocketAddr};
 
@@ -18,6 +19,9 @@ use crate::AppState;
 
 const MAX_ENTRIES: usize = 5000;
 const RATE_WINDOW_SECONDS: i64 = 60;
+/// Completed seconds averaged into the "now" rate. One second alone is too
+/// jumpy to read at low traffic.
+const RATE_NOW_SECONDS: i64 = 5;
 const SLOW_MS: u64 = 3000;
 const STUCK_MS: u64 = 10_000;
 
@@ -88,9 +92,54 @@ pub struct LogEntry {
     pub(crate) accounts: Vec<LoggedAccount>,
 }
 
+/// Requests completed within one second, split by the traffic classes the
+/// overview reports separately.
+#[derive(Clone, Copy, Default)]
+struct SecondCounts {
+    all: u64,
+    playback: u64,
+    search: u64,
+}
+
+impl SecondCounts {
+    fn add(&mut self, other: SecondCounts) {
+        self.all += other.all;
+        self.playback += other.playback;
+        self.search += other.search;
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+pub struct RequestRate {
+    /// Requests per second over the last `RATE_NOW_SECONDS` completed seconds.
+    pub now: f64,
+    /// Requests per second over the last 60 seconds.
+    pub avg_60s: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+pub struct RequestRates {
+    pub all: RequestRate,
+    pub playback: RequestRate,
+    pub search: RequestRate,
+}
+
+/// Playback covers every route served through the playback queue; polling
+/// `/playback/requests/{id}` is not a new playback request.
+fn is_playback_path(path: &str) -> bool {
+    matches!(
+        path.split('/').find(|segment| !segment.is_empty()),
+        Some("track" | "trackManifests" | "dash" | "video" | "widevine")
+    )
+}
+
+fn is_search_path(path: &str) -> bool {
+    path.split('/').find(|segment| !segment.is_empty()) == Some("search")
+}
+
 pub struct RequestLog {
     entries: Mutex<VecDeque<LogEntry>>,
-    requests_per_second: Mutex<VecDeque<(i64, u64)>>,
+    requests_per_second: Mutex<VecDeque<(i64, SecondCounts)>>,
     total_requests: AtomicU64,
 }
 
@@ -106,6 +155,11 @@ impl RequestLog {
     pub fn record(&self, entry: LogEntry) {
         self.total_requests.fetch_add(1, Ordering::Relaxed);
         let timestamp = entry.ts;
+        let counted = SecondCounts {
+            all: 1,
+            playback: u64::from(is_playback_path(&entry.path)),
+            search: u64::from(is_search_path(&entry.path)),
+        };
         if let Ok(mut entries) = self.entries.lock() {
             if entries.len() >= MAX_ENTRIES {
                 entries.pop_front();
@@ -114,10 +168,10 @@ impl RequestLog {
         }
         if let Ok(mut buckets) = self.requests_per_second.lock() {
             buckets.retain(|(second, _)| *second > timestamp - RATE_WINDOW_SECONDS);
-            if let Some((_, count)) = buckets.iter_mut().find(|(second, _)| *second == timestamp) {
-                *count += 1;
+            if let Some((_, counts)) = buckets.iter_mut().find(|(second, _)| *second == timestamp) {
+                counts.add(counted);
             } else {
-                buckets.push_back((timestamp, 1));
+                buckets.push_back((timestamp, counted));
             }
         }
     }
@@ -127,19 +181,36 @@ impl RequestLog {
         self.total_requests.load(Ordering::Relaxed)
     }
 
-    /// Completed API requests in the last 60 seconds, including the current second.
-    pub fn requests_last_60s(&self) -> u64 {
-        let now = chrono::Utc::now().timestamp();
-        self.requests_per_second
-            .lock()
-            .map(|buckets| {
-                buckets
-                    .iter()
-                    .filter(|(second, _)| *second > now - RATE_WINDOW_SECONDS && *second <= now)
-                    .map(|(_, count)| count)
-                    .sum()
-            })
-            .unwrap_or(0)
+    /// Completed API requests per second: right now and averaged over the
+    /// last 60 seconds, for all traffic and for playback and search alone.
+    pub fn request_rates(&self) -> RequestRates {
+        self.request_rates_at(chrono::Utc::now().timestamp())
+    }
+
+    /// The 60-second window includes the current second. "Now" covers only
+    /// completed seconds, so a second still filling up does not understate it.
+    fn request_rates_at(&self, now: i64) -> RequestRates {
+        let mut window = SecondCounts::default();
+        let mut recent = SecondCounts::default();
+        if let Ok(buckets) = self.requests_per_second.lock() {
+            for (second, counts) in buckets.iter() {
+                if *second > now - RATE_WINDOW_SECONDS && *second <= now {
+                    window.add(*counts);
+                }
+                if *second >= now - RATE_NOW_SECONDS && *second < now {
+                    recent.add(*counts);
+                }
+            }
+        }
+        let rate = |recent: u64, window: u64| RequestRate {
+            now: recent as f64 / RATE_NOW_SECONDS as f64,
+            avg_60s: window as f64 / RATE_WINDOW_SECONDS as f64,
+        };
+        RequestRates {
+            all: rate(recent.all, window.all),
+            playback: rate(recent.playback, window.playback),
+            search: rate(recent.search, window.search),
+        }
     }
 
     /// p95 of the bounded recent request log, not a lifetime latency metric.
@@ -389,7 +460,7 @@ pub async fn log_requests(
 
 #[cfg(test)]
 mod tests {
-    use super::{LogEntry, RequestLog, should_log_path};
+    use super::{LogEntry, RequestLog, RequestRate, should_log_path};
 
     fn entry(ts: i64, latency_ms: u64) -> LogEntry {
         LogEntry {
@@ -440,7 +511,43 @@ mod tests {
 
         assert_eq!(log.snapshot().len(), 5000);
         assert_eq!(log.total_requests(), 5002);
-        assert_eq!(log.requests_last_60s(), 5001);
+        assert_eq!(log.request_rates_at(now).all.avg_60s, 5001.0 / 60.0);
+    }
+
+    #[test]
+    fn rates_split_playback_and_search_into_now_and_average() {
+        let log = RequestLog::new();
+        let now = 1_000_000;
+        let record = |ts: i64, path: &str, times: usize| {
+            for _ in 0..times {
+                let mut item = entry(ts, 1);
+                item.path = path.into();
+                log.record(item);
+            }
+        };
+        // Older than the "now" window, still inside the 60-second average.
+        record(now - 30, "/track/1", 6);
+        record(now - 30, "/search", 12);
+        record(now - 30, "/album", 3);
+        // Completed seconds that make up "now".
+        record(now - 5, "/trackManifests/7", 2);
+        record(now - 2, "/widevine", 1);
+        record(now - 1, "/video", 2);
+        record(now - 1, "/search", 10);
+        record(now - 1, "/playback/requests", 4);
+        // The second still in progress counts toward the average only.
+        record(now, "/dash/9", 3);
+        record(now, "/search", 3);
+
+        let rates = log.request_rates_at(now);
+        assert_eq!(rates.playback, RequestRate { now: 1.0, avg_60s: 14.0 / 60.0 });
+        assert_eq!(rates.search, RequestRate { now: 2.0, avg_60s: 25.0 / 60.0 });
+        assert_eq!(rates.all, RequestRate { now: 19.0 / 5.0, avg_60s: 46.0 / 60.0 });
+
+        // Six seconds later everything recorded so far has left "now".
+        let later = log.request_rates_at(now + 6);
+        assert_eq!(later.all.now, 0.0);
+        assert_eq!(later.all.avg_60s, 46.0 / 60.0);
     }
 
     #[test]

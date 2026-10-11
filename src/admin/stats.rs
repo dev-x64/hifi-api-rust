@@ -121,7 +121,7 @@ pub async fn get_stats(State(state): State<AppState>) -> Result<Json<Value>, App
         .sum();
     let total_requests = state.request_log.total_requests();
     let (recent_requests, total_errors) = state.request_log.outcome_counts();
-    let requests_per_second_60s = state.request_log.requests_last_60s() as f64 / 60.0;
+    let request_rates = state.request_log.request_rates();
     let recent_p95_ms = state.request_log.recent_p95_ms();
     let now = Utc::now().timestamp();
     let active_count = accounts
@@ -192,7 +192,8 @@ pub async fn get_stats(State(state): State<AppState>) -> Result<Json<Value>, App
         "error_rate": if recent_requests > 0 {
             format!("{:.2}%", (total_errors as f64 / recent_requests as f64) * 100.0)
         } else { "0.00%".into() },
-        "requests_per_second_60s": requests_per_second_60s,
+        "requests_per_second_60s": request_rates.all.avg_60s,
+        "request_rates": request_rates,
         "recent_p95_ms": recent_p95_ms,
         "recent_requests": recent_requests,
         "recent_error_rate_percent": (recent_requests > 0).then(|| total_errors as f64 * 100.0 / recent_requests as f64),

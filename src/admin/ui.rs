@@ -289,6 +289,11 @@ button:focus-visible,input:focus-visible,select:focus-visible { outline:2px soli
 .stat-rows { display:grid; gap:7px; margin-top:12px; font-size:12px; line-height:1.4; color:#aab4c0; }
 .stat-row { display:flex; align-items:center; gap:8px; }
 .stat-row strong { margin-left:auto; padding-left:12px; color:var(--text); font-weight:600; font-variant-numeric:tabular-nums; white-space:nowrap; }
+.rate-rows { grid-template-columns:minmax(0,1fr) auto auto; column-gap:16px; align-items:baseline; }
+.rate-rows > span { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.rate-rows strong,.rate-rows .rate-head { text-align:right; white-space:nowrap; font-variant-numeric:tabular-nums; }
+.rate-rows strong { color:var(--text); font-weight:600; }
+.rate-rows .rate-head { color:var(--muted); font-size:11px; }
 .stat-card .status-dot { width:8px; height:8px; box-shadow:none; }
 .stat-card .status-ok { background:#2fa36b; }
 .stat-card .status-warn { background:#f4b860; }
@@ -893,12 +898,25 @@ function proxyCard(proxy) {
             metricRow('В пуле', esc(metricNumber(proxy.pool_size)))]));
 }
 
+function rateCard(rates) {
+    rates = rates || {};
+    var cells = '<span></span><span class="rate-head">Сейчас</span><span class="rate-head">60 с</span>' +
+        [['Всего', rates.all], ['Воспроизведение', rates.playback], ['Поиск', rates.search]].map(function(row) {
+            var rate = row[1] || {};
+            return '<span>' + esc(row[0]) + '</span><strong>' + esc(metricNumber(rate.now, 2)) + '</strong><strong>' +
+                esc(metricNumber(rate.avg_60s, 2)) + '</strong>';
+        }).join('');
+    return metricCard('Запросов в секунду', esc(metricNumber((rates.all || {}).now, 2)) + ' <span class="metric-unit">сейчас</span>', [],
+        '«Сейчас» — завершённые API-запросы в секунду за последние 5 секунд, «60 с» — среднее за последние 60 секунд. Воспроизведение — запросы треков, видео и лицензий; поиск — запросы /search.',
+        '<div class="stat-rows rate-rows">' + cells + '</div>');
+}
+
 function overviewCards(stats) {
     var sample = stats.recent_requests;
     var noRequests = 'Пока нет завершённых запросов.';
     var errorValue = sample > 0 ? metricNumber(stats.recent_error_rate_percent, 2) + '%' : '—';
     return overviewGroup('Трафик', 4,
-            metricCard('Запросов в секунду', esc(metricNumber(stats.requests_per_second_60s, 2)), ['Среднее за последние 60 секунд.']) +
+            rateCard(stats.request_rates) +
             metricCard('Время ответа · p95', esc(metricNumber(stats.recent_p95_ms)) + (stats.recent_p95_ms != null ? ' <span class="metric-unit">мс</span>' : ''),
                 [sample > 0 ? '95% ответов укладываются в это время.' : noRequests],
                 'Считается по последним завершённым запросам. Журнал хранит до 5000 записей.') +

@@ -37,7 +37,8 @@ function localized(ctx, html) {
 const counts = { total: 13, enabled: 13, ready: 5, disabled: 0, no_token: 6, needs_check: 2, preview_only: 0, rate_limited: 0, metadata_ready: 7 };
 const empty = Object.fromEntries(Object.keys(counts).map(key => [key, 0]));
 const snapshot = {
-    total_requests: 352374, requests_per_second_60s: 6.15, recent_p95_ms: 300,
+    total_requests: 352374, recent_p95_ms: 300,
+    request_rates: { all: { now: 7.4, avg_60s: 6.15 }, playback: { now: 2.2, avg_60s: 1.85 }, search: { now: 4, avg_60s: 3.5 } },
     recent_requests: 5000, total_errors: 61, recent_error_rate_percent: 1.22,
     account_readiness: counts, playback_readiness: counts, catalog_readiness: empty,
     playback: { active: 0, pending: 0, pool_size: 7 }, catalog: { mode: 'pool' }, redis: { configured: false },
@@ -52,6 +53,12 @@ for (const language of ['en', 'ru']) {
         assert.equal((html.match(/class="ov-title"/g) || []).length, 3);
         assert.doesNotMatch(html, /0\/13|undefined|NaN/);
         assert.match(html, language === 'en' ? /Concurrent request limit<\/span><strong>7</ : /Лимит одновременно<\/span><strong>7</);
+        // Requests per second: the headline is the current total; each class shows now, then the 60-second average.
+        const n = value => language === 'en' ? value : value.replace('.', ',');
+        assert.match(html, new RegExp('class="value">' + n('7.40') + ' <span class="metric-unit">' + (language === 'en' ? 'now' : 'сейчас') + '<'));
+        for (const [en, ru, now, avg] of [['Total', 'Всего', '7.40', '6.15'], ['Playback', 'Воспроизведение', '2.20', '1.85'], ['Search', 'Поиск', '4.00', '3.50']]) {
+            assert.ok(html.includes('<span>' + (language === 'en' ? en : ru) + '</span><strong>' + n(now) + '</strong><strong>' + n(avg) + '</strong>'), en);
+        }
         assert.match(html, language === 'en' ? /No valid token<\/span><strong>6</ : /Без токена<\/span><strong>6</);
         assert.match(html, language === 'en' ? /FULL ready<\/span><strong>5</ : /Готовы к FULL<\/span><strong>5</);
         // The limit follows accounts that can serve now, so the gap to enabled ones is spelled out.
@@ -70,6 +77,9 @@ test('empty traffic has no invented error rate or latency', () => {
     const html = localized(ctx, vm.runInContext('overviewCards(stats)', ctx));
     assert.doesNotMatch(html, /0\.00%|undefined|NaN/);
     assert.match(html, /No requests have completed yet/);
+    // A stats payload without rates (older server) renders dashes, not zeros.
+    ctx.stats.request_rates = undefined;
+    assert.match(vm.runInContext('rateCard(stats.request_rates)', ctx), /class="value">— /);
     assert.match(html, /No playback accounts are enabled/);
 });
 
