@@ -20,7 +20,7 @@ const CACHE_TTL_SECS: u64 = 3600;
 /// misses become hits; only cold keys miss.
 const STALE_WINDOW_SECS: u64 = 3600;
 /// Hard memory bound for cached bodies (moka weight = body bytes).
-const MAX_CACHE_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_CACHE_BYTES: u64 = 128 * 1024 * 1024;
 /// Hard memory bound for negatively cached error bodies.
 const MAX_NEG_BYTES: u64 = 32 * 1024 * 1024;
 /// Hard TTL ceiling for negative entries (manual per-status expiry inside

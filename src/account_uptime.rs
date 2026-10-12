@@ -146,6 +146,19 @@ impl AccountUptime {
         Ok(())
     }
 
+    /// Forgets all history, so earlier time is unknown again. Called under the per-account
+    /// mutex; the caller then observes the current state to restart the timeline.
+    pub async fn reset(&mut self, db: Option<&SqlitePool>, id: &str) -> Result<(), sqlx::Error> {
+        if let Some(db) = db {
+            sqlx::query("DELETE FROM account_uptime_events WHERE account_id = ?")
+                .bind(id)
+                .execute(db)
+                .await?;
+        }
+        self.events.clear();
+        Ok(())
+    }
+
     fn prune(&mut self, now: i64) {
         let old = self.events.partition_point(|e| e.at < now - WINDOW_SECS);
         if old > 1 {

@@ -63,10 +63,10 @@ body { font-family:'SF Mono','Fira Code','Cascadia Code','JetBrains Mono',Menlo,
 .uptime-bar:focus-visible { outline:2px solid #7c6cff; outline-offset:2px; }
 .uptime-stack { display:flex; flex-direction:column-reverse; height:100%; overflow:hidden; border-radius:3px; background:var(--panel-2); transition:filter .12s; }
 .uptime-bar:hover .uptime-stack, .uptime-bar:focus-visible .uptime-stack { filter:brightness(1.3); }
-.uptime-bar::after { content:attr(data-tip); position:absolute; bottom:calc(100% + 8px); left:50%; z-index:20; transform:translateX(-50%); padding:8px 10px; border:1px solid var(--line); border-radius:8px; background:var(--bg); box-shadow:0 8px 24px rgba(0,0,0,.45); color:var(--text); font-size:11px; line-height:1.6; white-space:pre; pointer-events:none; opacity:0; visibility:hidden; transition:opacity .12s; }
-.uptime-bar:hover::after, .uptime-bar:focus-visible::after { opacity:1; visibility:visible; }
-.uptime-bar[data-edge="start"]::after { left:0; transform:none; }
-.uptime-bar[data-edge="end"]::after { left:auto; right:0; transform:none; }
+.uptime-bar::after, .rate-bar::after { content:attr(data-tip); position:absolute; bottom:calc(100% + 8px); left:50%; z-index:20; transform:translateX(-50%); padding:8px 10px; border:1px solid var(--line); border-radius:8px; background:var(--bg); box-shadow:0 8px 24px rgba(0,0,0,.45); color:var(--text); font-size:11px; line-height:1.6; white-space:pre; pointer-events:none; opacity:0; visibility:hidden; transition:opacity .12s; }
+.uptime-bar:hover::after, .uptime-bar:focus-visible::after, .rate-bar:hover::after { opacity:1; visibility:visible; }
+.uptime-bar[data-edge="start"]::after, .rate-bar[data-edge="start"]::after { left:0; transform:none; }
+.uptime-bar[data-edge="end"]::after, .rate-bar[data-edge="end"]::after { left:auto; right:0; transform:none; }
 .uptime-span { width:100%; flex-shrink:0; }
 .uptime-span + .uptime-span { box-sizing:border-box; border-bottom:1px solid var(--panel); }
 .uptime-up { background:#2fa36b; }
@@ -224,6 +224,19 @@ body { font-family:'SF Mono','Fira Code','Cascadia Code','JetBrains Mono',Menlo,
 .term-extra { display:none; }
 .terminal.show-extra .term-extra { display:inline; }
 .term-account { color:#79c0ff; }
+.errors-panel > summary { cursor:pointer; list-style:none; user-select:none; }
+.errors-panel > summary::-webkit-details-marker { display:none; }
+.errors-panel > summary::before { content:'▸'; color:#7d8a7e; font-size:11px; }
+.errors-panel[open] > summary::before { content:'▾'; }
+.errors-panel:not([open]) > summary { border-bottom:0; }
+.errors-panel .term-title { font-size:12px; color:#c9e8d2; }
+.errors-panel .term-body { height:auto; max-height:520px; padding-top:4px; }
+.err-count { font-family:monospace; font-size:11px; color:#f85149; }
+.err-item { padding:9px 0; border-bottom:1px solid #142114; overflow-wrap:anywhere; }
+.err-item:last-child { border-bottom:0; }
+.err-item .term-line { white-space:normal; }
+.err-cause strong { color:#e3b341; font-weight:600; }
+.err-cause span { color:#9aa79b; }
 .term-cursor { display:inline-block; width:8px; height:14px; background:#3fb950; vertical-align:-2px; animation:termBlink 1.1s infinite; }
 @media (max-width:768px) { .term-body { height:300px; font-size:11px; } }
 
@@ -296,6 +309,21 @@ button:focus-visible,input:focus-visible,select:focus-visible { outline:2px soli
 .rate-rows strong,.rate-rows .rate-head { text-align:right; white-space:nowrap; font-variant-numeric:tabular-nums; }
 .rate-rows strong { color:var(--text); font-weight:600; }
 .rate-rows .rate-head { color:var(--muted); font-size:11px; }
+.stat-wide { grid-column:span 2; }
+.stat-tall { grid-row:span 2; }
+.rate-chart { display:flex; align-items:flex-end; gap:2px; height:48px; margin-top:14px; border-bottom:1px solid var(--line); }
+.rate-bar { position:relative; display:flex; flex:1; flex-direction:column-reverse; min-width:0; height:100%; }
+.rate-bar i { display:block; flex:none; min-height:2px; }
+.rate-bar i + i { box-sizing:border-box; border-bottom:1px solid var(--panel); }
+.rate-bar i:last-child { border-radius:2px 2px 0 0; }
+.rate-bar:hover i { filter:brightness(1.3); }
+.rate-playback { background:#7c6cff; }
+.rate-search { background:#2aa3b3; }
+.rate-catalog { background:#c9822f; }
+.rate-cached { box-shadow:inset 0 0 0 1px var(--muted); }
+.rate-key { display:inline-block; width:8px; height:8px; margin-right:8px; border-radius:2px; }
+.rate-unit { color:var(--muted); font-weight:500; }
+.rate-cols { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:0 32px; align-items:start; }
 .stat-card .status-dot { width:8px; height:8px; box-shadow:none; }
 .stat-card .status-ok { background:#2fa36b; }
 .stat-card .status-warn { background:#f4b860; }
@@ -368,12 +396,14 @@ button:focus-visible,input:focus-visible,select:focus-visible { outline:2px soli
   .header { margin-top:4px; }
   .header h1 { font-size:24px; }
   .header-actions .btn:not(.mobile-keep) { display:none; }
-  .ov-2,.ov-3 { grid-template-columns:1fr; }
+  .ov-2,.ov-3,.rate-cols { grid-template-columns:1fr; }
   .toolbar,.section-head { align-items:stretch; flex-direction:column; }
   .search-wrap { width:100%; }
 }
 @media (max-width:480px) {
   .ov-4 { grid-template-columns:1fr; }
+  .stat-wide { grid-column:auto; }
+  .stat-tall { grid-row:auto; }
   .card-actions { width:100%; display:grid; grid-template-columns:1fr 1fr; }
   .card-actions .btn { width:100%; }
   .section-actions { display:grid; grid-template-columns:1fr 1fr; }
@@ -415,13 +445,19 @@ button:focus-visible,input:focus-visible,select:focus-visible { outline:2px soli
 
   <section id="view-overview" class="view active">
     <div id="stats" class="overview"></div>
-    <div class="section-head"><div><h2>Журнал запросов</h2><p>Последняя активность обновляется автоматически каждые 15 секунд.</p></div><div class="section-actions"><button class="btn" id="requestLogDetails" aria-pressed="false" onclick="toggleRequestLogDetails()">Доп. поля</button><button class="btn" id="requestLogMore" onclick="showMoreRequests()">Показать ещё</button><button class="btn" onclick="loadRequestLog()">Обновить журнал</button></div></div>
+    <div class="section-head"><div><h2>Журнал запросов</h2><p>Последняя активность обновляется автоматически каждые 5 секунд.</p></div><div class="section-actions"><button class="btn" id="requestLogDetails" aria-pressed="false" onclick="toggleRequestLogDetails()">Доп. поля</button><button class="btn" id="requestLogMore" onclick="showMoreRequests()">Показать ещё</button><button class="btn" onclick="loadRequestLog()">Обновить журнал</button></div></div>
     <div class="terminal" id="requestLogTerminal">
       <div class="term-bar"><span class="term-dots"><i></i><i></i><i></i></span><span class="term-title">hifi-api — live request log</span><span class="term-live" id="term-live">● LIVE</span></div>
       <div class="term-meta"><span>Всего <strong id="rq-total">—</strong></span><span>Показано <strong id="rq-shown">—</strong></span><span>Ошибок <strong id="rq-errors">—</strong></span><span>4xx без 429 <strong id="rq-user-errors">—</strong></span><span>429/5xx <strong id="rq-upstream-errors">—</strong></span><span>p50 <strong id="rq-p50">—</strong></span><span>p95 <strong id="rq-p95">—</strong></span><span id="rq-endpoints"></span><span id="rq-tracks" style="color:#d2a8ff"></span></div>
       <div class="term-meta" id="rq-slowest"></div>
       <div id="rq-recent" class="term-body"></div>
     </div>
+    <details class="terminal errors-panel" id="errorsPanel">
+      <summary class="term-bar"><span class="term-title">Последние ошибки API</span><span class="err-count" id="er-count">—</span></summary>
+      <div class="term-meta" id="er-causes"></div>
+      <div class="term-meta" id="er-accounts"></div>
+      <div id="er-list" class="term-body"></div>
+    </details>
   </section>
 
   <section id="view-accounts" class="view">
@@ -448,7 +484,8 @@ button:focus-visible,input:focus-visible,select:focus-visible { outline:2px soli
       <div class="form-section"><h3>Воспроизведение</h3><p class="form-copy">Настройки выбора формата и исходящих запросов к Tidal.</p><div class="form-group" style="margin-bottom:16px"><label>Формат по умолчанию</label><select id="rl-atmos" class="select" style="width:100%;padding:10px 12px"><option value="high">HIGH · AAC 320 kbps (v1)</option><option value="off">FLAC в приоритете</option><option value="prefer">Atmos в приоритете</option></select></div><div class="form-row"><div class="form-group"><label for="rl-track-requests">Запросов на аккаунт · треки</label><input type="number" id="rl-track-requests" min="1" max="10" value="1"></div><div class="form-group"><label for="rl-catalog-requests">Запросов на аккаунт · каталог</label><input type="number" id="rl-catalog-requests" min="1" max="10" value="1"></div></div><p class="form-copy">Лимит включает первую попытку. При ошибке сервис всё ещё может перейти на другой аккаунт; цепочка аккаунтов в журнале показывает такие переключения.</p><div class="form-group" style="margin-bottom:8px"><label for="rl-catalog-concurrency">Одновременных запросов на аккаунт каталога</label><input type="number" id="rl-catalog-concurrency" min="0" max="1000" value="0"></div><p class="form-copy">0 — без ограничения. Когда все аккаунты каталога заняты, запросы метаданных уходят в пул воспроизведения.</p><p class="form-copy">Автовосстановление всегда включено. Отключённые вручную аккаунты остаются выключенными.</p><div class="section-actions"><button class="btn btn-primary" onclick="saveSettings()">Сохранить</button><button class="btn" id="clearPlaybackBtn" onclick="clearPlaybackQueue()">Очистить очередь</button></div></div>
       <div class="form-section"><h3>Прокси</h3><p class="form-copy">Маршрутизация исходящих запросов. Изменения применяются сразу.</p><div class="card-stats" style="margin-bottom:16px"><span class="card-stat">Статус <strong id="px-status">—</strong></span><span class="card-stat">Назначено <strong id="px-current">—</strong></span><span class="card-stat">В пуле <strong id="px-pool">—</strong></span><span class="card-stat">Проверено назначений <strong id="px-verified">—</strong></span><span class="card-stat" title="Сумма последовательных ошибок по текущим назначениям; сбрасываются после успешного запроса">Ошибок подряд <strong id="px-fails">—</strong></span></div><div id="px-assignments" class="helper" style="white-space:pre-line;margin-bottom:16px"></div><div class="form-group"><label for="px-list">Адреса прокси · по одному в строке</label><textarea id="px-list" spellcheck="false" placeholder="http://user:password@host:port" oninput="proxyListDirty=true"></textarea></div><div class="section-actions" style="margin-top:12px"><button class="btn btn-primary" id="pxToggleBtn" onclick="toggleProxies()">Включить прокси</button><button class="btn" id="pxSaveBtn" onclick="saveProxyList()">Сохранить список</button></div><p class="helper" id="px-persist" style="margin-top:11px"></p></div>
       <div class="form-section"><h3>Уведомления</h3><p class="form-copy">Discord-оповещения о риске блокировки и недоступности аккаунтов.</p><div class="card-stats" style="margin-bottom:15px"><span class="card-stat">Discord <strong id="al-discord">—</strong></span></div><div class="form-group"><label for="al-webhook">URL вебхука Discord</label><input type="password" id="al-webhook" placeholder="https://discord.com/api/webhooks/…" autocomplete="new-password" spellcheck="false"></div><p class="helper" style="margin:8px 0 14px">Сохранённый URL скрыт. Введите новый, чтобы заменить его.</p><div class="section-actions" style="margin-bottom:15px"><button class="btn btn-primary" onclick="saveDiscordWebhook()" id="saveWebhookBtn">Сохранить вебхук</button><button class="btn btn-danger" onclick="disableDiscordWebhook()" id="disableWebhookBtn">Отключить вебхук</button></div><div class="section-actions"><button class="btn" onclick="testAlert()" id="alertTestBtn">Тест</button><button class="btn" onclick="sendReport('status')" id="reportStatusBtn">Статус</button><button class="btn" onclick="sendReport('accounts')" id="reportAccountsBtn">Аккаунты</button></div></div>
-      <div class="form-section"><h3>Кэш</h3><p class="form-copy">Счётчики запросов с запуска сервера. Устаревшие и объединённые ответы входят в попадания. Очистка кэша не обнуляет счётчики.</p><div class="card-stats" style="margin-bottom:15px"><span class="card-stat">Попадания <strong id="cc-hits">—</strong></span><span class="card-stat">Промахи <strong id="cc-misses">—</strong></span><span class="card-stat">Из устаревшего кэша <strong id="cc-stale">—</strong></span><span class="card-stat">Ошибок из кэша <strong id="cc-negative">—</strong></span><span class="card-stat">Объединённых запросов <strong id="cc-coalesced">—</strong></span></div><button class="btn" onclick="clearCache()" id="clearCacheBtn">Очистить кэш</button></div>
+      <div class="form-section"><h3>Кэш</h3><p class="form-copy">Счётчики запросов с запуска сервера. Устаревшие и объединённые ответы входят в попадания. Очистка кэша не обнуляет счётчики.</p><div class="card-stats" style="margin-bottom:15px"><span class="card-stat">Попадания <strong id="cc-hits">—</strong></span><span class="card-stat">Промахи <strong id="cc-misses">—</strong></span><span class="card-stat" title="Попадания от суммы попаданий и промахов">Доля попаданий <strong id="cc-rate">—</strong></span><span class="card-stat">Из устаревшего кэша <strong id="cc-stale">—</strong></span><span class="card-stat">Ошибок из кэша <strong id="cc-negative">—</strong></span><span class="card-stat">Объединённых запросов <strong id="cc-coalesced">—</strong></span></div><button class="btn" onclick="clearCache()" id="clearCacheBtn">Очистить кэш</button></div>
+      <div class="form-section"><h3>Аптайм аккаунтов</h3><p class="form-copy">Сброс удаляет историю доступности всех аккаунтов и начинает отсчёт заново — например, чтобы проверить стабильность после обновления.</p><button class="btn btn-danger" onclick="resetUptime()" id="resetUptimeBtn">Сбросить аптайм</button></div>
       <div class="form-section"><h3>Учётные данные</h3><p class="form-copy">Экспортируйте или импортируйте Tidal-аккаунты в JSON. Дубликаты токенов будут пропущены.</p><div class="section-actions"><button class="btn" onclick="exportCredentials()">Экспорт JSON</button><button class="btn" onclick="document.getElementById('importFile').click()">Импорт JSON</button><input type="file" id="importFile" accept=".json,application/json" style="display:none" onchange="importCredentials(event)"></div><div id="importResult" class="helper" style="margin-top:10px"></div></div>
       <div class="form-section"><h3>База данных</h3><p class="form-copy">Скачайте полный снимок или восстановите состояние без перезапуска.</p><div class="section-actions"><button class="btn" onclick="downloadBackup()">Скачать копию</button><button class="btn btn-danger" onclick="document.getElementById('restoreFile').click()">Восстановить</button><input type="file" id="restoreFile" accept=".db,.sqlite,.sqlite3,application/x-sqlite3" style="display:none" onchange="restoreBackup(event)"></div><div id="restoreResult" class="helper" style="margin-top:10px"></div></div>
     </div>
@@ -797,8 +834,8 @@ function metricPair(label, value) {
     return '<span>' + esc(label) + '</span> <strong>' + esc(metricNumber(value)) + '</strong>';
 }
 
-function metricCard(label, value, details, title, body) {
-    return '<div class="stat-card"' + (title ? ' title="' + esc(title) + '"' : '') + '><div class="label">' + esc(label) + '</div>' +
+function metricCard(label, value, details, title, body, layout) {
+    return '<div class="stat-card' + (layout ? ' ' + layout : '') + '"' + (title ? ' title="' + esc(title) + '"' : '') + '><div class="label">' + esc(label) + '</div>' +
         '<div class="value">' + value + '</div>' + (body || '') + '<div class="stat-details">' + (details || []).map(function(detail) {
             return '<div>' + detail + '</div>';
         }).join('') + '</div></div>';
@@ -825,11 +862,6 @@ function accountsCard(stats) {
     var counts = stats.account_readiness || {};
     var playback = stats.playback_readiness || {}, catalog = stats.catalog_readiness || {};
     var total = counts.total || 0, ready = counts.ready || 0, disabled = counts.disabled || 0;
-    var waiting = Math.max(0, total - ready - disabled);
-    var bar = total > 0 ? '<div class="stat-bar" aria-hidden="true">' +
-        [['status-ok', ready], ['status-warn', waiting], ['status-err', disabled]].map(function(segment) {
-            return segment[1] > 0 ? '<i class="' + segment[0] + '" style="flex-grow:' + segment[1] + '"></i>' : '';
-        }).join('') + '</div>' : '';
     var rows = [metricRow('Готовы к FULL', esc(metricNumber(playback.ready)), 'status-ok')];
     if (catalog.total > 0) rows.push(metricRow('Готовы к каталогу', esc(metricNumber(catalog.ready)), 'status-ok'));
     [['no_token', 'Без токена'], ['needs_check', 'Нужна FULL-проверка'], ['preview_only', 'Только PREVIEW'], ['rate_limited', 'Пауза 429']].forEach(function(item) {
@@ -839,7 +871,7 @@ function accountsCard(stats) {
     return metricCard('Готовые аккаунты', esc(metricNumber(ready)) + ' <span class="metric-unit"><span>из</span> ' + esc(metricNumber(total)) + '</span>',
         total === 0 ? ['Добавьте аккаунт для доступа к Tidal.'] : [],
         'Готовность: действующий токен и отсутствие паузы 429. Для воспроизведения нужна подтверждённая FULL-проверка не старше 8 часов.',
-        total > 0 ? bar + metricRows(rows) : '');
+        total > 0 ? metricRows(rows) : '');
 }
 
 function playbackCard(pb, readiness) {
@@ -900,17 +932,53 @@ function proxyCard(proxy) {
             metricRow('В пуле', esc(metricNumber(proxy.pool_size)))]));
 }
 
-function rateCard(rates) {
-    rates = rates || {};
+// Stacking order of the per-second chart; the rate table doubles as its legend.
+var rateSeries = [['playback', 'Воспроизведение'], ['search', 'Поиск'], ['catalog', 'Каталог']];
+
+function rateChart(history) {
+    if (!history || !history.length) return '';
+    var peak = Math.max.apply(null, history.map(function(second) { return second[0] + second[1] + second[2]; }));
+    var bars = history.map(function(second, index) {
+        var tip = (history.length - index) + ' ' + tr('с назад');
+        var spans = '';
+        rateSeries.forEach(function(series, kind) {
+            if (second[kind] > 0) spans += '<i class="rate-' + series[0] + '" style="height:' + (second[kind] * 100 / peak).toFixed(1) + '%"></i>';
+            tip += '\n' + tr(series[1]) + ': ' + second[kind];
+        });
+        var edge = index < 8 ? ' data-edge="start"' : (index >= history.length - 8 ? ' data-edge="end"' : '');
+        return '<div class="rate-bar" data-tip="' + esc(tip) + '"' + edge + '>' + spans + '</div>';
+    }).join('');
+    return '<div class="rate-chart" data-no-i18n role="img" aria-label="' + esc(tr('Запросы к Tidal по секундам за последние 60 секунд')) + '">' + bars + '</div>' +
+        '<div class="uptime-axis"><span>60 с назад</span><span>Сейчас</span></div>';
+}
+
+function rateCard(rates, stats) {
+    rates = rates || {}; stats = stats || {};
+    var unit = ' <span class="rate-unit">/с</span>';
     var cells = '<span></span><span class="rate-head">Сейчас</span><span class="rate-head">60 с</span>' +
-        [['Всего', rates.all], ['Воспроизведение', rates.playback], ['Поиск', rates.search]].map(function(row) {
+        [['Всего', rates.all, ''], ['Воспроизведение', rates.playback, 'rate-playback'], ['Поиск', rates.search, 'rate-search'],
+            ['Каталог', rates.catalog, 'rate-catalog'], ['Из кэша', rates.cached, 'rate-cached']].map(function(row) {
             var rate = row[1] || {};
-            return '<span>' + esc(row[0]) + '</span><strong>' + esc(metricNumber(rate.now, 2)) + '</strong><strong>' +
-                esc(metricNumber(rate.avg_60s, 2)) + '</strong>';
+            return '<span>' + (row[2] ? '<i class="rate-key ' + row[2] + '" aria-hidden="true"></i>' : '') + esc(row[0]) + '</span><strong>' +
+                esc(metricNumber(rate.now, 2)) + '</strong><strong>' + esc(metricNumber(rate.avg_60s, 2)) + '</strong>';
         }).join('');
-    return metricCard('Запросов в секунду', esc(metricNumber((rates.all || {}).now, 2)) + ' <span class="metric-unit">сейчас</span>', [],
-        '«Сейчас» — завершённые API-запросы в секунду за последние 5 секунд, «60 с» — среднее за последние 60 секунд. Воспроизведение — запросы треков, видео и лицензий; поиск — запросы /search.',
-        '<div class="stat-rows rate-rows">' + cells + '</div>');
+    // Load is spread over the accounts able to serve right now, which is what Tidal limits.
+    var mode = (stats.catalog || {}).mode;
+    var metadataAccounts = mode === 'static_token' ? 0 : ((mode === 'account' ? stats.catalog_readiness : stats.playback_readiness) || {}).metadata_ready;
+    function perAccount(label, rate, accounts) {
+        return accounts > 0 && rate != null ? [metricRow(label, esc(metricNumber(rate / accounts, 2)) + unit)] : [];
+    }
+    var limits = [];
+    if (rates.history) limits.push(metricRow('Пик за 60 с', esc(metricNumber(Math.max.apply(null, rates.history.map(function(second) {
+        return second[0] + second[1] + second[2];
+    })))) + unit));
+    limits = limits.concat(perAccount('Воспроизведение на один аккаунт', (rates.playback || {}).avg_60s, (stats.playback || {}).pool_size),
+        perAccount('Метаданные на один аккаунт', rates.search && rates.catalog ? rates.search.avg_60s + rates.catalog.avg_60s : null, metadataAccounts));
+    if (rates.throttled_60s != null) limits.push(metricRow('Ответов 429 за 60 с', esc(metricNumber(rates.throttled_60s)), rates.throttled_60s > 0 ? 'status-warn' : ''));
+    return metricCard('Запросы к Tidal в секунду', esc(metricNumber((rates.all || {}).now, 2)) + ' <span class="metric-unit">сейчас</span>',
+        ['Считаются только запросы, отправленные в Tidal: без ответов из кэша, опроса очереди и служебных маршрутов. «Сейчас» — среднее за последние 5 секунд.',
+            'Нагрузка на один аккаунт — среднее за 60 секунд, делённое на число аккаунтов, которые сейчас могут обслуживать такие запросы.'], '',
+        rateChart(rates.history) + '<div class="rate-cols"><div class="stat-rows rate-rows">' + cells + '</div>' + metricRows(limits) + '</div>', 'stat-wide stat-tall');
 }
 
 function overviewCards(stats) {
@@ -918,7 +986,7 @@ function overviewCards(stats) {
     var noRequests = 'Пока нет завершённых запросов.';
     var errorValue = sample > 0 ? metricNumber(stats.recent_error_rate_percent, 2) + '%' : '—';
     return overviewGroup('Трафик', 4,
-            rateCard(stats.request_rates) +
+            rateCard(stats.request_rates, stats) +
             metricCard('Время ответа · p95', esc(metricNumber(stats.recent_p95_ms)) + (stats.recent_p95_ms != null ? ' <span class="metric-unit">мс</span>' : ''),
                 [sample > 0 ? '95% ответов укладываются в это время.' : noRequests],
                 'Считается по последним завершённым запросам. Журнал хранит до 5000 записей.') +
@@ -926,11 +994,48 @@ function overviewCards(stats) {
                 [sample > 0 ? '<strong>' + esc(metricNumber(stats.total_errors)) + '</strong> <span>из</span> <strong>' + esc(metricNumber(sample)) + '</strong> <span>последних запросов</span>' : noRequests],
                 'Доля ответов HTTP 4xx/5xx, включая 404 и 429, среди последних завершённых запросов. Журнал хранит до 5000 записей.') +
             metricCard('Завершённые API-запросы', esc(metricNumber(stats.total_requests)), ['С момента запуска сервера.'],
-                'Один входящий API-запрос считается один раз, включая внутренние повторы через другие аккаунты.')) +
+                'Один входящий API-запрос считается один раз, включая внутренние повторы через другие аккаунты.', '', 'stat-wide')) +
         overviewGroup('Аккаунты и воспроизведение', 2,
             accountsCard(stats) + playbackCard(stats.playback, stats.playback_readiness)) +
         overviewGroup('Инфраструктура', 3,
             catalogCard(stats.catalog, stats.playback_readiness, stats.catalog_readiness) + redisCard(stats.redis) + proxyCard(overviewProxy));
+}
+
+// Cards whose markup did not change keep their DOM, so frequent refreshes do not
+// reset hover tooltips on cards that are standing still.
+var overviewCardHtml = [];
+
+function renderOverview(stats) {
+    var root = document.getElementById('stats');
+    var fresh = document.createElement('div');
+    fresh.innerHTML = overviewCards(stats);
+    var next = Array.prototype.slice.call(fresh.querySelectorAll('.stat-card'));
+    var current = root.querySelectorAll('.stat-card');
+    var html = next.map(function(card) { return card.outerHTML; });
+    if (current.length !== next.length || overviewCardHtml.length !== next.length) {
+        root.innerHTML = fresh.innerHTML;
+    } else {
+        next.forEach(function(card, index) {
+            if (overviewCardHtml[index] !== html[index]) current[index].replaceWith(card);
+        });
+    }
+    overviewCardHtml = html;
+}
+
+var statsRefreshing = false;
+
+async function refreshStats() {
+    if (statsRefreshing) return;
+    statsRefreshing = true;
+    try {
+        var res = await fetch('/admin/stats', { headers: headers() });
+        if (!res.ok) return;
+        window._stats = await res.json();
+        renderOverview(window._stats);
+    } catch(e) {
+    } finally {
+        statsRefreshing = false;
+    }
 }
 
 var _testResults = {};
@@ -1169,7 +1274,7 @@ async function fetchData() {
         window._accounts = accounts.accounts;
 
         window._stats = stats;
-        document.getElementById('stats').innerHTML = overviewCards(stats);
+        renderOverview(stats);
 
         var html = '';
         if (accounts.accounts.length === 0) {
@@ -1488,10 +1593,17 @@ bootstrap();
 setInterval(function() {
     if (!authenticated || document.hidden) return;
     if (currentView === 'overview' || currentView === 'accounts') fetchData();
-    if (currentView === 'overview') { loadRequestLog(); loadProxyStatus(); }
+    if (currentView === 'overview') loadProxyStatus();
     if (currentView === 'access') loadApiKeys();
     if (currentView === 'system') { loadProxyStatus(); loadAlertStatus(); loadCacheStats(); }
 }, 15000);
+// The overview is a live dashboard: its counters and request log refresh faster than the rest.
+setInterval(function() {
+    if (authenticated && !document.hidden && currentView === 'overview') refreshStats();
+}, 2000);
+setInterval(function() {
+    if (authenticated && !document.hidden && currentView === 'overview') loadRequestLog();
+}, 5000);
 
 async function loadAlertStatus() {
     try {
@@ -1709,6 +1821,23 @@ async function clearCache() {
     }
 }
 
+async function resetUptime() {
+    if (!confirm(tr('Сбросить историю аптайма всех аккаунтов? Отсчёт начнётся заново, вернуть историю будет нельзя.'))) return;
+    var btn = document.getElementById('resetUptimeBtn');
+    btn.disabled = true;
+    try {
+        var res = await fetch('/admin/uptime/reset', { method: 'POST', headers: headers() });
+        var data = await res.json();
+        if (!res.ok) throw new Error(data.detail || 'HTTP ' + res.status);
+        document.getElementById('success').textContent = 'История аптайма сброшена.';
+        fetchData();
+    } catch(e) {
+        document.getElementById('error').textContent = 'Сброс аптайма: ' + e.message;
+    } finally {
+        btn.disabled = false;
+    }
+}
+
 async function clearPlaybackQueue() {
     var btn = document.getElementById('clearPlaybackBtn');
     btn.disabled = true;
@@ -1733,6 +1862,9 @@ async function loadCacheStats() {
         var c = (await res.json()).cache || {};
         document.getElementById('cc-hits').textContent = c.hits != null ? c.hits : '—';
         document.getElementById('cc-misses').textContent = c.misses != null ? c.misses : '—';
+        var lookups = (c.hits || 0) + (c.misses || 0);
+        document.getElementById('cc-rate').textContent = lookups > 0
+            ? (c.hits * 100 / lookups).toLocaleString(adminLanguage === 'ru' ? 'ru-RU' : 'en-GB', {minimumFractionDigits:1, maximumFractionDigits:1}) + '%' : '—';
         document.getElementById('cc-stale').textContent = c.stale != null ? c.stale : '—';
         document.getElementById('cc-negative').textContent = c.negative != null ? c.negative : '—';
         document.getElementById('cc-coalesced').textContent = c.coalesced != null ? c.coalesced : '—';
@@ -1790,21 +1922,9 @@ async function loadRequestLog() {
         var rows = '';
         for (var q of recent.slice().reverse()) {
             var cls = q.status >= 500 ? 'test-fail' : (q.status >= 400 ? 'test-pending' : 'test-pass');
-            var t = '';
-            if (q.ts) {
-                var d = new Date(q.ts * 1000);
-                t = ('0' + d.getHours()).slice(-2) + ':' + ('0' + d.getMinutes()).slice(-2) + ':' + ('0' + d.getSeconds()).slice(-2);
-            }
-            var accountItems = (q.accounts || []).map(function(account) {
-                var label = account.label || account.id || '—';
-                var shortId = account.id && account.id !== 'catalog-token' ? ' [' + account.id.slice(0, 8) + ']' : '';
-                var role = account.role === 'catalog' ? ' · catalog' : '';
-                return esc(label) + esc(shortId + role);
-            });
-            var accountInfo = accountItems.length
-                ? ' <span class="term-extra term-account">ACCOUNT ' + accountItems.join(' → ') + '</span>'
-                : '';
-            rows += '<div class="term-line"><span class="term-time">' + t + '</span> ' +
+            var chain = accountChain(q.accounts);
+            var accountInfo = chain ? ' <span class="term-extra term-account">ACCOUNT ' + chain + '</span>' : '';
+            rows += '<div class="term-line"><span class="term-time">' + logTime(q.ts) + '</span> ' +
                 '<span class="term-method m-' + q.method + '">' + q.method + '</span> ' +
                 '<span class="term-path">' + esc(q.path) + '</span>' +
                 (q.detail ? ' <span class="term-id">#' + esc(q.detail) + '</span>' : '') + ' ' +
@@ -1826,7 +1946,99 @@ async function loadRequestLog() {
             box.innerHTML = '<div class="term-line"><span class="term-dim">$ waiting for traffic…</span> <span class="term-cursor"></span></div>';
         }
         renderedRequestLogLimit = limit;
+        renderErrors(r.recent_errors || []);
     } catch(e) {}
+}
+
+function logTime(ts) {
+    if (!ts) return '';
+    var d = new Date(ts * 1000);
+    return ('0' + d.getHours()).slice(-2) + ':' + ('0' + d.getMinutes()).slice(-2) + ':' + ('0' + d.getSeconds()).slice(-2);
+}
+
+// Accounts tried for one request, in attempt order.
+function accountChain(accounts) {
+    return (accounts || []).map(function(account) {
+        var label = account.label || account.id || '—';
+        var shortId = account.id && account.id !== 'catalog-token' ? ' [' + account.id.slice(0, 8) + ']' : '';
+        var role = account.role === 'catalog' ? ' · catalog' : '';
+        return esc(label) + esc(shortId + role);
+    }).join(' → ');
+}
+
+// What an error response means: [cause, explanation]. The server's own
+// message is matched first; the status alone is the fallback.
+function errorCause(q) {
+    var detail = String(q.error || '').toLowerCase();
+    var has = function(text) { return detail.indexOf(text) !== -1; };
+    if (has('different track')) return ['Подмена трека', 'Tidal вернул другую запись вместо запрошенной — обычно id есть только в Atmos или только в стерео. Повтор не поможет: нужен другой формат или id соседней версии.'];
+    if (has('preview only')) return ['Только превью', 'Tidal отдал 30-секундный фрагмент: трек недоступен целиком в регионе аккаунтов или у них нет нужной подписки.'];
+    if (has('did not return high')) return ['Нет качества HIGH', 'Tidal не отдал трек в AAC 320 kbps, выбранном как формат по умолчанию.'];
+    if (has('queue full')) return ['Очередь переполнена', 'Запросов воспроизведения больше, чем успевает обслужить пул аккаунтов. Клиенту стоит повторить через несколько секунд.'];
+    if (has('concurrent request limit')) return ['Каталог занят', 'Все аккаунты каталога заняты, а пула воспроизведения для переноса нагрузки нет.'];
+    if (has('all accounts') || has('no tidal credentials')) return ['Нет рабочих аккаунтов', 'Ни один аккаунт не смог выполнить запрос: аккаунтов нет, токены истекли, аккаунты отключены или все попытки завершились ошибкой.'];
+    if (has('proxy')) return ['Прокси недоступен', 'Нет рабочего прокси для запроса к Tidal, а прямое соединение отключено.'];
+    if (has('connection error')) return ['Нет связи с Tidal', 'Не удалось установить соединение с Tidal — проблема сети или прокси.'];
+    if (has('timeout')) return ['Таймаут', 'Запрос не уложился в отведённое время: Tidal или очередь отвечали слишком долго. Клиент может повторить.'];
+    if (has('cancelled')) return ['Запрос отменён', 'Клиент отменил запрос воспроизведения до его завершения.'];
+    if (q.status === 429) return ['Лимит Tidal', 'Tidal ограничил частоту запросов; аккаунт поставлен на паузу до конца ограничения.'];
+    if (q.status === 404) return ['Не найдено', 'Запрошенный ресурс не найден: неверный id или контент удалён из Tidal.'];
+    if (q.status === 400) return ['Неверный запрос', 'Клиент прислал неполные или некорректные параметры.'];
+    if (q.status === 401) return ['Токен отклонён', 'Tidal не принял токен аккаунта, и обновить его не удалось.'];
+    if (q.status === 403) return ['Доступ запрещён', 'Tidal отказал аккаунту в доступе — возможна блокировка аккаунта или региона.'];
+    if (has('upstream api error') || has('parse tidal response')) return ['Ошибка Tidal', 'Tidal ответил этим статусом или прислал ответ, который не удалось разобрать.'];
+    if (q.status === 503) return ['Сервис недоступен', 'Запрос не удалось обслужить прямо сейчас; подробности — в тексте ответа.'];
+    if (q.status >= 500) return ['Внутренняя ошибка', 'Сбой внутри сервиса; подробности — в тексте ответа и логах сервера.'];
+    return ['Другая ошибка', 'Причина не распознана; смотрите текст ответа.'];
+}
+
+function errorTally(counts) {
+    return Object.keys(counts).sort(function(a, b) { return counts[b] - counts[a]; }).slice(0, 8).map(function(name) {
+        return '<span>' + name + ' <strong>×' + counts[name] + '</strong></span>';
+    }).join('');
+}
+
+// Latest API errors, newest first, each with its cause and the accounts tried.
+function errorsPanel(errors) {
+    var causes = {}, accounts = {}, rows = '';
+    for (var q of errors) {
+        var cause = errorCause(q);
+        var title = '<span>' + cause[0] + '</span>';
+        causes[title] = (causes[title] || 0) + 1;
+        for (var account of (q.accounts || [])) {
+            var name = '<span data-no-i18n>' + esc(account.label || account.id || '—') + '</span>';
+            accounts[name] = (accounts[name] || 0) + 1;
+        }
+        var chain = accountChain(q.accounts);
+        rows += '<div class="err-item"><div class="term-line"><span class="term-time">' + logTime(q.ts) + '</span> ' +
+            '<span class="term-method m-' + esc(q.method) + '">' + esc(q.method) + '</span> ' +
+            '<span class="term-path" data-no-i18n>' + esc(q.path) + '</span>' +
+            (q.detail ? ' <span class="term-id" data-no-i18n>#' + esc(q.detail) + '</span>' : '') + ' ' +
+            '<span class="' + (q.status >= 500 ? 'test-fail' : 'test-pending') + '">' + esc(q.status) + '</span> ' +
+            '<span class="term-dim">' + esc(q.latency_ms) + 'ms ' + esc(q.client_ip) + '</span>' +
+            (q.cache ? ' <span class="term-id">CACHE ' + esc(q.cache) + '</span>' : '') + '</div>' +
+            '<div class="err-cause"><strong>' + cause[0] + '</strong> <span>' + cause[1] + '</span></div>' +
+            (q.error ? '<div class="term-dim" data-no-i18n>' + esc(q.error) + '</div>' : '') +
+            (chain ? '<div class="term-account" data-no-i18n>ACCOUNT ' + chain + '</div>' : '') + '</div>';
+    }
+    var causeList = errorTally(causes), accountList = errorTally(accounts);
+    return {
+        count: errors.length,
+        causes: causeList ? '<span>Причины:</span> ' + causeList : '',
+        accounts: accountList ? '<span>Аккаунты:</span> ' + accountList : '',
+        list: rows || '<div class="term-line"><span class="term-dim">Ошибок пока нет.</span></div>',
+    };
+}
+
+function renderErrors(errors) {
+    var panel = errorsPanel(errors);
+    document.getElementById('er-count').textContent = panel.count;
+    document.getElementById('er-causes').innerHTML = panel.causes;
+    document.getElementById('er-accounts').innerHTML = panel.accounts;
+    var box = document.getElementById('er-list');
+    var top = box.scrollTop;
+    box.innerHTML = panel.list;
+    box.scrollTop = top;
 }
 
 async function loadProxyStatus() {

@@ -17,6 +17,12 @@ services:
       - hifi_data:/data
     init: true
     restart: unless-stopped
+    # Rotate container logs: at most 3 files of 10 MB each.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 volumes:
   hifi_data:

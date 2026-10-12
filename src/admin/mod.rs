@@ -43,6 +43,7 @@ pub(crate) fn locked_response(retry_after: u64) -> Response {
         HeaderValue::from_str(&retry_after.to_string()).expect("valid retry interval"),
     );
     response.headers_mut().insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response.extensions_mut().insert(crate::request_log::Rejected);
     response
 }
 

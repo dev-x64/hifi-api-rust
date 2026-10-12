@@ -267,6 +267,19 @@ impl AccountState {
     pub(crate) async fn observe_uptime(&self, now: i64) {
         // Serialize the token snapshot with history updates, including rejected-token events.
         let mut history = self.uptime_history().lock().await;
+        self.record_uptime(&mut history, now).await;
+    }
+
+    /// Drop recorded history and restart it from the current state, without letting a
+    /// concurrent observation land between the two.
+    pub(crate) async fn reset_uptime(&self, now: i64) -> Result<(), sqlx::Error> {
+        let mut history = self.uptime_history().lock().await;
+        history.reset(self.db.get(), &self.id).await?;
+        self.record_uptime(&mut history, now).await;
+        Ok(())
+    }
+
+    async fn record_uptime(&self, history: &mut crate::account_uptime::AccountUptime, now: i64) {
         let active = self.is_active.load(Ordering::Relaxed);
         let expires = self.token_expires_at.load(Ordering::Relaxed);
         let token = self.access_token.read().await;
@@ -522,6 +535,19 @@ impl AccountManager {
         }
         self.observe_uptime(account).await;
         Ok(())
+    }
+
+    /// Restart availability tracking for every account; returns how many were reset.
+    pub async fn reset_uptime(&self) -> Result<usize, AppError> {
+        let accounts = self.list_accounts().await;
+        let now = Utc::now().timestamp();
+        for account in &accounts {
+            if let Some(db) = &self.db {
+                account.attach_db(db);
+            }
+            account.reset_uptime(now).await?;
+        }
+        Ok(accounts.len())
     }
 
     pub async fn load_from_db(&self) -> Result<(), AppError> {
@@ -2093,6 +2119,51 @@ mod tests {
         ).bind(&account.id).fetch_all(&db).await.unwrap();
         assert_eq!(states, vec![(true, false), (true, true), (true, false), (true, true), (true, false), (false, false)]);
         db.close().await;
+    }
+
+    #[tokio::test]
+    async fn uptime_reset_forgets_history_and_restarts_from_the_current_state() {
+        use crate::account_uptime::UptimeStatus;
+
+        let db = crate::db::init_pool("sqlite::memory:").await.unwrap();
+        let am = AccountManager::new(Some(db.clone()), SwitchingWeights::default());
+        let account = am.add_account("a".into(), "c".into(), "s".into(), "r".into(), None)
+            .await.unwrap();
+        let other = am.add_account("b".into(), "c".into(), "s".into(), "r2".into(), None)
+            .await.unwrap();
+        am.set_account_active(&account.id, false).await.unwrap();
+        am.set_account_active(&account.id, true).await.unwrap();
+        am.set_account_active(&other.id, false).await.unwrap();
+
+        assert_eq!(am.reset_uptime().await.unwrap(), 2);
+        let states: Vec<(String, bool, bool)> = sqlx::query_as(
+            "SELECT account_id, is_active, token_ready FROM account_uptime_events ORDER BY account_id",
+        ).fetch_all(&db).await.unwrap();
+        let mut expected = vec![(account.id.clone(), true, false), (other.id.clone(), false, false)];
+        expected.sort();
+        assert_eq!(states, expected);
+
+        // Earlier downtime is gone both in memory and after a restart.
+        let later = chrono::Utc::now().timestamp() + 60;
+        let summary = account.uptime_summary(later).await;
+        assert_eq!(summary.current_status, Some(UptimeStatus::Waiting));
+        assert_eq!(summary.down_seconds, 0);
+        assert!(summary.unknown_seconds >= crate::account_uptime::WINDOW_SECS - 61);
+        let reloaded = AccountManager::new(Some(db.clone()), SwitchingWeights::default());
+        reloaded.load_from_db().await.unwrap();
+        let restored = reloaded.get_account_by_id(&account.id).await.unwrap();
+        assert_eq!(restored.uptime_summary(later).await.down_seconds, 0);
+        db.close().await;
+
+        // Without a database the in-memory history is reset the same way.
+        let am = AccountManager::new(None, SwitchingWeights::default());
+        let account = am.add_account("a".into(), "c".into(), "s".into(), "r".into(), None)
+            .await.unwrap();
+        am.set_account_active(&account.id, false).await.unwrap();
+        assert_eq!(am.reset_uptime().await.unwrap(), 1);
+        let summary = account.uptime_summary(chrono::Utc::now().timestamp() + 60).await;
+        assert_eq!(summary.current_status, Some(UptimeStatus::Down));
+        assert_eq!(summary.up_seconds + summary.waiting_seconds, 0);
     }
 
     #[tokio::test]

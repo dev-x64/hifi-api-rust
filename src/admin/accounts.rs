@@ -152,6 +152,11 @@ pub async fn remove_account(
     Ok(Json(json!({ "message": "Account removed" })))
 }
 
+pub async fn reset_uptime(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    let accounts = state.account_manager.reset_uptime().await?;
+    Ok(Json(json!({ "message": "Uptime history reset", "accounts": accounts })))
+}
+
 #[derive(Deserialize)]
 pub struct UpdateAccountRequest {
     pub label: Option<String>,

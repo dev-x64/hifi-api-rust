@@ -415,21 +415,18 @@ impl ApiKeyManager {
             }
         }
 
-        match req.headers().get("X-API-Key").and_then(|v| v.to_str().ok()) {
+        let detail = match req.headers().get("X-API-Key").and_then(|v| v.to_str().ok()) {
             Some(raw) => match state.api_keys.check_and_consume(raw).await {
-                Ok(_) => next.run(req).await,
-                Err(_) => (
-                    StatusCode::UNAUTHORIZED,
-                    Json(json!({"detail": "Invalid API key, inactive, or quota exhausted"})),
-                )
-                    .into_response(),
+                Ok(_) => return next.run(req).await,
+                Err(_) => "Invalid API key, inactive, or quota exhausted",
             },
-            None => (
-                StatusCode::UNAUTHORIZED,
-                Json(json!({"detail": "Missing X-API-Key header"})),
-            )
-                .into_response(),
-        }
+            None => "Missing X-API-Key header",
+        };
+        let mut response =
+            (StatusCode::UNAUTHORIZED, Json(json!({"detail": detail}))).into_response();
+        // Refused here: the request log must not count it as traffic to Tidal.
+        response.extensions_mut().insert(crate::request_log::Rejected);
+        response
     }
 
     /// Validate a raw key and consume one quota unit. Ok(label) on success.

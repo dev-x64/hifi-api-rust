@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use axum::Json;
-use axum::body::Body;
+use axum::body::{Body, HttpBody};
 use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, HeaderValue, Request, StatusCode, header::RETRY_AFTER};
 use axum::middleware::Next;
@@ -24,6 +24,11 @@ const RATE_WINDOW_SECONDS: i64 = 60;
 const RATE_NOW_SECONDS: i64 = 5;
 const SLOW_MS: u64 = 3000;
 const STUCK_MS: u64 = 10_000;
+/// Error responses listed with their explanation in the admin overview.
+const RECENT_ERRORS: usize = 50;
+/// Largest error body read back for its `detail` message.
+const MAX_ERROR_BODY: u64 = 16 * 1024;
+const MAX_ERROR_DETAIL: usize = 300;
 
 #[derive(Clone)]
 pub(crate) struct LoggedAccount {
@@ -90,22 +95,123 @@ pub struct LogEntry {
     pub cache: String,
     /// Accounts selected while serving this request, in attempt order.
     pub(crate) accounts: Vec<LoggedAccount>,
+    /// Turned away before any handler ran, so Tidal was never involved.
+    pub rejected: bool,
+    /// The `detail` message of an error response. Empty when it carried none.
+    pub error: String,
+}
+
+impl LogEntry {
+    /// An error of the API itself. A refused client or a probe of an unknown
+    /// path says nothing about the service.
+    fn is_api_error(&self) -> bool {
+        self.status >= 400
+            && !self.rejected
+            && (Traffic::of(self) != Traffic::Service || self.path.starts_with("/playback/"))
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "ts": self.ts,
+            "method": self.method,
+            "path": self.path,
+            "detail": self.detail,
+            "status": self.status,
+            "latency_ms": self.latency_ms,
+            "client_ip": self.client_ip,
+            "cache": self.cache,
+            "accounts": self.accounts.iter().map(|account| json!({
+                "id": account.id,
+                "label": account.label,
+                "role": account.role,
+            })).collect::<Vec<_>>(),
+            "slow": self.latency_ms >= SLOW_MS,
+            "error": self.error,
+        })
+    }
+}
+
+/// Put on a response refused before its handler ran (blocked or unauthorized client).
+#[derive(Clone, Copy)]
+pub(crate) struct Rejected;
+
+/// What serving a request asked of Tidal. Only the first three reach it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Traffic {
+    /// Routes served through the playback queue.
+    Playback,
+    Search,
+    /// Every other metadata route.
+    Catalog,
+    /// A Tidal route answered from the response cache.
+    Cached,
+    /// Queue polling, the index, unknown paths and rejected clients.
+    Service,
+}
+
+impl Traffic {
+    fn of(entry: &LogEntry) -> Self {
+        if entry.rejected {
+            return Traffic::Service;
+        }
+        let class = match entry.path.split('/').find(|segment| !segment.is_empty()) {
+            Some("track" | "trackManifests" | "dash" | "video" | "widevine") => Traffic::Playback,
+            Some("search") => Traffic::Search,
+            Some(
+                "info" | "album" | "artist" | "mix" | "playlist" | "cover" | "lyrics"
+                | "recommendations" | "topvideos",
+            ) => Traffic::Catalog,
+            _ => return Traffic::Service,
+        };
+        if matches!(entry.cache.as_str(), "HIT" | "STALE" | "NEGATIVE") {
+            Traffic::Cached
+        } else {
+            class
+        }
+    }
 }
 
 /// Requests completed within one second, split by the traffic classes the
 /// overview reports separately.
 #[derive(Clone, Copy, Default)]
 struct SecondCounts {
-    all: u64,
     playback: u64,
     search: u64,
+    catalog: u64,
+    cached: u64,
+    /// 429 responses on Tidal routes: fresh, repeated from the cache, or returned
+    /// while every account is paused.
+    throttled: u64,
 }
 
 impl SecondCounts {
+    fn of(entry: &LogEntry) -> Self {
+        let traffic = Traffic::of(entry);
+        // Every call to Tidal picks an account first. A request that picked none was
+        // answered locally (bad parameters, a full queue, no usable account), except
+        // a queued playback job, which picks its account once a slot frees up.
+        let queued = traffic == Traffic::Playback && entry.status == StatusCode::ACCEPTED.as_u16();
+        let sent = !entry.accounts.is_empty() || queued;
+        Self {
+            playback: u64::from(sent && traffic == Traffic::Playback),
+            search: u64::from(sent && traffic == Traffic::Search),
+            catalog: u64::from(sent && traffic == Traffic::Catalog),
+            cached: u64::from(traffic == Traffic::Cached),
+            throttled: u64::from(traffic != Traffic::Service && entry.status == 429),
+        }
+    }
+
     fn add(&mut self, other: SecondCounts) {
-        self.all += other.all;
         self.playback += other.playback;
         self.search += other.search;
+        self.catalog += other.catalog;
+        self.cached += other.cached;
+        self.throttled += other.throttled;
+    }
+
+    /// Requests that were sent on to Tidal.
+    fn upstream(&self) -> u64 {
+        self.playback + self.search + self.catalog
     }
 }
 
@@ -117,24 +223,19 @@ pub struct RequestRate {
     pub avg_60s: f64,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+/// Only requests that reach Tidal count toward `all`; `cached` is reported beside it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct RequestRates {
     pub all: RequestRate,
     pub playback: RequestRate,
     pub search: RequestRate,
-}
-
-/// Playback covers every route served through the playback queue; polling
-/// `/playback/requests/{id}` is not a new playback request.
-fn is_playback_path(path: &str) -> bool {
-    matches!(
-        path.split('/').find(|segment| !segment.is_empty()),
-        Some("track" | "trackManifests" | "dash" | "video" | "widevine")
-    )
-}
-
-fn is_search_path(path: &str) -> bool {
-    path.split('/').find(|segment| !segment.is_empty()) == Some("search")
+    pub catalog: RequestRate,
+    pub cached: RequestRate,
+    /// 429 responses on Tidal routes over the last 60 seconds.
+    pub throttled_60s: u64,
+    /// Requests sent to Tidal in each of the last 60 completed seconds, oldest
+    /// first, as `[playback, search, catalog]`.
+    pub history: Vec<[u64; 3]>,
 }
 
 pub struct RequestLog {
@@ -155,11 +256,7 @@ impl RequestLog {
     pub fn record(&self, entry: LogEntry) {
         self.total_requests.fetch_add(1, Ordering::Relaxed);
         let timestamp = entry.ts;
-        let counted = SecondCounts {
-            all: 1,
-            playback: u64::from(is_playback_path(&entry.path)),
-            search: u64::from(is_search_path(&entry.path)),
-        };
+        let counted = SecondCounts::of(&entry);
         if let Ok(mut entries) = self.entries.lock() {
             if entries.len() >= MAX_ENTRIES {
                 entries.pop_front();
@@ -181,8 +278,8 @@ impl RequestLog {
         self.total_requests.load(Ordering::Relaxed)
     }
 
-    /// Completed API requests per second: right now and averaged over the
-    /// last 60 seconds, for all traffic and for playback and search alone.
+    /// Requests per second sent to Tidal: right now and averaged over the
+    /// last 60 seconds, in total and per traffic class.
     pub fn request_rates(&self) -> RequestRates {
         self.request_rates_at(chrono::Utc::now().timestamp())
     }
@@ -192,6 +289,7 @@ impl RequestLog {
     fn request_rates_at(&self, now: i64) -> RequestRates {
         let mut window = SecondCounts::default();
         let mut recent = SecondCounts::default();
+        let mut history = vec![[0; 3]; RATE_WINDOW_SECONDS as usize];
         if let Ok(buckets) = self.requests_per_second.lock() {
             for (second, counts) in buckets.iter() {
                 if *second > now - RATE_WINDOW_SECONDS && *second <= now {
@@ -200,6 +298,10 @@ impl RequestLog {
                 if *second >= now - RATE_NOW_SECONDS && *second < now {
                     recent.add(*counts);
                 }
+                if *second >= now - RATE_WINDOW_SECONDS && *second < now {
+                    history[(*second - (now - RATE_WINDOW_SECONDS)) as usize] =
+                        [counts.playback, counts.search, counts.catalog];
+                }
             }
         }
         let rate = |recent: u64, window: u64| RequestRate {
@@ -207,9 +309,13 @@ impl RequestLog {
             avg_60s: window as f64 / RATE_WINDOW_SECONDS as f64,
         };
         RequestRates {
-            all: rate(recent.all, window.all),
+            all: rate(recent.upstream(), window.upstream()),
             playback: rate(recent.playback, window.playback),
             search: rate(recent.search, window.search),
+            catalog: rate(recent.catalog, window.catalog),
+            cached: rate(recent.cached, window.cached),
+            throttled_60s: window.throttled,
+            history,
         }
     }
 
@@ -310,24 +416,14 @@ impl RequestLog {
             .iter()
             .rev()
             .take(limit.min(MAX_ENTRIES))
-            .map(|e| {
-                json!({
-                    "ts": e.ts,
-                    "method": e.method,
-                    "path": e.path,
-                    "detail": e.detail,
-                    "status": e.status,
-                    "latency_ms": e.latency_ms,
-                    "client_ip": e.client_ip,
-                    "cache": e.cache,
-                    "accounts": e.accounts.iter().map(|account| json!({
-                        "id": account.id,
-                        "label": account.label,
-                        "role": account.role,
-                    })).collect::<Vec<_>>(),
-                    "slow": e.latency_ms >= SLOW_MS,
-                })
-            })
+            .map(LogEntry::to_json)
+            .collect();
+        let recent_errors: Vec<Value> = entries
+            .iter()
+            .rev()
+            .filter(|e| e.is_api_error())
+            .take(RECENT_ERRORS)
+            .map(LogEntry::to_json)
             .collect();
 
         json!({
@@ -343,6 +439,7 @@ impl RequestLog {
             "top_ips": top_ips.into_iter().take(10).map(|(k, v)| json!({"ip": k, "hits": v})).collect::<Vec<_>>(),
             "top_tracks": top_tracks.into_iter().take(10).map(|(k, v)| json!({"id": k, "hits": v})).collect::<Vec<_>>(),
             "recent": recent,
+            "recent_errors": recent_errors,
         })
     }
 }
@@ -393,6 +490,31 @@ fn extract_detail(path: &str, query: Option<&str>) -> String {
     String::new()
 }
 
+/// Read the `detail` message of an error response that is already buffered
+/// and small, handing the response back unchanged. Streamed and large bodies
+/// are left alone.
+async fn take_error_detail(resp: Response) -> (Response, String) {
+    let size = resp.body().size_hint().exact();
+    let Some(size) = size.filter(|size| resp.status().as_u16() >= 400 && *size <= MAX_ERROR_BODY)
+    else {
+        return (resp, String::new());
+    };
+    let (parts, body) = resp.into_parts();
+    let Ok(bytes) = axum::body::to_bytes(body, size as usize).await else {
+        return (
+            (StatusCode::BAD_GATEWAY, "Upstream body read failed").into_response(),
+            String::new(),
+        );
+    };
+    let detail = match serde_json::from_slice::<Value>(&bytes) {
+        Ok(body) => body.get("detail").and_then(Value::as_str).unwrap_or_default().to_string(),
+        // Axum's own rejections (a malformed path or query) are plain text.
+        Err(_) => String::from_utf8_lossy(&bytes).trim().to_string(),
+    };
+    let detail = detail.chars().take(MAX_ERROR_DETAIL).collect();
+    (Response::from_parts(parts, Body::from(bytes)), detail)
+}
+
 pub async fn log_requests(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -414,6 +536,7 @@ pub async fn log_requests(
             Json(json!({ "detail": "IP temporarily blocked after repeated scanner requests" })),
         )
             .into_response();
+        response.extensions_mut().insert(Rejected);
         response.headers_mut().insert(
             RETRY_AFTER,
             HeaderValue::from_str(&retry_after.to_string()).expect("valid retry interval"),
@@ -425,6 +548,7 @@ pub async fn log_requests(
     if !log_path {
         return resp;
     }
+    let (resp, error) = take_error_detail(resp).await;
     let status = resp.status().as_u16();
     let latency_ms = start.elapsed().as_millis() as u64;
     let cache = resp
@@ -453,6 +577,8 @@ pub async fn log_requests(
         client_ip: ip.to_string(),
         cache,
         accounts,
+        rejected: resp.extensions().get::<Rejected>().is_some(),
+        error,
     });
 
     resp
@@ -460,7 +586,10 @@ pub async fn log_requests(
 
 #[cfg(test)]
 mod tests {
-    use super::{LogEntry, RequestLog, RequestRate, should_log_path};
+    use super::{
+        LogEntry, LoggedAccount, RequestLog, RequestRate, Traffic, should_log_path,
+        take_error_detail,
+    };
 
     fn entry(ts: i64, latency_ms: u64) -> LogEntry {
         LogEntry {
@@ -473,7 +602,21 @@ mod tests {
             client_ip: "127.0.0.1".into(),
             cache: String::new(),
             accounts: Vec::new(),
+            rejected: false,
+            error: String::new(),
         }
+    }
+
+    /// A request that picked an account, as every call to Tidal does.
+    fn served(ts: i64, path: &str) -> LogEntry {
+        let mut item = entry(ts, 1);
+        item.path = path.into();
+        item.accounts.push(LoggedAccount {
+            id: "a".into(),
+            label: "A".into(),
+            role: "playback".into(),
+        });
+        item
     }
 
     #[test]
@@ -504,9 +647,9 @@ mod tests {
     fn rate_uses_sixty_seconds_even_after_log_eviction() {
         let log = RequestLog::new();
         let now = chrono::Utc::now().timestamp();
-        log.record(entry(now - 60, 1));
+        log.record(served(now - 60, "/track/:id"));
         for _ in 0..5001 {
-            log.record(entry(now, 10));
+            log.record(served(now, "/track/:id"));
         }
 
         assert_eq!(log.snapshot().len(), 5000);
@@ -520,9 +663,7 @@ mod tests {
         let now = 1_000_000;
         let record = |ts: i64, path: &str, times: usize| {
             for _ in 0..times {
-                let mut item = entry(ts, 1);
-                item.path = path.into();
-                log.record(item);
+                log.record(served(ts, path));
             }
         };
         // Older than the "now" window, still inside the 60-second average.
@@ -534,7 +675,10 @@ mod tests {
         record(now - 2, "/widevine", 1);
         record(now - 1, "/video", 2);
         record(now - 1, "/search", 10);
+        // Polling a queued job reports its account, but neither it nor unknown paths call Tidal.
         record(now - 1, "/playback/requests", 4);
+        record(now - 1, "/", 2);
+        record(now - 1, "/wp-login.php", 5);
         // The second still in progress counts toward the average only.
         record(now, "/dash/9", 3);
         record(now, "/search", 3);
@@ -542,12 +686,79 @@ mod tests {
         let rates = log.request_rates_at(now);
         assert_eq!(rates.playback, RequestRate { now: 1.0, avg_60s: 14.0 / 60.0 });
         assert_eq!(rates.search, RequestRate { now: 2.0, avg_60s: 25.0 / 60.0 });
-        assert_eq!(rates.all, RequestRate { now: 19.0 / 5.0, avg_60s: 46.0 / 60.0 });
+        assert_eq!(rates.catalog, RequestRate { now: 0.0, avg_60s: 3.0 / 60.0 });
+        assert_eq!(rates.all, RequestRate { now: 15.0 / 5.0, avg_60s: 42.0 / 60.0 });
+        // One slot per completed second, oldest first; the current second is left out.
+        assert_eq!(rates.history.len(), 60);
+        assert_eq!(rates.history[30], [6, 12, 3]);
+        assert_eq!(rates.history[55], [2, 0, 0]);
+        assert_eq!(rates.history[59], [2, 10, 0]);
+        assert_eq!(rates.history.iter().flatten().sum::<u64>(), 36);
+        // Service requests stay in the request log and the lifetime total.
+        assert_eq!(log.total_requests(), 53);
 
         // Six seconds later everything recorded so far has left "now".
         let later = log.request_rates_at(now + 6);
         assert_eq!(later.all.now, 0.0);
-        assert_eq!(later.all.avg_60s, 46.0 / 60.0);
+        assert_eq!(later.all.avg_60s, 42.0 / 60.0);
+        assert_eq!(later.history[54], [3, 3, 0]);
+    }
+
+    #[test]
+    fn cached_and_rejected_requests_do_not_count_as_tidal_traffic() {
+        let classify = |path: &str, cache: &str, rejected: bool| {
+            let mut item = entry(0, 1);
+            item.path = path.into();
+            item.cache = cache.into();
+            item.rejected = rejected;
+            Traffic::of(&item)
+        };
+        assert_eq!(classify("/search/", "MISS", false), Traffic::Search);
+        assert_eq!(classify("/search/", "SKIP", false), Traffic::Search);
+        for verdict in ["HIT", "STALE", "NEGATIVE"] {
+            assert_eq!(classify("/search/", verdict, false), Traffic::Cached, "{verdict}");
+        }
+        assert_eq!(classify("/track/:id", "", false), Traffic::Playback);
+        assert_eq!(classify("/track/:id", "", true), Traffic::Service);
+        for path in ["/album/similar", "/artist", "/cover", "/lyrics", "/info", "/topvideos"] {
+            assert_eq!(classify(path, "", false), Traffic::Catalog, "{path}");
+        }
+        for path in ["/", "/playback/requests", "/robots.txt", "/searching"] {
+            assert_eq!(classify(path, "", false), Traffic::Service, "{path}");
+        }
+
+        let log = RequestLog::new();
+        let now = 1_000_000;
+        let record = |path: &str, cache: &str, status: u16, picked_account: bool, rejected: bool| {
+            let mut item = if picked_account { served(now - 1, path) } else { entry(now - 1, 1) };
+            item.path = path.into();
+            item.cache = cache.into();
+            item.status = status;
+            item.rejected = rejected;
+            log.record(item);
+        };
+        record("/search", "MISS", 200, true, false);
+        record("/search", "MISS", 429, true, false);
+        record("/search", "HIT", 200, false, false);
+        record("/search", "NEGATIVE", 429, false, false);
+        // A client refused before its handler is neither load nor a Tidal 429.
+        record("/search", "", 429, false, true);
+        // Answered without picking an account: bad parameters, a full queue.
+        record("/search", "SKIP", 400, false, false);
+        record("/track/:id", "", 503, false, false);
+        // Every account paused: nothing is sent, yet the client still sees Tidal's limit.
+        record("/album", "SKIP", 429, false, false);
+        // A queued playback job reaches Tidal once a slot frees up; only playback queues.
+        record("/track/:id", "", 202, false, false);
+        record("/search", "", 202, false, false);
+        let rates = log.request_rates_at(now);
+        assert_eq!(rates.search.avg_60s, 2.0 / 60.0);
+        assert_eq!(rates.playback.avg_60s, 1.0 / 60.0);
+        assert_eq!(rates.catalog.avg_60s, 0.0);
+        assert_eq!(rates.all.avg_60s, 3.0 / 60.0);
+        assert_eq!(rates.cached.avg_60s, 2.0 / 60.0);
+        assert_eq!(rates.throttled_60s, 3);
+        assert_eq!(rates.history[59], [1, 2, 0]);
     }
 
     #[test]
@@ -597,6 +808,82 @@ mod tests {
         assert_eq!(summary["slowest"][0]["endpoint"], "/search/");
         assert_eq!(summary["recent"][3]["cache"], "STALE");
         assert_eq!(summary["recent"][3]["slow"], true);
+    }
+
+    #[test]
+    fn recent_errors_keep_the_newest_api_failures_with_reason_and_accounts() {
+        let log = RequestLog::new();
+        let record = |ts: i64, path: &str, status: u16, rejected: bool| {
+            let mut item = entry(ts, 10);
+            item.path = path.into();
+            item.status = status;
+            item.rejected = rejected;
+            item.detail = ts.to_string();
+            log.record(item);
+        };
+        for ts in 0..60 {
+            record(ts, "/track/:id", 503, false);
+            record(ts, "/track/:id", 200, false);
+        }
+        // Not failures of the service: a scanner probe and a refused client.
+        record(60, "/wp-login.php", 404, false);
+        record(61, "/track/:id", 401, true);
+        // A queued playback job reports its failure on the polling route.
+        record(62, "/playback/requests", 409, false);
+        let mut failed = entry(63, 1514);
+        failed.status = 503;
+        failed.error = "Preview only for track".into();
+        failed.accounts = vec![LoggedAccount {
+            id: "abc".into(),
+            label: "Main".into(),
+            role: "playback".into(),
+        }];
+        log.record(failed);
+
+        let summary = log.summary(1);
+        let errors = summary["recent_errors"].as_array().unwrap();
+        assert_eq!(errors.len(), 50);
+        assert_eq!(errors[0]["error"], "Preview only for track");
+        assert_eq!(errors[0]["latency_ms"], 1514);
+        assert_eq!(errors[0]["accounts"][0]["label"], "Main");
+        assert_eq!(errors[1]["path"], "/playback/requests");
+        assert_eq!(errors[2]["detail"], "59");
+        assert_eq!(errors[49]["detail"], "12");
+        assert!(errors.iter().all(|e| e["status"] != 200 && e["status"] != 401 && e["status"] != 404));
+        // The list is independent of how much of the log was asked for.
+        assert_eq!(summary["recent"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn error_detail_is_read_without_changing_the_response() {
+        use axum::body::{Body, to_bytes};
+        use axum::response::IntoResponse;
+
+        let failed = crate::error::AppError::ServiceUnavailableRetry("Playback queue full".into(), 5);
+        let (resp, detail) = take_error_detail(failed.into_response()).await;
+        assert_eq!(detail, "Playback queue full");
+        assert_eq!(resp.status(), 503);
+        assert_eq!(resp.headers().get("retry-after").unwrap(), "5");
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], br#"{"detail":"Playback queue full"}"#);
+
+        // Long messages are cut for the log only; a plain-text body is the message itself.
+        let long = crate::error::AppError::Internal("é".repeat(400)).into_response();
+        assert_eq!(take_error_detail(long).await.1, "é".repeat(300));
+        let plain = (axum::http::StatusCode::BAD_REQUEST, "Invalid URL\n").into_response();
+        assert_eq!(take_error_detail(plain).await.1, "Invalid URL");
+        let other = (axum::http::StatusCode::GONE, axum::Json(serde_json::json!({"status": "x"})));
+        assert_eq!(take_error_detail(other.into_response()).await.1, "");
+
+        // Successful and streamed responses are passed through unread.
+        let ok = axum::Json(serde_json::json!({"detail": "fine"})).into_response();
+        assert_eq!(take_error_detail(ok).await.1, "");
+        let chunks = futures::stream::iter([Ok::<_, std::io::Error>(r#"{"detail":"streamed"}"#)]);
+        let streamed = (axum::http::StatusCode::BAD_GATEWAY, Body::from_stream(chunks)).into_response();
+        let (resp, detail) = take_error_detail(streamed).await;
+        assert_eq!(detail, "");
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], br#"{"detail":"streamed"}"#);
     }
 }
 
