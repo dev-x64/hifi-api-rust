@@ -29,6 +29,8 @@ const NEG_CACHE_TTL_SECS: u64 = 300;
 /// Safety cap for a single cached body. Our metadata endpoints return small
 /// JSON; anything bigger passes through uncached (see below).
 const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
+/// How long a verdict on a substituted track id is reused.
+const REPLACEMENT_TTL_SECS: u64 = 6 * 3600;
 
 /// Metadata prefixes safe to cache. Playback routes (/track, /trackManifests,
 /// /dash, /widevine, /video, /topvideos) and /admin are NEVER cached — their
@@ -142,6 +144,10 @@ pub struct ResponseCache {
     /// Per-key in-flight guards: concurrent identical requests collapse onto
     /// the leader instead of stampeding Tidal. Auto-evicts via TTL.
     inflight: Cache<String, Arc<Mutex<()>>>,
+    /// Whether the id Tidal substituted for a requested one may be served,
+    /// keyed `requested:substituted`: `None` when it is the same recording,
+    /// otherwise the difference.
+    pub(crate) replacements: Cache<String, Option<String>>,
     pub hits: AtomicU64,
     pub misses: AtomicU64,
     pub coalesced: AtomicU64,
@@ -168,6 +174,10 @@ impl ResponseCache {
                 .time_to_live(Duration::from_secs(60))
                 .max_capacity(10000)
                 .build(),
+            replacements: Cache::builder()
+                .time_to_live(Duration::from_secs(REPLACEMENT_TTL_SECS))
+                .max_capacity(10000)
+                .build(),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             coalesced: AtomicU64::new(0),
@@ -179,6 +189,7 @@ impl ResponseCache {
     pub async fn invalidate_all(&self) {
         self.cache.invalidate_all();
         self.negative.invalidate_all();
+        self.replacements.invalidate_all();
     }
 
     pub(crate) async fn get(&self, key: &str) -> Option<CachedResponse> {

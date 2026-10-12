@@ -38,8 +38,8 @@ const counts = { total: 13, enabled: 13, ready: 5, disabled: 0, no_token: 6, nee
 const empty = Object.fromEntries(Object.keys(counts).map(key => [key, 0]));
 const snapshot = {
     total_requests: 352374, recent_p95_ms: 300,
-    request_rates: { all: { now: 7.4, avg_60s: 6.15 }, playback: { now: 2.2, avg_60s: 1.75 }, search: { now: 4, avg_60s: 3.5 },
-        catalog: { now: 1.2, avg_60s: 0.9 }, cached: { now: 0.6, avg_60s: 0.5 }, throttled_60s: 3,
+    request_rates: { all: { now: 7.4, avg_60s: 6.15, peak_60s: 12 }, playback: { now: 2.2, avg_60s: 1.75, peak_60s: 3 }, search: { now: 4, avg_60s: 3.5, peak_60s: 6 },
+        catalog: { now: 1.2, avg_60s: 0.9, peak_60s: 4 }, cached: { now: 0.6, avg_60s: 0.5, peak_60s: 1234 }, throttled_60s: 3,
         history: Array.from({ length: 60 }, (_, second) => second === 59 ? [2, 6, 4] : (second === 10 ? [3, 0, 0] : [0, 0, 0])) },
     recent_requests: 5000, total_errors: 61, recent_error_rate_percent: 1.22,
     account_readiness: counts, playback_readiness: counts, catalog_readiness: empty,
@@ -55,21 +55,21 @@ for (const language of ['en', 'ru']) {
         assert.equal((html.match(/class="ov-title"/g) || []).length, 3);
         assert.doesNotMatch(html, /0\/13|undefined|NaN/);
         assert.match(html, language === 'en' ? /Concurrent request limit<\/span><strong>7</ : /Лимит одновременно<\/span><strong>7</);
-        // Requests per second: the headline is the current total; each class shows now, then the 60-second average.
+        // Requests per second: the headline is the current total; each class shows now, the 60-second average, then its busiest second.
         const n = value => language === 'en' ? value : value.replace('.', ',');
         assert.match(html, new RegExp('class="value">' + n('7.40') + ' <span class="metric-unit">' + (language === 'en' ? 'now' : 'сейчас') + '<'));
-        for (const [en, ru, now, avg] of [['Total', 'Всего', '7.40', '6.15'], ['Playback', 'Воспроизведение', '2.20', '1.75'], ['Search', 'Поиск', '4.00', '3.50'],
-            ['Catalog', 'Каталог', '1.20', '0.90'], ['From cache', 'Из кэша', '0.60', '0.50']]) {
-            assert.ok(html.includes('>' + (language === 'en' ? en : ru) + '</span><strong>' + n(now) + '</strong><strong>' + n(avg) + '</strong>'), en);
+        assert.ok(html.includes('<span class="rate-head">' + (language === 'en' ? 'Peak' : 'Пик') + '</span>'));
+        for (const [en, ru, now, avg, peak] of [['Total', 'Всего', '7.40', '6.15', '12'], ['Playback', 'Воспроизведение', '2.20', '1.75', '3'], ['Search', 'Поиск', '4.00', '3.50', '6'],
+            ['Catalog', 'Каталог', '1.20', '0.90', '4'], ['From cache', 'Из кэша', '0.60', '0.50', language === 'en' ? '1,234' : '1\u00a0234']]) {
+            assert.ok(html.includes('>' + (language === 'en' ? en : ru) + '</span><strong>' + n(now) + '</strong><strong>' + n(avg) + '</strong><strong>' + peak + '</strong>'), en);
         }
         // One bar per second, scaled to the busiest one; each class keeps its own colour and the tooltip spells it out.
         assert.equal((html.match(/class="rate-bar"/g) || []).length, 60);
         assert.match(html, /<i class="rate-playback" style="height:16\.7%"><\/i><i class="rate-search" style="height:50\.0%"><\/i><i class="rate-catalog" style="height:33\.3%"><\/i>/);
         assert.match(html, /<i class="rate-playback" style="height:25\.0%"><\/i><\/div>/);
         assert.ok(html.includes(language === 'en' ? 'data-tip="1 s ago\nPlayback: 2\nSearch: 6\nCatalog: 4" data-edge="end"' : 'data-tip="1 с назад\nВоспроизведение: 2\nПоиск: 6\nКаталог: 4" data-edge="end"'));
-        // Limits: the peak second, the load each serving account carries, and Tidal's throttling.
+        // Limits: the load each serving account carries, and Tidal's throttling.
         const unit = ' <span class="rate-unit">' + (language === 'en' ? '/s' : '/с') + '</span></strong>';
-        assert.ok(html.includes((language === 'en' ? 'Peak in 60 s' : 'Пик за 60 с') + '</span><strong>12' + unit));
         assert.ok(html.includes((language === 'en' ? 'Playback per account' : 'Воспроизведение на один аккаунт') + '</span><strong>' + n('0.25') + unit));
         assert.ok(html.includes((language === 'en' ? 'Metadata per account' : 'Метаданные на один аккаунт') + '</span><strong>' + n('0.63') + unit));
         assert.match(html, language === 'en' ? /status-warn"><\/span><span>429 responses in 60 s<\/span><strong>3</ : /status-warn"><\/span><span>Ответов 429 за 60 с<\/span><strong>3</);
@@ -96,6 +96,7 @@ test('empty traffic has no invented error rate or latency', () => {
     const bare = vm.runInContext('rateCard(stats.request_rates)', ctx);
     assert.match(bare, /class="value">— /);
     assert.doesNotMatch(bare, /rate-chart|rate-unit|undefined|NaN/);
+    assert.equal((bare.match(/<strong>—<\/strong>/g) || []).length, 15);
     // A static metadata token has no accounts to spread the load over.
     assert.doesNotMatch(vm.runInContext('rateCard(' + JSON.stringify(snapshot.request_rates) + ', {catalog:{mode:"static_token"}})', ctx), /Метаданные на один аккаунт/);
     assert.match(html, /No playback accounts are enabled/);

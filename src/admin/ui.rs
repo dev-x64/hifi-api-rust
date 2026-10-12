@@ -304,7 +304,7 @@ button:focus-visible,input:focus-visible,select:focus-visible { outline:2px soli
 .stat-rows { display:grid; gap:7px; margin-top:12px; font-size:12px; line-height:1.4; color:#aab4c0; }
 .stat-row { display:flex; align-items:center; gap:8px; }
 .stat-row strong { margin-left:auto; padding-left:12px; color:var(--text); font-weight:600; font-variant-numeric:tabular-nums; white-space:nowrap; }
-.rate-rows { grid-template-columns:minmax(0,1fr) auto auto; column-gap:16px; align-items:baseline; }
+.rate-rows { grid-template-columns:minmax(0,1fr) auto auto auto; column-gap:16px; align-items:baseline; }
 .rate-rows > span { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .rate-rows strong,.rate-rows .rate-head { text-align:right; white-space:nowrap; font-variant-numeric:tabular-nums; }
 .rate-rows strong { color:var(--text); font-weight:600; }
@@ -323,7 +323,9 @@ button:focus-visible,input:focus-visible,select:focus-visible { outline:2px soli
 .rate-cached { box-shadow:inset 0 0 0 1px var(--muted); }
 .rate-key { display:inline-block; width:8px; height:8px; margin-right:8px; border-radius:2px; }
 .rate-unit { color:var(--muted); font-weight:500; }
-.rate-cols { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:0 32px; align-items:start; }
+.rate-cols { display:flex; flex-wrap:wrap; gap:0 32px; align-items:flex-start; }
+.rate-cols > * { flex:1 1 200px; min-width:0; }
+.rate-cols > .rate-rows { flex-basis:270px; }
 .stat-card .status-dot { width:8px; height:8px; box-shadow:none; }
 .stat-card .status-ok { background:#2fa36b; }
 .stat-card .status-warn { background:#f4b860; }
@@ -396,7 +398,7 @@ button:focus-visible,input:focus-visible,select:focus-visible { outline:2px soli
   .header { margin-top:4px; }
   .header h1 { font-size:24px; }
   .header-actions .btn:not(.mobile-keep) { display:none; }
-  .ov-2,.ov-3,.rate-cols { grid-template-columns:1fr; }
+  .ov-2,.ov-3 { grid-template-columns:1fr; }
   .toolbar,.section-head { align-items:stretch; flex-direction:column; }
   .search-wrap { width:100%; }
 }
@@ -624,7 +626,7 @@ function showView(name) {
     document.getElementById('pageTitle').textContent = meta[1];
     document.getElementById('pageSubtitle').textContent = meta[2];
     toggleSidebar(false);
-    if (name === 'overview') loadProxyStatus();
+    if (name === 'overview') { refreshStats(); loadRequestLog(); loadProxyStatus(); }
     window.scrollTo({ top:0, behavior:'smooth' });
 }
 
@@ -955,12 +957,13 @@ function rateChart(history) {
 function rateCard(rates, stats) {
     rates = rates || {}; stats = stats || {};
     var unit = ' <span class="rate-unit">/с</span>';
-    var cells = '<span></span><span class="rate-head">Сейчас</span><span class="rate-head">60 с</span>' +
+    var cells = '<span></span><span class="rate-head">Сейчас</span><span class="rate-head">60 с</span><span class="rate-head">Пик</span>' +
         [['Всего', rates.all, ''], ['Воспроизведение', rates.playback, 'rate-playback'], ['Поиск', rates.search, 'rate-search'],
             ['Каталог', rates.catalog, 'rate-catalog'], ['Из кэша', rates.cached, 'rate-cached']].map(function(row) {
             var rate = row[1] || {};
             return '<span>' + (row[2] ? '<i class="rate-key ' + row[2] + '" aria-hidden="true"></i>' : '') + esc(row[0]) + '</span><strong>' +
-                esc(metricNumber(rate.now, 2)) + '</strong><strong>' + esc(metricNumber(rate.avg_60s, 2)) + '</strong>';
+                esc(metricNumber(rate.now, 2)) + '</strong><strong>' + esc(metricNumber(rate.avg_60s, 2)) + '</strong><strong>' +
+                esc(metricNumber(rate.peak_60s)) + '</strong>';
         }).join('');
     // Load is spread over the accounts able to serve right now, which is what Tidal limits.
     var mode = (stats.catalog || {}).mode;
@@ -968,15 +971,11 @@ function rateCard(rates, stats) {
     function perAccount(label, rate, accounts) {
         return accounts > 0 && rate != null ? [metricRow(label, esc(metricNumber(rate / accounts, 2)) + unit)] : [];
     }
-    var limits = [];
-    if (rates.history) limits.push(metricRow('Пик за 60 с', esc(metricNumber(Math.max.apply(null, rates.history.map(function(second) {
-        return second[0] + second[1] + second[2];
-    })))) + unit));
-    limits = limits.concat(perAccount('Воспроизведение на один аккаунт', (rates.playback || {}).avg_60s, (stats.playback || {}).pool_size),
+    var limits = perAccount('Воспроизведение на один аккаунт', (rates.playback || {}).avg_60s, (stats.playback || {}).pool_size).concat(
         perAccount('Метаданные на один аккаунт', rates.search && rates.catalog ? rates.search.avg_60s + rates.catalog.avg_60s : null, metadataAccounts));
     if (rates.throttled_60s != null) limits.push(metricRow('Ответов 429 за 60 с', esc(metricNumber(rates.throttled_60s)), rates.throttled_60s > 0 ? 'status-warn' : ''));
     return metricCard('Запросы к Tidal в секунду', esc(metricNumber((rates.all || {}).now, 2)) + ' <span class="metric-unit">сейчас</span>',
-        ['Считаются только запросы, отправленные в Tidal: без ответов из кэша, опроса очереди и служебных маршрутов. «Сейчас» — среднее за последние 5 секунд.',
+        ['Считаются только запросы, отправленные в Tidal: без ответов из кэша, опроса очереди и служебных маршрутов. «Сейчас» — среднее за последние 5 секунд, пик — самая загруженная секунда из последних 60, у каждой строки своя.',
             'Нагрузка на один аккаунт — среднее за 60 секунд, делённое на число аккаунтов, которые сейчас могут обслуживать такие запросы.'], '',
         rateChart(rates.history) + '<div class="rate-cols"><div class="stat-rows rate-rows">' + cells + '</div>' + metricRows(limits) + '</div>', 'stat-wide stat-tall');
 }
@@ -1016,7 +1015,10 @@ function renderOverview(stats) {
         root.innerHTML = fresh.innerHTML;
     } else {
         next.forEach(function(card, index) {
-            if (overviewCardHtml[index] !== html[index]) current[index].replaceWith(card);
+            if (overviewCardHtml[index] === html[index]) return;
+            // A chart under the pointer waits for it to leave, so the tooltip being read stays put.
+            if (current[index].querySelector('.rate-bar:hover')) html[index] = overviewCardHtml[index];
+            else current[index].replaceWith(card);
         });
     }
     overviewCardHtml = html;
@@ -1029,6 +1031,7 @@ async function refreshStats() {
     statsRefreshing = true;
     try {
         var res = await fetch('/admin/stats', { headers: headers() });
+        if (res.status === 401) { setKey(); return; }
         if (!res.ok) return;
         window._stats = await res.json();
         renderOverview(window._stats);
@@ -1598,12 +1601,20 @@ setInterval(function() {
     if (currentView === 'system') { loadProxyStatus(); loadAlertStatus(); loadCacheStats(); }
 }, 15000);
 // The overview is a live dashboard: its counters and request log refresh faster than the rest.
+// Traffic is counted per second, so two polls a second show each one as soon as it completes.
 setInterval(function() {
     if (authenticated && !document.hidden && currentView === 'overview') refreshStats();
-}, 2000);
+}, 500);
 setInterval(function() {
-    if (authenticated && !document.hidden && currentView === 'overview') loadRequestLog();
-}, 5000);
+    if (authenticated && !document.hidden && currentView === 'overview' && !selectingLog()) loadRequestLog();
+}, 2000);
+
+// Re-rendering the log would drop a selection the user is about to copy.
+function selectingLog() {
+    var selection = window.getSelection();
+    var node = selection.isCollapsed ? null : selection.anchorNode;
+    return !!node && !!(node.parentElement || node).closest('#rq-recent,#er-list');
+}
 
 async function loadAlertStatus() {
     try {
@@ -1971,7 +1982,7 @@ function accountChain(accounts) {
 function errorCause(q) {
     var detail = String(q.error || '').toLowerCase();
     var has = function(text) { return detail.indexOf(text) !== -1; };
-    if (has('different track')) return ['Подмена трека', 'Tidal вернул другую запись вместо запрошенной — обычно id есть только в Atmos или только в стерео. Повтор не поможет: нужен другой формат или id соседней версии.'];
+    if (has('different track')) return ['Подмена трека', 'Tidal отдал аудио под другим id, и это другая запись: ISRC или длительность не совпали либо сравнить их не удалось — причина в скобках в тексте ответа. Замену с тем же ISRC и длительностью сервис отдаёт без ошибки.'];
     if (has('preview only')) return ['Только превью', 'Tidal отдал 30-секундный фрагмент: трек недоступен целиком в регионе аккаунтов или у них нет нужной подписки.'];
     if (has('did not return high')) return ['Нет качества HIGH', 'Tidal не отдал трек в AAC 320 kbps, выбранном как формат по умолчанию.'];
     if (has('queue full')) return ['Очередь переполнена', 'Запросов воспроизведения больше, чем успевает обслужить пул аккаунтов. Клиенту стоит повторить через несколько секунд.'];

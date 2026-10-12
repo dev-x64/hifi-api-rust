@@ -221,6 +221,8 @@ pub struct RequestRate {
     pub now: f64,
     /// Requests per second over the last 60 seconds.
     pub avg_60s: f64,
+    /// Requests in the busiest of the last 60 completed seconds.
+    pub peak_60s: u64,
 }
 
 /// Only requests that reach Tidal count toward `all`; `cached` is reported beside it.
@@ -289,6 +291,8 @@ impl RequestLog {
     fn request_rates_at(&self, now: i64) -> RequestRates {
         let mut window = SecondCounts::default();
         let mut recent = SecondCounts::default();
+        let mut peak = SecondCounts::default();
+        let mut peak_upstream = 0;
         let mut history = vec![[0; 3]; RATE_WINDOW_SECONDS as usize];
         if let Ok(buckets) = self.requests_per_second.lock() {
             for (second, counts) in buckets.iter() {
@@ -301,19 +305,26 @@ impl RequestLog {
                 if *second >= now - RATE_WINDOW_SECONDS && *second < now {
                     history[(*second - (now - RATE_WINDOW_SECONDS)) as usize] =
                         [counts.playback, counts.search, counts.catalog];
+                    // Each class peaks in its own second, so the total is not their sum.
+                    peak.playback = peak.playback.max(counts.playback);
+                    peak.search = peak.search.max(counts.search);
+                    peak.catalog = peak.catalog.max(counts.catalog);
+                    peak.cached = peak.cached.max(counts.cached);
+                    peak_upstream = peak_upstream.max(counts.upstream());
                 }
             }
         }
-        let rate = |recent: u64, window: u64| RequestRate {
+        let rate = |recent: u64, window: u64, peak_60s: u64| RequestRate {
             now: recent as f64 / RATE_NOW_SECONDS as f64,
             avg_60s: window as f64 / RATE_WINDOW_SECONDS as f64,
+            peak_60s,
         };
         RequestRates {
-            all: rate(recent.upstream(), window.upstream()),
-            playback: rate(recent.playback, window.playback),
-            search: rate(recent.search, window.search),
-            catalog: rate(recent.catalog, window.catalog),
-            cached: rate(recent.cached, window.cached),
+            all: rate(recent.upstream(), window.upstream(), peak_upstream),
+            playback: rate(recent.playback, window.playback, peak.playback),
+            search: rate(recent.search, window.search, peak.search),
+            catalog: rate(recent.catalog, window.catalog, peak.catalog),
+            cached: rate(recent.cached, window.cached, peak.cached),
             throttled_60s: window.throttled,
             history,
         }
@@ -684,10 +695,11 @@ mod tests {
         record(now, "/search", 3);
 
         let rates = log.request_rates_at(now);
-        assert_eq!(rates.playback, RequestRate { now: 1.0, avg_60s: 14.0 / 60.0 });
-        assert_eq!(rates.search, RequestRate { now: 2.0, avg_60s: 25.0 / 60.0 });
-        assert_eq!(rates.catalog, RequestRate { now: 0.0, avg_60s: 3.0 / 60.0 });
-        assert_eq!(rates.all, RequestRate { now: 15.0 / 5.0, avg_60s: 42.0 / 60.0 });
+        // Peaks cover completed seconds only, and the total peaks in its own busiest second.
+        assert_eq!(rates.playback, RequestRate { now: 1.0, avg_60s: 14.0 / 60.0, peak_60s: 6 });
+        assert_eq!(rates.search, RequestRate { now: 2.0, avg_60s: 25.0 / 60.0, peak_60s: 12 });
+        assert_eq!(rates.catalog, RequestRate { now: 0.0, avg_60s: 3.0 / 60.0, peak_60s: 3 });
+        assert_eq!(rates.all, RequestRate { now: 15.0 / 5.0, avg_60s: 42.0 / 60.0, peak_60s: 21 });
         // One slot per completed second, oldest first; the current second is left out.
         assert_eq!(rates.history.len(), 60);
         assert_eq!(rates.history[30], [6, 12, 3]);
@@ -702,6 +714,8 @@ mod tests {
         assert_eq!(later.all.now, 0.0);
         assert_eq!(later.all.avg_60s, 42.0 / 60.0);
         assert_eq!(later.history[54], [3, 3, 0]);
+        // A second that scrolled out of the chart no longer holds the peak.
+        assert_eq!(log.request_rates_at(now + 31).all.peak_60s, 12);
     }
 
     #[test]
@@ -757,6 +771,8 @@ mod tests {
         assert_eq!(rates.catalog.avg_60s, 0.0);
         assert_eq!(rates.all.avg_60s, 3.0 / 60.0);
         assert_eq!(rates.cached.avg_60s, 2.0 / 60.0);
+        assert_eq!(rates.cached.peak_60s, 2);
+        assert_eq!(rates.all.peak_60s, 3);
         assert_eq!(rates.throttled_60s, 3);
         assert_eq!(rates.history[59], [1, 2, 0]);
     }

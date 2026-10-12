@@ -177,22 +177,87 @@ pub(crate) async fn fetch_track_playback(
     // tier is asked for an Atmos-only id (e.g. 527739156 → 479222720,
     // signalled by `trackId` naming the sibling). Never serve track Y for
     // track X — fail so callers try the next tier/account instead of
-    // mislabeling another recording's bytes.
+    // mislabeling another recording's bytes. A re-release of the requested
+    // recording under a new id is not another track and is served.
     for ptr in ["/data/trackId", "/data/data/trackId"] {
         if let Some(seen) = result.pointer(ptr).and_then(json_track_id) {
             if seen != id.to_string() {
-                return Err(AppError::UpstreamError(
-                    StatusCode::CONFLICT,
-                    format!(
-                        "Tidal returned audio for track {} for requested {}: refusing to serve a different track",
-                        seen, id
-                    ),
-                ));
+                if let Some(reason) = substitution_refusal(state, &id.to_string(), &seen).await {
+                    return Err(AppError::UpstreamError(
+                        StatusCode::CONFLICT,
+                        format!(
+                            "Tidal returned audio for track {} for requested {}: refusing to serve a different track ({})",
+                            seen, id, reason
+                        ),
+                    ));
+                }
             }
             break;
         }
     }
     Ok(result)
+}
+
+/// Largest gap in length between two releases of one recording.
+const SAME_RECORDING_SECONDS: i64 = 2;
+
+/// What stays the same when Tidal re-releases a recording under a new id.
+#[derive(Debug, PartialEq)]
+struct Recording {
+    isrc: String,
+    seconds: i64,
+}
+
+impl Recording {
+    /// From a `/v1/tracks/{id}` payload.
+    fn of(track: &Value) -> Option<Self> {
+        let isrc = track.get("isrc")?.as_str()?.trim().to_ascii_uppercase();
+        let seconds = track.get("duration")?.as_i64()?;
+        (!isrc.is_empty()).then_some(Self { isrc, seconds })
+    }
+
+    /// Why `other` is not this recording; `None` when it is.
+    fn difference(&self, other: &Recording) -> Option<String> {
+        if self.isrc != other.isrc {
+            Some(format!("ISRC {} ≠ {}", self.isrc, other.isrc))
+        } else if (self.seconds - other.seconds).abs() > SAME_RECORDING_SECONDS {
+            Some(format!("length {} s ≠ {} s", self.seconds, other.seconds))
+        } else {
+            None
+        }
+    }
+}
+
+async fn recording(state: &AppState, track_id: &str) -> Option<Recording> {
+    let url = format!("https://api.tidal.com/v1/tracks/{}/", track_id);
+    let track = state
+        .tidal_client
+        .make_catalog_authed_request(
+            &url,
+            Some(vec![("countryCode", &state.config.country_code)]),
+        )
+        .await
+        .ok()?;
+    Recording::of(&track)
+}
+
+/// Tidal answers a retired id with the audio of the release that replaced it
+/// (e.g. 3686705 → 360563532). That is still the requested track when both
+/// ids carry the same ISRC and length. Returns why `seen` must be refused,
+/// or `None` when it may be served.
+async fn substitution_refusal(state: &AppState, requested: &str, seen: &str) -> Option<String> {
+    let key = format!("{}:{}", requested.trim(), seen);
+    if let Some(verdict) = state.cache.replacements.get(&key).await {
+        return verdict;
+    }
+    let (wanted, got) = tokio::join!(recording(state, requested.trim()), recording(state, seen));
+    let (Some(wanted), Some(got)) = (wanted, got) else {
+        // Left uncached: the metadata may be readable on the next request.
+        return Some("could not compare ISRC and length".into());
+    };
+    let verdict = wanted.difference(&got);
+    state.cache.replacements.insert(key, verdict.clone()).await;
+    verdict
 }
 
 /// A track id from Tidal JSON: number or string.
@@ -492,13 +557,15 @@ pub(crate) async fn fetch_manifest_inner(
         if !manifest_matches_track(uri, track_id) {
             let seen =
                 manifest_track_id(uri).unwrap_or_else(|| "unknown".to_string());
-            return Err(AppError::UpstreamError(
-                StatusCode::CONFLICT,
-                format!(
-                    "Tidal returned manifest for track {} for requested {}: refusing to serve a different track",
-                    seen, track_id
-                ),
-            ));
+            if let Some(reason) = substitution_refusal(state, track_id, &seen).await {
+                return Err(AppError::UpstreamError(
+                    StatusCode::CONFLICT,
+                    format!(
+                        "Tidal returned manifest for track {} for requested {}: refusing to serve a different track ({})",
+                        seen, track_id, reason
+                    ),
+                ));
+            }
         }
     }
 
@@ -592,7 +659,7 @@ mod tests {
     use super::{
         default_quality, high_audio_uri, manifest_matches_track, manifest_track_id,
         resolve_formats, track_format, unsupported_quality_info,
-        unsupported_quality_response, use_high_for_dash, TrackFormat,
+        unsupported_quality_response, use_high_for_dash, Recording, TrackFormat,
     };
     use axum::http::StatusCode;
     use base64::Engine as _;
@@ -623,6 +690,28 @@ mod tests {
         assert_eq!(info["defaultQuality"], "HIGH");
         assert_eq!(info["supportedQualities"][0]["quality"], "HIGH");
         assert_eq!(info["supportedQualities"][4]["format"], "FLAC_HIRES");
+    }
+
+    #[test]
+    fn a_new_id_is_the_same_recording_only_with_matching_isrc_and_length() {
+        let track = |isrc: &str, duration: i64| json!({"id": 1, "isrc": isrc, "duration": duration});
+        let old = Recording::of(&track("ITB009800123", 213)).unwrap();
+        // A re-release: same ISRC (case and padding aside), length within rounding.
+        assert_eq!(old.difference(&Recording::of(&track(" itb009800123 ", 215)).unwrap()), None);
+        assert_eq!(old.difference(&Recording::of(&track("ITB009800123", 211)).unwrap()), None);
+        // Another edit of the song, or another recording altogether.
+        assert_eq!(
+            old.difference(&Recording::of(&track("ITB009800123", 216)).unwrap()).unwrap(),
+            "length 213 s ≠ 216 s"
+        );
+        assert_eq!(
+            old.difference(&Recording::of(&track("USUM72400001", 213)).unwrap()).unwrap(),
+            "ISRC ITB009800123 ≠ USUM72400001"
+        );
+        // Without both facts nothing can be compared.
+        assert_eq!(Recording::of(&json!({"isrc": "", "duration": 213})), None);
+        assert_eq!(Recording::of(&json!({"isrc": "ITB009800123"})), None);
+        assert_eq!(Recording::of(&json!({"duration": 213})), None);
     }
 
     #[test]
@@ -820,13 +909,15 @@ pub(crate) async fn fetch_dash_uri(
 
     if !manifest_matches_track(uri, track_id) {
         let seen = manifest_track_id(uri).unwrap_or_else(|| "unknown".to_string());
-        return Err(AppError::UpstreamError(
-            StatusCode::CONFLICT,
-            format!(
-                "Tidal returned manifest for track {} for requested {}: refusing to serve a different track",
-                seen, track_id
-            ),
-        ));
+        if let Some(reason) = substitution_refusal(state, track_id, &seen).await {
+            return Err(AppError::UpstreamError(
+                StatusCode::CONFLICT,
+                format!(
+                    "Tidal returned manifest for track {} for requested {}: refusing to serve a different track ({})",
+                    seen, track_id, reason
+                ),
+            ));
+        }
     }
 
     Ok(uri.to_string())
