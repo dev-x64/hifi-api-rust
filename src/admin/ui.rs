@@ -68,9 +68,10 @@ body { font-family:'SF Mono','Fira Code','Cascadia Code','JetBrains Mono',Menlo,
 .uptime-bar[data-edge="start"]::after { left:0; transform:none; }
 .uptime-bar[data-edge="end"]::after { left:auto; right:0; transform:none; }
 .uptime-span { width:100%; flex-shrink:0; }
-.uptime-up { background:var(--green); }
+.uptime-span + .uptime-span { box-sizing:border-box; border-bottom:1px solid var(--panel); }
+.uptime-up { background:#2fa36b; }
 .uptime-down { background:var(--red); }
-.uptime-waiting { background:rgba(244,184,96,.5); }
+.uptime-waiting { background:#343e4c; }
 .uptime-unknown { background:repeating-linear-gradient(135deg,transparent,transparent 4px,rgba(139,150,165,.2) 4px,rgba(139,150,165,.2) 8px); }
 .uptime-axis { display:flex; justify-content:space-between; margin-top:6px; font-size:10px; color:var(--muted); }
 .token-refresh-error { margin-top:12px; font-size:12px; line-height:1.5; color:#d29922; overflow-wrap:anywhere; }
@@ -79,6 +80,7 @@ body { font-family:'SF Mono','Fira Code','Cascadia Code','JetBrains Mono',Menlo,
 .uptime-totals strong { color:var(--text); font-weight:600; }
 .uptime-key { display:inline-block; width:8px; height:8px; border-radius:2px; }
 .uptime-key.uptime-unknown { box-shadow:inset 0 0 0 1px var(--muted); }
+.uptime-key.uptime-waiting { box-shadow:inset 0 0 0 1px #5b6878; }
 .uptime-note { margin-top:8px; font-size:10px; line-height:1.5; color:var(--muted); }
 .test-badge { cursor:pointer; text-decoration:underline; text-decoration-style:dotted; text-underline-offset:2px; }
 .test-badge:hover { color:#f0f6fc; }
