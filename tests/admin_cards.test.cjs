@@ -43,7 +43,9 @@ const snapshot = {
         history: Array.from({ length: 60 }, (_, second) => second === 59 ? [2, 6, 4] : (second === 10 ? [3, 0, 0] : [0, 0, 0])) },
     recent_requests: 5000, total_errors: 61, recent_error_rate_percent: 1.22,
     account_readiness: counts, playback_readiness: counts, catalog_readiness: empty,
-    playback: { active: 0, pending: 0, pool_size: 7 }, catalog: { mode: 'pool' }, redis: { configured: false },
+    playback: { active: 0, pending: 0, pool_size: 7, track_latency: { count: 40, p50_ms: 800, p95_ms: 1250, p99_ms: 2100, max_ms: 2400, queued: 3, wait_p95_ms: 600 } },
+    latency: { search: { count: 10, p50_ms: 210, p95_ms: 480, p99_ms: 520 }, catalog: { count: 0, p50_ms: null, p95_ms: null, p99_ms: null } },
+    catalog: { mode: 'pool' }, redis: { configured: false },
 };
 
 for (const language of ['en', 'ru']) {
@@ -55,6 +57,11 @@ for (const language of ['en', 'ru']) {
         assert.equal((html.match(/class="ov-title"/g) || []).length, 3);
         assert.doesNotMatch(html, /0\/13|undefined|NaN/);
         assert.match(html, language === 'en' ? /Concurrent request limit<\/span><strong>7</ : /Лимит одновременно<\/span><strong>7</);
+        // Response time: tracks from the queue's own timings, search and albums from the log.
+        assert.match(html, language === 'en' ? /class="value">1,250 <span class="metric-unit">ms · track p95</ : /class="value">1\u00a0250 <span class="metric-unit">мс · p95 треков</);
+        assert.ok(html.includes('<span>' + (language === 'en' ? 'Tracks' : 'Треки') + '</span><strong>' + (language === 'en' ? '800' : '800') + '</strong><strong>' + (language === 'en' ? '1,250' : '1\u00a0250') + '</strong><strong>' + (language === 'en' ? '2,100' : '2\u00a0100') + '</strong>'));
+        assert.ok(html.includes('<span>' + (language === 'en' ? 'Albums, artists…' : 'Альбомы, артисты…') + '</span><strong>—</strong><strong>—</strong><strong>—</strong>'));
+        assert.match(html, language === 'en' ? /Waited in queue<\/span> <strong>3<\/strong> <span>of<\/span> <strong>40<\/strong>/ : /Ждали в очереди<\/span> <strong>3<\/strong> <span>из<\/span> <strong>40<\/strong>/);
         // Requests per second: the headline is the current total; each class shows now, the 60-second average, then its busiest second.
         const n = value => language === 'en' ? value : value.replace('.', ',');
         assert.match(html, new RegExp('class="value">' + n('7.40') + ' <span class="metric-unit">' + (language === 'en' ? 'now' : 'сейчас') + '<'));

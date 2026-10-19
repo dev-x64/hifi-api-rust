@@ -344,12 +344,38 @@ impl RequestLog {
             .iter()
             .map(|e| e.latency_ms)
             .collect();
-        if latencies.is_empty() {
-            return None;
-        }
         latencies.sort_unstable();
-        let index = ((latencies.len() as f64 * 0.95).ceil() as usize).saturating_sub(1);
-        Some(latencies[index])
+        percentile(&latencies, 0.95)
+    }
+
+    /// Response time percentiles of successful Tidal requests in the bounded
+    /// log, per traffic class. Cache hits and queued (202) answers say nothing
+    /// about Tidal's speed and are left out.
+    pub fn latency_by_class(&self) -> Value {
+        let mut search = Vec::new();
+        let mut catalog = Vec::new();
+        if let Ok(entries) = self.entries.lock() {
+            for entry in entries.iter() {
+                if entry.status >= 400 || entry.status == StatusCode::ACCEPTED.as_u16() {
+                    continue;
+                }
+                match Traffic::of(entry) {
+                    Traffic::Search => search.push(entry.latency_ms),
+                    Traffic::Catalog => catalog.push(entry.latency_ms),
+                    _ => {}
+                }
+            }
+        }
+        let summary = |mut values: Vec<u64>| {
+            values.sort_unstable();
+            json!({
+                "count": values.len(),
+                "p50_ms": percentile(&values, 0.5),
+                "p95_ms": percentile(&values, 0.95),
+                "p99_ms": percentile(&values, 0.99),
+            })
+        };
+        json!({ "search": summary(search), "catalog": summary(catalog) })
     }
 
     pub fn snapshot(&self) -> Vec<LogEntry> {
@@ -458,6 +484,15 @@ impl RequestLog {
             "recent_errors": recent_errors,
         })
     }
+}
+
+/// Nearest-rank percentile of an ascending list; None when it is empty.
+pub fn percentile(sorted: &[u64], p: f64) -> Option<u64> {
+    if sorted.is_empty() {
+        return None;
+    }
+    let index = ((sorted.len() as f64 * p).ceil() as usize).clamp(1, sorted.len()) - 1;
+    Some(sorted[index])
 }
 
 impl Default for RequestLog {
@@ -791,6 +826,38 @@ mod tests {
             log.record(entry(now, latency));
         }
         assert_eq!(log.recent_p95_ms(), Some(95));
+    }
+
+    #[test]
+    fn latency_by_class_counts_only_successful_tidal_answers() {
+        let log = RequestLog::new();
+        let now = chrono::Utc::now().timestamp();
+        for latency in 1..=100 {
+            let mut item = entry(now, latency);
+            item.path = "/search/".into();
+            item.cache = "MISS".into();
+            log.record(item);
+        }
+        for (path, cache, status, latency) in [
+            ("/search/", "HIT", 200, 1),        // from cache
+            ("/search/", "MISS", 500, 99_999), // failed
+            ("/album/", "MISS", 200, 40),
+            ("/album/", "MISS", 202, 1),       // queued, not finished
+        ] {
+            let mut item = entry(now, latency);
+            item.path = path.into();
+            item.cache = cache.into();
+            item.status = status;
+            log.record(item);
+        }
+        let latency = log.latency_by_class();
+        assert_eq!(latency["search"]["count"], 100);
+        assert_eq!(latency["search"]["p50_ms"], 50);
+        assert_eq!(latency["search"]["p95_ms"], 95);
+        assert_eq!(latency["search"]["p99_ms"], 99);
+        assert_eq!(latency["catalog"]["count"], 1);
+        assert_eq!(latency["catalog"]["p99_ms"], 40);
+        assert_eq!(super::percentile(&[], 0.5), None);
     }
 
     #[test]

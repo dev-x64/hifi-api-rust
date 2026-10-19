@@ -14,11 +14,15 @@ use tokio::sync::Mutex;
 
 use crate::AppState;
 
-const CACHE_TTL_SECS: u64 = 3600;
-/// Extra window after TTL expiry during which stale entries still serve
+const HOUR_SECS: u64 = 3600;
+const DAY_SECS: u64 = 24 * HOUR_SECS;
+/// Extra window after the fresh period during which entries still serve
 /// instantly (X-Cache: STALE) while a background refresh runs. Expiry
-/// misses become hits; only cold keys miss.
-const STALE_WINDOW_SECS: u64 = 3600;
+/// misses become hits; only cold keys miss. Long on purpose: a stale serve
+/// always triggers a refresh, so changes still arrive with the next request.
+const STALE_WINDOW_SECS: u64 = 7 * DAY_SECS;
+/// Longest fresh period of any route (see `fresh_secs`).
+const MAX_FRESH_SECS: u64 = 7 * DAY_SECS;
 /// Hard memory bound for cached bodies (moka weight = body bytes).
 const MAX_CACHE_BYTES: u64 = 128 * 1024 * 1024;
 /// Hard memory bound for negatively cached error bodies.
@@ -79,14 +83,33 @@ fn normalize_query(query: Option<&str>) -> String {
     ser.finish()
 }
 
+/// How long a cached metadata answer stays fresh, by how often it changes:
+/// album, track info, covers and lyrics hardly ever; artists and
+/// recommendations now and then; search a few times a day; playlists and
+/// mixes often.
+fn fresh_secs(path: &str) -> u64 {
+    const STABLE: &[&str] = &["/album/", "/info/", "/cover/", "/lyrics/"];
+    const DAILY: &[&str] = &["/artist/", "/recommendations/"];
+    if STABLE.iter().any(|p| path.starts_with(p)) {
+        MAX_FRESH_SECS
+    } else if DAILY.iter().any(|p| path.starts_with(p)) {
+        12 * HOUR_SECS
+    } else if path.starts_with("/search/") {
+        6 * HOUR_SECS
+    } else {
+        HOUR_SECS
+    }
+}
+
 /// Freshness of a cached entry of a given age (seconds). Entries younger
-/// than the soft TTL serve instantly; entries inside the stale window
-/// still serve instantly while a background refresh runs; anything older
-/// is refetched inline. Pure function — unit tested.
-fn freshness(age_secs: i64) -> Freshness {
-    if age_secs < CACHE_TTL_SECS as i64 {
+/// than the route's fresh period serve instantly; entries inside the stale
+/// window still serve instantly while a background refresh runs; anything
+/// older is refetched inline. Pure function — unit tested.
+fn freshness(path: &str, age_secs: i64) -> Freshness {
+    let fresh = fresh_secs(path);
+    if age_secs < fresh as i64 {
         Freshness::Fresh
-    } else if age_secs < (CACHE_TTL_SECS + STALE_WINDOW_SECS) as i64 {
+    } else if age_secs < (fresh + STALE_WINDOW_SECS) as i64 {
         Freshness::Stale
     } else {
         Freshness::Expired
@@ -161,7 +184,7 @@ impl ResponseCache {
     pub fn new() -> Self {
         Self {
             cache: Cache::builder()
-                .time_to_live(Duration::from_secs(CACHE_TTL_SECS + STALE_WINDOW_SECS))
+                .time_to_live(Duration::from_secs(MAX_FRESH_SECS + STALE_WINDOW_SECS))
                 .weigher(|_k, v: &CachedResponse| v.body.len() as u32)
                 .max_capacity(MAX_CACHE_BYTES)
                 .build(),
@@ -281,6 +304,7 @@ pub async fn cache_responses(
     if req.method() != Method::GET || !cacheable(req.uri().path()) {
         return next.run(req).await;
     }
+    let path = req.uri().path().to_string();
     let key = format!(
         "{}?{}",
         req.uri().path(),
@@ -289,7 +313,7 @@ pub async fn cache_responses(
 
     // Fresh entries serve instantly.
     if let Some(hit) = state.cache.get(&key).await {
-        if freshness(now_secs() - hit.fetched_at) == Freshness::Fresh {
+        if freshness(&path, now_secs() - hit.fetched_at) == Freshness::Fresh {
             state.cache.hits.fetch_add(1, Ordering::Relaxed);
             return build_response(hit.status, &hit.headers, hit.body.clone(), "HIT");
         }
@@ -297,7 +321,7 @@ pub async fn cache_responses(
         // `next` + `req` move into the task untouched. A failed refresh
         // keeps the stale entry until hard expiry, so upstream blips never
         // surface as user-facing misses.
-        if freshness(now_secs() - hit.fetched_at) == Freshness::Stale {
+        if freshness(&path, now_secs() - hit.fetched_at) == Freshness::Stale {
             state.cache.hits.fetch_add(1, Ordering::Relaxed);
             state.cache.stale.fetch_add(1, Ordering::Relaxed);
             let stale_resp = build_response(hit.status, &hit.headers, hit.body.clone(), "STALE");
@@ -350,10 +374,10 @@ pub async fn cache_responses(
         .await;
     let _lock = guard.lock().await;
     if let Some(hit) = state.cache.get(&key).await {
-        if freshness(now_secs() - hit.fetched_at) != Freshness::Expired {
+        if freshness(&path, now_secs() - hit.fetched_at) != Freshness::Expired {
             state.cache.hits.fetch_add(1, Ordering::Relaxed);
             state.cache.coalesced.fetch_add(1, Ordering::Relaxed);
-            let label = if freshness(now_secs() - hit.fetched_at) == Freshness::Fresh {
+            let label = if freshness(&path, now_secs() - hit.fetched_at) == Freshness::Fresh {
                 "HIT"
             } else {
                 "STALE"
@@ -456,12 +480,20 @@ mod tests {
 
     #[test]
     fn freshness_windows() {
-        assert_eq!(freshness(0), Freshness::Fresh);
-        assert_eq!(freshness(3599), Freshness::Fresh);
-        assert_eq!(freshness(3600), Freshness::Stale);
-        assert_eq!(freshness(7199), Freshness::Stale);
-        assert_eq!(freshness(7200), Freshness::Expired);
-        assert_eq!(freshness(999_999), Freshness::Expired);
+        let week = 7 * 24 * 3600;
+        // Playlists change often: fresh for an hour, then served stale while refreshed.
+        assert_eq!(freshness("/playlist/", 0), Freshness::Fresh);
+        assert_eq!(freshness("/playlist/", 3599), Freshness::Fresh);
+        assert_eq!(freshness("/playlist/", 3600), Freshness::Stale);
+        assert_eq!(freshness("/playlist/", 3600 + week - 1), Freshness::Stale);
+        assert_eq!(freshness("/playlist/", 3600 + week), Freshness::Expired);
+        // Search for 6 hours, artists for 12, albums and lyrics for a week.
+        assert_eq!(freshness("/search/", 6 * 3600 - 1), Freshness::Fresh);
+        assert_eq!(freshness("/search/", 6 * 3600), Freshness::Stale);
+        assert_eq!(freshness("/artist/similar/", 12 * 3600 - 1), Freshness::Fresh);
+        assert_eq!(freshness("/album/", week - 1), Freshness::Fresh);
+        assert_eq!(freshness("/lyrics/", 2 * week - 1), Freshness::Stale);
+        assert_eq!(freshness("/album/", 2 * week), Freshness::Expired);
     }
 
     #[test]

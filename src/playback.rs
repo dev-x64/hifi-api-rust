@@ -10,7 +10,7 @@
 //! the wrapped operation still uses the normal multi-account failover
 //! inside its slot.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -127,7 +127,19 @@ struct Job {
     accounts: Vec<crate::request_log::LoggedAccount>,
 }
 
+/// Completed track requests remembered for the response time card.
+const TIMING_SAMPLES: usize = 1000;
+
+/// One successful track request: time waiting for a slot and in total,
+/// from arrival to a ready answer.
+#[derive(Clone, Copy)]
+struct TrackTiming {
+    wait_ms: u64,
+    total_ms: u64,
+}
+
 pub struct PlaybackQueue {
+    timings: std::sync::Mutex<VecDeque<TrackTiming>>,
     inflight: AtomicUsize,
     jobs: RwLock<HashMap<String, Job>>,
     /// Broadcast on slot release so waiters wake immediately instead of
@@ -138,6 +150,7 @@ pub struct PlaybackQueue {
 impl PlaybackQueue {
     pub fn new() -> Self {
         Self {
+            timings: std::sync::Mutex::new(VecDeque::with_capacity(TIMING_SAMPLES)),
             inflight: AtomicUsize::new(0),
             jobs: RwLock::new(HashMap::new()),
             wakeup: tokio::sync::Notify::new(),
@@ -297,9 +310,11 @@ impl PlaybackQueue {
             .unwrap_or(usize::MAX);
         if self.try_acquire(pool) {
             let _slot = SlotGuard(self);
+            let started = std::time::Instant::now();
             let out =
                 tokio::time::timeout(Duration::from_secs(OP_TIMEOUT_SECS), run_op(state, &op))
                     .await;
+            self.record_timing(&op, matches!(out, Ok(Ok(_))), Duration::ZERO, started.elapsed());
             return match out {
                 Ok(Ok(result)) => Ok(job_result_response(&result)),
                 Ok(Err(e)) => Err(e),
@@ -351,6 +366,7 @@ impl PlaybackQueue {
         let app = state.clone();
         let job_id = id.clone();
         tokio::spawn(async move {
+            let queued_at = std::time::Instant::now();
             loop {
                 // Stop waiting if cancelled while queued.
                 {
@@ -385,11 +401,13 @@ impl PlaybackQueue {
                     return;
                 }
             }
+            let waited = queued_at.elapsed();
             let (out, accounts) = crate::request_log::capture_accounts(tokio::time::timeout(
                 Duration::from_secs(OP_TIMEOUT_SECS),
                 run_op(&app, &op_owned),
             ))
             .await;
+            queue.record_timing(&op_owned, matches!(out, Ok(Ok(_))), waited, queued_at.elapsed());
             {
                 let mut jobs = queue.jobs.write().await;
                 if let Some(j) = jobs.get_mut(&job_id) {
@@ -447,12 +465,53 @@ impl PlaybackQueue {
         (active, pending, total, oldest)
     }
 
+    /// Remember a successful track request (tracks, manifests, DASH); video
+    /// and licenses have different costs and are left out.
+    fn record_timing(&self, op: &PlaybackOp, ok: bool, wait: Duration, total: Duration) {
+        if !ok || !matches!(op, PlaybackOp::Track { .. } | PlaybackOp::Manifest { .. } | PlaybackOp::Dash { .. }) {
+            return;
+        }
+        if let Ok(mut timings) = self.timings.lock() {
+            if timings.len() >= TIMING_SAMPLES {
+                timings.pop_front();
+            }
+            timings.push_back(TrackTiming {
+                wait_ms: wait.as_millis() as u64,
+                total_ms: total.as_millis() as u64,
+            });
+        }
+    }
+
+    /// Percentiles of the total time of recent successful track requests,
+    /// plus how often and how long they waited in the queue.
+    pub fn track_latency(&self) -> Value {
+        let timings: Vec<TrackTiming> = self
+            .timings
+            .lock()
+            .map(|t| t.iter().copied().collect())
+            .unwrap_or_default();
+        let mut totals: Vec<u64> = timings.iter().map(|t| t.total_ms).collect();
+        totals.sort_unstable();
+        let mut waits: Vec<u64> = timings.iter().map(|t| t.wait_ms).filter(|w| *w > 0).collect();
+        waits.sort_unstable();
+        json!({
+            "count": totals.len(),
+            "p50_ms": crate::request_log::percentile(&totals, 0.5),
+            "p95_ms": crate::request_log::percentile(&totals, 0.95),
+            "p99_ms": crate::request_log::percentile(&totals, 0.99),
+            "max_ms": totals.last(),
+            "queued": waits.len(),
+            "wait_p95_ms": crate::request_log::percentile(&waits, 0.95),
+        })
+    }
+
     /// Queue counters for /admin/stats. `limit` None means unlimited.
     pub async fn stats(&self, pool: usize, limit: Option<usize>) -> Value {
         let (active, pending, total, oldest) = self.snapshot(pool).await;
         json!({
             "pool_size": pool,
             "limit": limit,
+            "track_latency": self.track_latency(),
             "active": active,
             "pending": pending,
             "jobs": total,
@@ -712,6 +771,31 @@ pub async fn clear_playback_queue(State(state): State<AppState>) -> Result<Json<
 mod tests {
     use super::{Job, JobState, PENDING_TIMEOUT_SECS, PlaybackQueue};
     use std::collections::HashMap;
+
+    #[test]
+    fn track_latency_covers_tracks_only_and_counts_queue_waits() {
+        use super::PlaybackOp;
+        use std::time::Duration;
+        let queue = PlaybackQueue::new();
+        assert_eq!(queue.track_latency()["p95_ms"], serde_json::Value::Null);
+        let track = PlaybackOp::Dash { track_id: "1".into(), atmos: None };
+        for ms in 1..=100 {
+            let wait = if ms > 90 { Duration::from_millis(ms) } else { Duration::ZERO };
+            queue.record_timing(&track, true, wait, Duration::from_millis(ms * 10));
+        }
+        // Failures and video are not track response times.
+        queue.record_timing(&track, false, Duration::ZERO, Duration::from_secs(60));
+        let video = PlaybackOp::Video { id: 1, quality: "HIGH".into(), mode: "STREAM".into(), presentation: "FULL".into() };
+        queue.record_timing(&video, true, Duration::ZERO, Duration::from_secs(60));
+        let latency = queue.track_latency();
+        assert_eq!(latency["count"], 100);
+        assert_eq!(latency["p50_ms"], 500);
+        assert_eq!(latency["p95_ms"], 950);
+        assert_eq!(latency["p99_ms"], 990);
+        assert_eq!(latency["max_ms"], 1000);
+        assert_eq!(latency["queued"], 10);
+        assert_eq!(latency["wait_p95_ms"], 100);
+    }
 
     #[test]
     fn payload_shape_matches_upstream() {

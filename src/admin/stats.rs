@@ -199,6 +199,7 @@ pub async fn get_stats(State(state): State<AppState>) -> Result<Json<Value>, App
         "requests_per_second_60s": request_rates.all.avg_60s,
         "request_rates": request_rates,
         "recent_p95_ms": recent_p95_ms,
+        "latency": state.request_log.latency_by_class(),
         "recent_requests": recent_requests,
         "recent_error_rate_percent": (recent_requests > 0).then(|| total_errors as f64 * 100.0 / recent_requests as f64),
         "account_readiness": account_readiness,
