@@ -253,6 +253,22 @@ pub async fn check_account_premium(
     })))
 }
 
+/// Manual lookup of the Tidal subscription: plan, status and expiry date.
+pub async fn check_account_subscription(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    let account = state
+        .account_manager
+        .get_account_by_id(&id)
+        .await
+        .ok_or_else(|| AppError::NotFound(format!("Account {} not found", id)))?;
+    let mut result = state.tidal_client.account_subscription(&account).await?;
+    result["account_id"] = json!(id);
+    result["checked_at"] = json!(chrono::Utc::now().timestamp());
+    Ok(Json(result))
+}
+
 pub async fn test_all_accounts(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     let now = chrono::Utc::now().timestamp();
     if let Ok(cache) = TEST_CACHE.lock() {

@@ -219,6 +219,17 @@ impl PlaybackQueue {
         state.account_manager.playback_slots().await
     }
 
+    /// Requests that may run at once: each ready account takes up to
+    /// `track_concurrency_per_account` of them; 0 lifts the limit.
+    pub fn capacity(pool: usize, per_account: u32) -> Option<usize> {
+        (per_account > 0).then(|| pool.saturating_mul(per_account as usize))
+    }
+
+    async fn capacity_now(state: &AppState) -> usize {
+        let pool = Self::pool_size(state).await;
+        Self::capacity(pool, state.settings.track_concurrency_per_account()).unwrap_or(usize::MAX)
+    }
+
     fn payload(id: &str, state_str: &str, position: usize, pool: usize, active: usize) -> Value {
         let url = format!("/playback/requests/{}", id);
         json!({
@@ -281,7 +292,9 @@ impl PlaybackQueue {
     /// forever behind a backlog nobody will wait out.
     pub async fn dispatch(&self, state: &AppState, op: PlaybackOp) -> Result<Response, AppError> {
         self.prune().await;
-        let pool = Self::pool_size(state).await;
+        let accounts = Self::pool_size(state).await;
+        let pool = Self::capacity(accounts, state.settings.track_concurrency_per_account())
+            .unwrap_or(usize::MAX);
         if self.try_acquire(pool) {
             let _slot = SlotGuard(self);
             let out =
@@ -349,7 +362,7 @@ impl PlaybackQueue {
                         return;
                     }
                 }
-                let pool_now = app.account_manager.playback_slots().await;
+                let pool_now = Self::capacity_now(&app).await;
                 if queue.try_acquire(pool_now) {
                     break;
                 }
@@ -414,7 +427,7 @@ impl PlaybackQueue {
             }
         });
 
-        Ok(Self::pending_response(&id, position, pool, active))
+        Ok(Self::pending_response(&id, position, accounts, active))
     }
 
     async fn snapshot(&self, pool: usize) -> (usize, usize, usize, i64) {
@@ -434,11 +447,12 @@ impl PlaybackQueue {
         (active, pending, total, oldest)
     }
 
-    /// Queue counters for /admin/stats.
-    pub async fn stats(&self, pool: usize) -> Value {
+    /// Queue counters for /admin/stats. `limit` None means unlimited.
+    pub async fn stats(&self, pool: usize, limit: Option<usize>) -> Value {
         let (active, pending, total, oldest) = self.snapshot(pool).await;
         json!({
             "pool_size": pool,
+            "limit": limit,
             "active": active,
             "pending": pending,
             "jobs": total,

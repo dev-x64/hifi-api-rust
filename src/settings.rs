@@ -18,6 +18,12 @@ pub struct AppSettings {
     /// Maximum metadata requests one catalog account serves at the same
     /// time; the overflow goes to the playback pool. 0 = unlimited.
     catalog_concurrency_per_account: RwLock<u32>,
+    /// Maximum track, video and license requests one playback account
+    /// serves at the same time. 0 = unlimited.
+    track_concurrency_per_account: RwLock<u32>,
+    /// Pause in milliseconds a playback account takes after each request
+    /// before it may take the next one. 0 = no pause.
+    track_request_delay_ms: RwLock<u32>,
     /// Secret: never include this in API snapshots or logs.
     discord_webhook_url: RwLock<String>,
     /// Shared cross-instance state (None = single-host mode, skip sync).
@@ -31,6 +37,8 @@ impl AppSettings {
             track_requests_per_account: RwLock::new(1),
             catalog_requests_per_account: RwLock::new(1),
             catalog_concurrency_per_account: RwLock::new(0),
+            track_concurrency_per_account: RwLock::new(1),
+            track_request_delay_ms: RwLock::new(0),
             discord_webhook_url: RwLock::new(
                 std::env::var("DISCORD_WEBHOOK_URL").unwrap_or_default(),
             ),
@@ -56,6 +64,8 @@ impl AppSettings {
             "track_requests_per_account": self.track_requests_per_account(),
             "catalog_requests_per_account": self.catalog_requests_per_account(),
             "catalog_concurrency_per_account": self.catalog_concurrency_per_account(),
+            "track_concurrency_per_account": self.track_concurrency_per_account(),
+            "track_request_delay_ms": self.track_request_delay_ms(),
         })
     }
 
@@ -76,6 +86,20 @@ impl AppSettings {
     pub fn catalog_concurrency_per_account(&self) -> u32 {
         *self
             .catalog_concurrency_per_account
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn track_concurrency_per_account(&self) -> u32 {
+        *self
+            .track_concurrency_per_account
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn track_request_delay_ms(&self) -> u32 {
+        *self
+            .track_request_delay_ms
             .read()
             .unwrap_or_else(|e| e.into_inner())
     }
@@ -137,6 +161,18 @@ impl AppSettings {
                 .catalog_concurrency_per_account
                 .write()
                 .unwrap_or_else(|e| e.into_inner()) = normalize_concurrency_per_account(v);
+        }
+        if let Some(v) = first_opt_u32(updates, "track_concurrency_per_account")? {
+            *self
+                .track_concurrency_per_account
+                .write()
+                .unwrap_or_else(|e| e.into_inner()) = normalize_concurrency_per_account(v);
+        }
+        if let Some(v) = first_opt_u32(updates, "track_request_delay_ms")? {
+            *self
+                .track_request_delay_ms
+                .write()
+                .unwrap_or_else(|e| e.into_inner()) = normalize_request_delay_ms(v);
         }
         Ok(())
     }
@@ -204,6 +240,22 @@ impl AppSettings {
                         .unwrap_or_else(|e| e.into_inner()) = normalize_concurrency_per_account(value);
                 }
             }
+            "track_concurrency_per_account" => {
+                if let Ok(value) = value.parse::<u32>() {
+                    *self
+                        .track_concurrency_per_account
+                        .write()
+                        .unwrap_or_else(|e| e.into_inner()) = normalize_concurrency_per_account(value);
+                }
+            }
+            "track_request_delay_ms" => {
+                if let Ok(value) = value.parse::<u32>() {
+                    *self
+                        .track_request_delay_ms
+                        .write()
+                        .unwrap_or_else(|e| e.into_inner()) = normalize_request_delay_ms(value);
+                }
+            }
             _ => {}
         }
     }
@@ -215,6 +267,8 @@ impl AppSettings {
         "track_requests_per_account",
         "catalog_requests_per_account",
         "catalog_concurrency_per_account",
+        "track_concurrency_per_account",
+        "track_request_delay_ms",
     ];
 
     /// Canonical (key, value) snapshot, shared by the SQLite and Redis writers.
@@ -239,6 +293,14 @@ impl AppSettings {
             (
                 "catalog_concurrency_per_account",
                 self.catalog_concurrency_per_account().to_string(),
+            ),
+            (
+                "track_concurrency_per_account",
+                self.track_concurrency_per_account().to_string(),
+            ),
+            (
+                "track_request_delay_ms",
+                self.track_request_delay_ms().to_string(),
             ),
         ]
         .into_iter()
@@ -366,6 +428,11 @@ fn normalize_concurrency_per_account(value: u32) -> u32 {
     value.min(1000)
 }
 
+/// Capped below the lease wait, so a resting pool never times requests out.
+fn normalize_request_delay_ms(value: u32) -> u32 {
+    value.min(10_000)
+}
+
 fn first_opt_u32(obj: &Value, key: &str) -> Result<Option<u32>, String> {
     match obj.get(key) {
         None | Some(Value::Null) => Ok(None),
@@ -459,6 +526,20 @@ mod tests {
         assert_eq!(settings.catalog_concurrency_per_account(), 1000);
         settings.apply_kv("catalog_concurrency_per_account", "0");
         assert_eq!(settings.catalog_concurrency_per_account(), 0);
+
+        // Tracks keep one request per account by default; 0 lifts the limit.
+        assert_eq!(settings.track_concurrency_per_account(), 1);
+        settings
+            .apply(&serde_json::json!({"track_concurrency_per_account": 0}))
+            .unwrap();
+        assert_eq!(settings.snapshot()["track_concurrency_per_account"], 0);
+        settings.apply_kv("track_concurrency_per_account", "3");
+        assert_eq!(settings.track_concurrency_per_account(), 3);
+        assert_eq!(settings.track_request_delay_ms(), 0);
+        settings.apply(&serde_json::json!({"track_request_delay_ms": 750})).unwrap();
+        assert_eq!(settings.snapshot()["track_request_delay_ms"], 750);
+        settings.apply_kv("track_request_delay_ms", "99999");
+        assert_eq!(settings.track_request_delay_ms(), 10_000);
         // Redis seeding pairs these two lists by position.
         let entries = settings.settings_entries();
         assert_eq!(entries.len(), AppSettings::REDIS_SETTING_NAMES.len());

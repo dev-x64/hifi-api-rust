@@ -53,35 +53,75 @@ body { font-family:'SF Mono','Fira Code','Cascadia Code','JetBrains Mono',Menlo,
 .card-stat { font-size:11px; color:#8b949e; white-space:nowrap; }
 .card-stat strong { color:#c9d1d9; }
 .account-uptime { padding:16px 20px; border-top:1px solid #30363d; }
-.uptime-heading { display:flex; align-items:center; flex-wrap:wrap; gap:6px 10px; margin-bottom:12px; font-size:12px; color:var(--muted); }
+.uptime-heading { display:flex; align-items:center; flex-wrap:wrap; gap:8px 12px; margin-bottom:12px; font-size:12px; color:var(--muted); }
 .uptime-heading strong { color:var(--text); font-weight:600; }
+.uptime-tabs { display:inline-flex; gap:2px; padding:2px; border:1px solid var(--line); border-radius:7px; background:#0c1117; }
+.uptime-tabs button { padding:3px 9px; border:0; border-radius:5px; background:transparent; color:var(--muted); font:inherit; font-size:11px; cursor:pointer; }
+.uptime-tabs button:hover { color:var(--text); }
+.uptime-tabs button[aria-pressed="true"] { background:#222a35; color:var(--text); }
 .uptime-current { padding:2px 8px; border-radius:999px; background:rgba(244,184,96,.12); color:var(--amber); font-size:11px; }
 .uptime-score { margin-left:auto; }
 .uptime-score strong { margin-left:6px; font-size:15px; font-variant-numeric:tabular-nums; }
-.uptime-chart { display:flex; gap:3px; }
-.uptime-bar { position:relative; flex:1; min-width:0; height:36px; border-radius:3px; }
-.uptime-bar:focus-visible { outline:2px solid #7c6cff; outline-offset:2px; }
-.uptime-stack { display:flex; flex-direction:column-reverse; height:100%; overflow:hidden; border-radius:3px; background:var(--panel-2); transition:filter .12s; }
-.uptime-bar:hover .uptime-stack, .uptime-bar:focus-visible .uptime-stack { filter:brightness(1.3); }
-.uptime-bar::after, .rate-bar::after { content:attr(data-tip); position:absolute; bottom:calc(100% + 8px); left:50%; z-index:20; transform:translateX(-50%); padding:8px 10px; border:1px solid var(--line); border-radius:8px; background:var(--bg); box-shadow:0 8px 24px rgba(0,0,0,.45); color:var(--text); font-size:11px; line-height:1.6; white-space:pre; pointer-events:none; opacity:0; visibility:hidden; transition:opacity .12s; }
-.uptime-bar:hover::after, .uptime-bar:focus-visible::after, .rate-bar:hover::after { opacity:1; visibility:visible; }
-.uptime-bar[data-edge="start"]::after, .rate-bar[data-edge="start"]::after { left:0; transform:none; }
-.uptime-bar[data-edge="end"]::after, .rate-bar[data-edge="end"]::after { left:auto; right:0; transform:none; }
-.uptime-span { width:100%; flex-shrink:0; }
-.uptime-span + .uptime-span { box-sizing:border-box; border-bottom:1px solid var(--panel); }
+.uptime-score.good strong { color:var(--green); }
+.uptime-score.warn strong { color:var(--amber); }
+.uptime-score.bad strong { color:var(--red); }
+.uptime-track { position:relative; height:28px; cursor:crosshair; }
+.uptime-bars { position:absolute; inset:0; overflow:hidden; border-radius:6px; background:var(--panel-2); }
+.uptime-seg { position:absolute; top:0; bottom:0; }
+.uptime-bars .uptime-waiting, .uptime-bars .uptime-down { min-width:2px; }
+.uptime-grid { position:absolute; top:0; bottom:0; width:1px; background:rgba(10,13,18,.75); pointer-events:none; }
 .uptime-up { background:#2fa36b; }
+.uptime-waiting { background:#d9a03f; }
 .uptime-down { background:var(--red); }
-.uptime-waiting { background:#343e4c; }
 .uptime-unknown { background:repeating-linear-gradient(135deg,transparent,transparent 4px,rgba(139,150,165,.2) 4px,rgba(139,150,165,.2) 8px); }
-.uptime-axis { display:flex; justify-content:space-between; margin-top:6px; font-size:10px; color:var(--muted); }
-.token-refresh-error { margin-top:12px; font-size:12px; line-height:1.5; color:#d29922; overflow-wrap:anywhere; }
-.uptime-totals { display:flex; flex-wrap:wrap; gap:6px 18px; margin-top:10px; color:var(--muted); font-size:11px; }
+.uptime-cursor { position:absolute; top:-3px; bottom:-3px; width:2px; margin-left:-1px; border-radius:1px; background:var(--text); opacity:0; pointer-events:none; }
+.uptime-tip { position:absolute; bottom:calc(100% + 10px); z-index:20; display:grid; gap:2px; min-width:170px; padding:8px 10px; transform:translateX(-50%); border:1px solid var(--line); border-radius:8px; background:var(--bg); box-shadow:0 8px 24px rgba(0,0,0,.45); color:var(--muted); font-size:11px; line-height:1.5; white-space:nowrap; pointer-events:none; opacity:0; visibility:hidden; }
+.uptime-tip b { color:var(--text); font-weight:600; }
+.uptime-tip b::before { content:''; display:inline-block; width:8px; height:8px; margin-right:6px; border-radius:2px; background:var(--muted); }
+.uptime-tip .uptime-tip-up::before { background:#2fa36b; }
+.uptime-tip .uptime-tip-waiting::before { background:#d9a03f; }
+.uptime-tip .uptime-tip-down::before { background:var(--red); }
+.uptime-tip[data-edge="start"] { transform:translateX(-12px); }
+.uptime-tip[data-edge="end"] { transform:translateX(calc(-100% + 12px)); }
+.uptime-track.hover .uptime-cursor, .uptime-track.hover .uptime-tip { opacity:1; visibility:visible; }
+.uptime-labels { position:relative; height:16px; margin-top:6px; font-size:10px; color:var(--muted); }
+.uptime-labels span { position:absolute; top:0; transform:translateX(-50%); white-space:nowrap; }
+.uptime-totals { display:flex; flex-wrap:wrap; gap:6px 18px; margin-top:8px; color:var(--muted); font-size:11px; }
 .uptime-totals span { display:inline-flex; align-items:center; gap:6px; }
 .uptime-totals strong { color:var(--text); font-weight:600; }
 .uptime-key { display:inline-block; width:8px; height:8px; border-radius:2px; }
 .uptime-key.uptime-unknown { box-shadow:inset 0 0 0 1px var(--muted); }
-.uptime-key.uptime-waiting { box-shadow:inset 0 0 0 1px #5b6878; }
+.rate-bar::after { content:attr(data-tip); position:absolute; bottom:calc(100% + 8px); left:50%; z-index:20; transform:translateX(-50%); padding:8px 10px; border:1px solid var(--line); border-radius:8px; background:var(--bg); box-shadow:0 8px 24px rgba(0,0,0,.45); color:var(--text); font-size:11px; line-height:1.6; white-space:pre; pointer-events:none; opacity:0; visibility:hidden; transition:opacity .12s; }
+.rate-bar:hover::after { opacity:1; visibility:visible; }
+.rate-bar[data-edge="start"]::after { left:0; transform:none; }
+.rate-bar[data-edge="end"]::after { left:auto; right:0; transform:none; }
+.uptime-axis { display:flex; justify-content:space-between; margin-top:6px; font-size:10px; color:var(--muted); }
+.sub-ok { color:var(--green); }
+.sub-bad { color:var(--amber); }
+.sub-checked { color:var(--muted); font-size:11px; }
+.token-refresh-error { margin-top:12px; font-size:12px; line-height:1.5; color:#d29922; overflow-wrap:anywhere; }
 .uptime-note { margin-top:8px; font-size:10px; line-height:1.5; color:var(--muted); }
+.ready-history:empty { display:none; }
+.ready-history { margin-bottom:28px; }
+.ready-history-head h2 { font-size:17px; letter-spacing:-.25px; }
+.ready-history-head p { color:var(--muted); font-size:12px; margin:5px 0 14px; line-height:1.45; }
+.ready-history-head strong { color:var(--text); }
+.ready-days { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px; }
+.ready-day { padding:16px 18px; border:1px solid var(--line); border-radius:12px; background:linear-gradient(145deg,#151a22,#11161d); }
+.ready-day-head { display:flex; justify-content:space-between; gap:8px; font-size:12px; color:var(--muted); }
+.ready-day-head span:first-child { color:var(--text); font-weight:650; }
+.ready-nums { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; margin-top:12px; }
+.ready-nums small { display:block; color:var(--muted); font-size:11px; }
+.ready-nums strong { display:block; margin-top:2px; color:var(--text); font-size:24px; font-weight:700; letter-spacing:-.5px; font-variant-numeric:tabular-nums; }
+.ready-nums .ready-min { color:var(--amber); }
+.ready-nums .ready-max { color:var(--green); }
+.ready-spark { display:block; width:100%; height:40px; margin-top:12px; }
+.ready-grid line { stroke:var(--line); stroke-width:1; vector-effect:non-scaling-stroke; }
+.ready-area { fill:rgba(72,199,142,.14); }
+.ready-line { fill:none; stroke:var(--green); stroke-width:1.5; vector-effect:non-scaling-stroke; }
+.ready-foot { min-height:16px; margin-top:8px; color:var(--muted); font-size:11px; }
+.ready-empty { margin-top:14px; color:var(--muted); font-size:12px; }
+@media (max-width:760px) { .ready-days { grid-template-columns:1fr; } .uptime-score { margin-left:0; width:100%; } }
 .test-badge { cursor:pointer; text-decoration:underline; text-decoration-style:dotted; text-underline-offset:2px; }
 .test-badge:hover { color:#f0f6fc; }
 
@@ -125,6 +165,12 @@ body { font-family:'SF Mono','Fira Code','Cascadia Code','JetBrains Mono',Menlo,
 .modal h3 { font-size:17px; margin-bottom:20px; color:#f0f6fc; }
 .modal .form-group { margin-bottom:16px; }
 .modal .modal-actions { display:flex; gap:10px; margin-top:18px; }
+.mode-tabs { display:inline-flex; gap:2px; padding:3px; margin:2px 0 14px; border:1px solid var(--line); border-radius:9px; background:#0c1117; }
+.mode-tabs button { min-height:30px; padding:5px 14px; border:0; border-radius:6px; background:transparent; color:var(--muted); font-size:12px; font-weight:650; cursor:pointer; }
+.mode-tabs button:hover { color:var(--text); }
+.mode-tabs button[aria-selected="true"] { background:#222a35; color:var(--text); }
+[data-mode="oauth"] .manual-only, [data-mode="manual"] .oauth-only { display:none !important; }
+[data-mode="oauth"] .add-account .form-row { grid-template-columns:1fr; margin-bottom:0; }
 .modal .modal-actions .btn { padding:8px 20px; font-size:13px; }
 
 .empty-state { text-align:center; padding:48px 20px; color:#8b949e; }
@@ -463,6 +509,7 @@ button:focus-visible,input:focus-visible,select:focus-visible { outline:2px soli
   </section>
 
   <section id="view-accounts" class="view">
+    <div id="readyHistory" class="ready-history" data-no-i18n></div>
     <div class="section-head"><div><h2>Tidal-аккаунты</h2><p>Управляйте пулом воспроизведения, токенами и каталогом.</p></div><div class="section-actions"><button class="btn" onclick="testAll()" id="testAllBtn">Проверить все</button><button class="btn btn-primary" onclick="openAddAccount()">+ Добавить</button></div></div>
     <div class="toolbar"><div class="search-wrap"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg><input id="accountSearch" type="search" placeholder="Найти аккаунт..." oninput="filterAccounts(this.value)"></div><div class="account-summary" id="accountCount"><span class="status-dot status-ok"></span><span>Готовы сейчас</span><strong>— / —</strong></div></div>
     <div id="accounts-container" class="accounts-grid"></div>
@@ -483,7 +530,7 @@ button:focus-visible,input:focus-visible,select:focus-visible { outline:2px soli
     <div class="section-head"><div><h2>Системные настройки</h2><p>Интеграции, резервные копии и обслуживание.</p></div></div>
     <div class="system-grid">
       <div class="form-section"><h3>Настройки панели</h3><p class="form-copy">Язык интерфейса сохраняется в cookie этого браузера.</p><div class="form-group"><label for="panel-language">Язык интерфейса</label><select id="panel-language" class="select" style="width:100%;padding:10px 12px" onchange="setLanguage(this.value)"><option value="en">English</option><option value="ru">Русский</option></select></div></div>
-      <div class="form-section"><h3>Воспроизведение</h3><p class="form-copy">Настройки выбора формата и исходящих запросов к Tidal.</p><div class="form-group" style="margin-bottom:16px"><label>Формат по умолчанию</label><select id="rl-atmos" class="select" style="width:100%;padding:10px 12px"><option value="high">HIGH · AAC 320 kbps (v1)</option><option value="off">FLAC в приоритете</option><option value="prefer">Atmos в приоритете</option></select></div><div class="form-row"><div class="form-group"><label for="rl-track-requests">Запросов на аккаунт · треки</label><input type="number" id="rl-track-requests" min="1" max="10" value="1"></div><div class="form-group"><label for="rl-catalog-requests">Запросов на аккаунт · каталог</label><input type="number" id="rl-catalog-requests" min="1" max="10" value="1"></div></div><p class="form-copy">Лимит включает первую попытку. При ошибке сервис всё ещё может перейти на другой аккаунт; цепочка аккаунтов в журнале показывает такие переключения.</p><div class="form-group" style="margin-bottom:8px"><label for="rl-catalog-concurrency">Одновременных запросов на аккаунт каталога</label><input type="number" id="rl-catalog-concurrency" min="0" max="1000" value="0"></div><p class="form-copy">0 — без ограничения. Когда все аккаунты каталога заняты, запросы метаданных уходят в пул воспроизведения.</p><p class="form-copy">Автовосстановление всегда включено. Отключённые вручную аккаунты остаются выключенными.</p><div class="section-actions"><button class="btn btn-primary" onclick="saveSettings()">Сохранить</button><button class="btn" id="clearPlaybackBtn" onclick="clearPlaybackQueue()">Очистить очередь</button></div></div>
+      <div class="form-section"><h3>Воспроизведение</h3><p class="form-copy">Настройки выбора формата и исходящих запросов к Tidal.</p><div class="form-group" style="margin-bottom:16px"><label>Формат по умолчанию</label><select id="rl-atmos" class="select" style="width:100%;padding:10px 12px"><option value="high">HIGH · AAC 320 kbps (v1)</option><option value="off">FLAC в приоритете</option><option value="prefer">Atmos в приоритете</option></select></div><div class="form-row"><div class="form-group"><label for="rl-track-concurrency">Одновременных запросов на аккаунт воспроизведения</label><input type="number" id="rl-track-concurrency" min="0" max="1000" value="1"></div><div class="form-group"><label for="rl-track-delay">Пауза аккаунта между запросами, мс</label><input type="number" id="rl-track-delay" min="0" max="10000" step="50" value="0"></div></div><p class="form-copy">Сколько запросов один аккаунт воспроизведения одновременно отправляет в Tidal — треки, видео, лицензии и метаданные, если они попали в пул. Занятый или отдыхающий аккаунт пропускается, запрос берёт свободный; если свободных нет, запрос ждёт в очереди. 0 — без ограничения. Пауза — сколько аккаунт отдыхает после каждого запроса, прежде чем взять следующий (до 10 000 мс). Аккаунтов «только каталог» это не касается.</p><div class="form-row"><div class="form-group"><label for="rl-track-requests">Попыток на одном аккаунте · треки и видео</label><input type="number" id="rl-track-requests" min="1" max="10" value="1"></div><div class="form-group"><label for="rl-catalog-requests">Попыток на одном аккаунте · метаданные</label><input type="number" id="rl-catalog-requests" min="1" max="10" value="1"></div></div><p class="form-copy">Сколько раз один запрос может обратиться к одному и тому же аккаунту, считая первую попытку. 1 — без повторов; 2 — один повтор, например после обновления токена при 401. Метаданные — это поиск, альбомы, артисты, плейлисты и т. п., с любого аккаунта. Если аккаунт не справился, запрос уходит на следующий независимо от этой настройки; цепочка аккаунтов видна в журнале.</p><div class="form-group" style="margin-bottom:8px"><label for="rl-catalog-concurrency">Одновременных запросов на аккаунт «только каталог»</label><input type="number" id="rl-catalog-concurrency" min="0" max="1000" value="0"></div><p class="form-copy">Касается только аккаунтов «только каталог». 0 — без ограничения. Когда все они заняты, запросы метаданных уходят в пул воспроизведения.</p><p class="form-copy">Автовосстановление всегда включено. Отключённые вручную аккаунты остаются выключенными.</p><div class="section-actions"><button class="btn btn-primary" onclick="saveSettings()">Сохранить</button><button class="btn" id="clearPlaybackBtn" onclick="clearPlaybackQueue()">Очистить очередь</button></div></div>
       <div class="form-section"><h3>Прокси</h3><p class="form-copy">Маршрутизация исходящих запросов. Изменения применяются сразу.</p><div class="card-stats" style="margin-bottom:16px"><span class="card-stat">Статус <strong id="px-status">—</strong></span><span class="card-stat">Назначено <strong id="px-current">—</strong></span><span class="card-stat">В пуле <strong id="px-pool">—</strong></span><span class="card-stat">Проверено назначений <strong id="px-verified">—</strong></span><span class="card-stat" title="Сумма последовательных ошибок по текущим назначениям; сбрасываются после успешного запроса">Ошибок подряд <strong id="px-fails">—</strong></span></div><div id="px-assignments" class="helper" style="white-space:pre-line;margin-bottom:16px"></div><div class="form-group"><label for="px-list">Адреса прокси · по одному в строке</label><textarea id="px-list" spellcheck="false" placeholder="http://user:password@host:port" oninput="proxyListDirty=true"></textarea></div><div class="section-actions" style="margin-top:12px"><button class="btn btn-primary" id="pxToggleBtn" onclick="toggleProxies()">Включить прокси</button><button class="btn" id="pxSaveBtn" onclick="saveProxyList()">Сохранить список</button></div><p class="helper" id="px-persist" style="margin-top:11px"></p></div>
       <div class="form-section"><h3>Уведомления</h3><p class="form-copy">Discord-оповещения о риске блокировки и недоступности аккаунтов.</p><div class="card-stats" style="margin-bottom:15px"><span class="card-stat">Discord <strong id="al-discord">—</strong></span></div><div class="form-group"><label for="al-webhook">URL вебхука Discord</label><input type="password" id="al-webhook" placeholder="https://discord.com/api/webhooks/…" autocomplete="new-password" spellcheck="false"></div><p class="helper" style="margin:8px 0 14px">Сохранённый URL скрыт. Введите новый, чтобы заменить его.</p><div class="section-actions" style="margin-bottom:15px"><button class="btn btn-primary" onclick="saveDiscordWebhook()" id="saveWebhookBtn">Сохранить вебхук</button><button class="btn btn-danger" onclick="disableDiscordWebhook()" id="disableWebhookBtn">Отключить вебхук</button></div><div class="section-actions"><button class="btn" onclick="testAlert()" id="alertTestBtn">Тест</button><button class="btn" onclick="sendReport('status')" id="reportStatusBtn">Статус</button><button class="btn" onclick="sendReport('accounts')" id="reportAccountsBtn">Аккаунты</button></div></div>
       <div class="form-section"><h3>Кэш</h3><p class="form-copy">Счётчики запросов с запуска сервера. Устаревшие и объединённые ответы входят в попадания. Очистка кэша не обнуляет счётчики.</p><div class="card-stats" style="margin-bottom:15px"><span class="card-stat">Попадания <strong id="cc-hits">—</strong></span><span class="card-stat">Промахи <strong id="cc-misses">—</strong></span><span class="card-stat" title="Попадания от суммы попаданий и промахов">Доля попаданий <strong id="cc-rate">—</strong></span><span class="card-stat">Из устаревшего кэша <strong id="cc-stale">—</strong></span><span class="card-stat">Ошибок из кэша <strong id="cc-negative">—</strong></span><span class="card-stat">Объединённых запросов <strong id="cc-coalesced">—</strong></span></div><button class="btn" onclick="clearCache()" id="clearCacheBtn">Очистить кэш</button></div>
@@ -495,7 +542,7 @@ button:focus-visible,input:focus-visible,select:focus-visible { outline:2px soli
 </div></main>
 </div>
 
-<div id="addAccountOverlay" class="overlay" onclick="if(event.target===this)closeAddAccount()"><div class="modal" style="width:620px"><div class="section-head"><div><div class="page-kicker">Новый аккаунт</div><h3 style="margin:0">Подключить Tidal</h3></div><button class="btn icon-btn btn-quiet" onclick="closeAddAccount()" aria-label="Закрыть">×</button></div><p class="form-copy">Самый простой вариант — OAuth. Ручной ввод подходит для уже готовых credentials.</p><div class="form-row"><div class="form-group"><label>Название</label><input type="text" id="new-label" placeholder="Основной аккаунт"></div><div class="form-group"><label>User ID · необязательно</label><input type="text" id="new-user-id" placeholder="208921067"></div></div><div class="form-group" style="margin-bottom:14px"><label>Client ID</label><input type="text" id="new-client-id" placeholder="client_id"></div><div class="form-row"><div class="form-group"><label>Client Secret</label><div class="pw-wrap"><input type="password" id="new-client-secret" placeholder="client_secret"><button type="button" class="pw-toggle" onclick="togglePw('new-client-secret', this)">&#128065;</button></div></div><div class="form-group"><label>Refresh Token</label><div class="pw-wrap"><input type="password" id="new-refresh-token" placeholder="refresh_token"><button type="button" class="pw-toggle" onclick="togglePw('new-refresh-token', this)">&#128065;</button></div></div></div><label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted);margin:16px 0"><input type="checkbox" id="new-catalog"> Только каталог — без воспроизведения</label><div class="modal-actions"><button class="btn btn-primary" onclick="startOAuth()" id="oauthBtn">Подключить через OAuth</button><button class="btn" onclick="addAccount()">Добавить вручную</button></div></div></div>
+<div id="addAccountOverlay" class="overlay" data-mode="oauth" onclick="if(event.target===this)closeAddAccount()"><form class="modal add-account" style="width:560px" onsubmit="event.preventDefault();submitAddAccount()"><div class="section-head"><div><div class="page-kicker">Новый аккаунт</div><h3 style="margin:0">Подключить Tidal</h3></div><button type="button" class="btn icon-btn btn-quiet" onclick="closeAddAccount()" aria-label="Закрыть">×</button></div><div class="mode-tabs" role="tablist"><button type="button" role="tab" id="addModeOauth" aria-selected="true" onclick="setAddAccountMode('oauth')">OAuth</button><button type="button" role="tab" id="addModeManual" aria-selected="false" onclick="setAddAccountMode('manual')">Вручную</button></div><p class="form-copy oauth-only">Откроется ссылка Tidal: войдите и подтвердите доступ — аккаунт добавится сам.</p><p class="form-copy manual-only">Для уже готовых credentials: Client ID, Client Secret и Refresh Token.</p><div class="form-row"><div class="form-group"><label for="new-label">Название · необязательно</label><input type="text" id="new-label" placeholder="Основной аккаунт"></div><div class="form-group manual-only"><label for="new-user-id">User ID · необязательно</label><input type="text" id="new-user-id" placeholder="208921067"></div></div><div class="manual-only"><div class="form-group" style="margin:0 0 14px"><label for="new-client-id">Client ID</label><input type="text" id="new-client-id" placeholder="client_id"></div><div class="form-row"><div class="form-group"><label for="new-client-secret">Client Secret</label><div class="pw-wrap"><input type="password" id="new-client-secret" placeholder="client_secret"><button type="button" class="pw-toggle" onclick="togglePw('new-client-secret', this)">&#128065;</button></div></div><div class="form-group"><label for="new-refresh-token">Refresh Token</label><div class="pw-wrap"><input type="password" id="new-refresh-token" placeholder="refresh_token"><button type="button" class="pw-toggle" onclick="togglePw('new-refresh-token', this)">&#128065;</button></div></div></div></div><label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted);margin:16px 0"><input type="checkbox" id="new-catalog"> Только каталог — без воспроизведения</label><div class="modal-actions"><button type="submit" class="btn btn-primary oauth-only" id="oauthBtn">Подключить через OAuth</button><button type="submit" class="btn btn-primary manual-only">Добавить аккаунт</button><button type="button" class="btn" onclick="closeAddAccount()">Отмена</button></div></form></div>
 <div id="oauthOverlay" class="overlay" onclick="if(event.target===this)closeOAuth()">
 <div class="modal">
 <h3>Авторизация через Tidal</h3>
@@ -635,7 +682,22 @@ function toggleSidebar(open) {
     document.getElementById('sidebarScrim').classList.toggle('open', !!open);
 }
 
-function openAddAccount() { document.getElementById('addAccountOverlay').classList.add('open'); setTimeout(function(){ document.getElementById('new-label').focus(); }, 100); }
+// OAuth is the default; manual entry is only for credentials that already exist.
+function setAddAccountMode(mode) {
+    var manual = mode === 'manual';
+    document.getElementById('addAccountOverlay').dataset.mode = manual ? 'manual' : 'oauth';
+    document.getElementById('addModeOauth').setAttribute('aria-selected', String(!manual));
+    document.getElementById('addModeManual').setAttribute('aria-selected', String(manual));
+}
+function submitAddAccount() {
+    if (document.getElementById('addAccountOverlay').dataset.mode === 'manual') addAccount();
+    else startOAuth();
+}
+function openAddAccount(mode) {
+    setAddAccountMode(mode);
+    document.getElementById('addAccountOverlay').classList.add('open');
+    setTimeout(function(){ document.getElementById(mode === 'manual' ? 'new-client-id' : 'new-label').focus(); }, 100);
+}
 function closeAddAccount() { document.getElementById('addAccountOverlay').classList.remove('open'); }
 
 function filterAccounts(query) {
@@ -729,66 +791,203 @@ function uptimeDuration(seconds) {
     return parts.join(' ');
 }
 
-function uptimeCard(uptime) {
+var uptimeRanges = [[86400, '24 ч'], [3 * 86400, '3 дня'], [7 * 86400, '7 дней']];
+var uptimeRange = 7 * 86400;
+try { uptimeRange = Number(localStorage.getItem('hifi_uptime_range')) || uptimeRange; } catch (_) {}
+var uptimeLabels = {up: 'Токен действует', waiting: 'Без токена', down: 'Аккаунт отключён', unknown: 'Нет данных'};
+
+function setUptimeRange(seconds) {
+    uptimeRange = seconds;
+    try { localStorage.setItem('hifi_uptime_range', String(seconds)); } catch (_) {}
+    refreshUptimeCharts();
+}
+
+function uptimeLocale() { return adminLanguage === 'ru' ? 'ru-RU' : 'en-GB'; }
+function uptimeDay(ts) { return new Date(ts * 1000).toLocaleDateString(uptimeLocale(), {day:'numeric', month:'short'}); }
+function uptimeClock(ts) { return new Date(ts * 1000).toLocaleTimeString(uptimeLocale(), {hour:'2-digit', minute:'2-digit'}); }
+function uptimePeriod(from, to) {
+    return uptimeDay(from) + ', ' + uptimeClock(from) + ' — ' + (uptimeDay(to) === uptimeDay(from) ? '' : uptimeDay(to) + ', ') + uptimeClock(to);
+}
+
+// Local midnights (or every 6 hours for a single day) between start and end.
+function uptimeTicks(start, end) {
+    var ticks = [], d = new Date(start * 1000);
+    var daily = end - start > 36 * 3600;
+    d.setMinutes(0, 0, 0);
+    if (daily) d.setHours(0); else d.setHours(Math.floor(d.getHours() / 6) * 6);
+    while (d.getTime() / 1000 < end) {
+        ticks.push(d.getTime() / 1000);
+        if (daily) d.setDate(d.getDate() + 1); else d.setHours(d.getHours() + 6);
+    }
+    return {daily: daily, ticks: ticks};
+}
+
+// A real timeline: every segment sits at its own time, so short outages and
+// their timing read directly. Hovering shows the exact interval.
+function uptimeCard(uptime, accountId) {
     if (!uptime) return '';
-    var span = uptime.window_end - uptime.window_start;
+    var end = uptime.window_end, start = Math.max(uptime.window_start, end - uptimeRange), span = end - start;
     if (!(span > 0)) return '';
-    var locale = adminLanguage === 'ru' ? 'ru-RU' : 'en-GB';
-    var labels = [tr('Нет данных'), tr('Токен действует'), tr('Аккаунт отключён'), tr('Без токена')];
-    var classes = ['uptime-unknown', 'uptime-up', 'uptime-down', 'uptime-waiting'];
-    // Bottom to top, the same in every bar: the valid-token share always
-    // grows from the baseline, so the strip reads as one chart.
-    var order = [1, 3, 2, 0];
-    var segments = uptime.segments || [];
-    var chart = '';
-    function day(ts) { return new Date(ts * 1000).toLocaleDateString(locale, {day:'numeric', month:'short'}); }
-    function clock(ts) { return new Date(ts * 1000).toLocaleTimeString(locale, {hour:'2-digit', minute:'2-digit'}); }
-    function range(from, to) {
-        return day(from) + ', ' + clock(from) + ' — ' + (day(to) === day(from) ? '' : day(to) + ', ') + clock(to);
-    }
-    var barCount = 60;
-    for (var bar = 0; bar < barCount; bar++) {
-        var start = uptime.window_start + bar * span / barCount;
-        var end = uptime.window_start + (bar + 1) * span / barCount;
-        var totals = [0, 0, 0, 0];
-        segments.forEach(function(segment) {
-            var from = Math.max(start, segment.start), to = Math.min(end, segment.end);
-            if (to <= from) return;
-            var kind = segment.status === 'waiting' ? 3 : (segment.active == null ? 0 : (segment.active ? 1 : 2));
-            totals[kind] += to - from;
-        });
-        var spans = '', tip = range(start, end);
-        order.forEach(function(kind) {
-            if (!totals[kind]) return;
-            spans += '<span class="uptime-span ' + classes[kind] + '" style="height:' + (totals[kind] * 100 / (end - start)) + '%"></span>';
-            tip += '\n' + labels[kind] + ': ' + uptimeDuration(totals[kind]);
-        });
-        // Keep the tooltip inside the card at both ends of the strip.
-        var edge = bar < barCount / 3 ? ' data-edge="start"' : (bar >= barCount * 2 / 3 ? ' data-edge="end"' : '');
-        chart += '<div class="uptime-bar" tabindex="0" role="img" aria-label="' + esc(tip) + '" data-tip="' + esc(tip) + '"' + edge + '><div class="uptime-stack">' + spans + '</div></div>';
-    }
-    var percentage = uptime.percentage == null ? '—' : Number(uptime.percentage).toLocaleString(locale, {minimumFractionDigits:2, maximumFractionDigits:2}) + '%';
-    var totalsHtml = '';
-    order.forEach(function(kind) {
-        var seconds = [uptime.unknown_seconds, uptime.up_seconds, uptime.down_seconds, uptime.waiting_seconds || 0][kind];
-        if (kind !== 1 && !seconds) return;
-        totalsHtml += '<span><i class="uptime-key ' + classes[kind] + '" aria-hidden="true"></i>' + labels[kind] + ' <strong>' + esc(uptimeDuration(seconds)) + '</strong></span>';
+    function pos(ts) { return ((ts - start) * 100 / span).toFixed(3); }
+    var totals = {up: 0, waiting: 0, down: 0, unknown: 0}, base = '', marks = '', outages = 0, previous = null;
+    (uptime.segments || []).forEach(function(segment) {
+        var from = Math.max(start, segment.start), to = Math.min(end, segment.end);
+        if (to <= from) return;
+        var kind = segment.status || 'unknown';
+        totals[kind] += to - from;
+        var html = '<i class="uptime-seg uptime-' + kind + '" style="left:' + pos(from) + '%;width:' + pos(start + to - from) + '%"></i>';
+        // Problems are drawn last with a minimum width, so even a minute stays visible.
+        if (kind === 'waiting' || kind === 'down') {
+            marks += html;
+            if (previous !== 'waiting' && previous !== 'down') outages++;
+        } else base += html;
+        previous = kind;
     });
+    var axis = uptimeTicks(start, end), grid = '', labels = '';
+    axis.ticks.forEach(function(tick, i) {
+        if (tick > start) grid += '<i class="uptime-grid" style="left:' + pos(tick) + '%"></i>';
+        if (axis.daily) {
+            var from = Math.max(tick, start), to = Math.min(axis.ticks[i + 1] || end, end);
+            if (to - from > span * 0.07) labels += '<span style="left:' + pos((from + to) / 2) + '%">' + esc(uptimeDay(tick)) + '</span>';
+        } else if (tick > start + span * 0.04 && tick < end - span * 0.04) {
+            labels += '<span style="left:' + pos(tick) + '%">' + esc(uptimeClock(tick)) + '</span>';
+        }
+    });
+    var known = totals.up + totals.waiting + totals.down;
+    var percentage = known ? Number(totals.up * 100 / known).toLocaleString(uptimeLocale(), {minimumFractionDigits:1, maximumFractionDigits:1}) + '%' : '—';
+    var tone = !known ? '' : (totals.up / known >= 0.95 ? ' good' : (totals.up / known >= 0.7 ? ' warn' : ' bad'));
+    var tabs = uptimeRanges.map(function(range) {
+        return '<button type="button" aria-pressed="' + (range[0] === uptimeRange) + '" onclick="setUptimeRange(' + range[0] + ')">' + tr(range[1]) + '</button>';
+    }).join('');
+    var legend = ['up', 'waiting', 'down', 'unknown'].map(function(kind) {
+        if (kind !== 'up' && !totals[kind]) return '';
+        return '<span><i class="uptime-key uptime-' + kind + '" aria-hidden="true"></i>' + tr(uptimeLabels[kind]) + ' <strong>' + esc(uptimeDuration(totals[kind])) + '</strong></span>';
+    }).join('') + (outages ? '<span title="' + esc(tr('Сколько раз аккаунт переставал быть готовым')) + '">' + tr('Перерывов') + ' <strong>' + outages + '</strong></span>' : '');
     var current = uptime.current_status === 'waiting'
         ? '<span class="uptime-current">' + tr('Нет действующего токена') + '</span>' : '';
-    return '<div class="uptime-heading"><strong>' + tr('Аптайм · последние 7 дней') + '</strong>' + current +
-        '<span class="uptime-score" title="' + esc(tr('Процент за период с известным статусом')) + '">' + tr('Доступность токена') + '<strong>' + percentage + '</strong></span></div>' +
-        '<div class="uptime-chart">' + chart + '</div>' +
-        '<div class="uptime-axis"><span>' + tr('7 дней назад') + '</span><span>' + tr('Сейчас') + '</span></div>' +
-        '<div class="uptime-totals">' + totalsHtml + '</div>' +
-        (uptime.unknown_seconds > 0 ? '<p class="uptime-note">' + tr('До начала наблюдения история недоступна.') + '</p>' : '');
+    var summary = tr('Доступность токена') + ' ' + percentage;
+    return '<div class="uptime-heading"><strong>' + tr('Аптайм') + '</strong><span class="uptime-tabs">' + tabs + '</span>' + current +
+        '<span class="uptime-score' + tone + '" title="' + esc(tr('Процент за период с известным статусом')) + '">' + tr('Доступность токена') + '<strong>' + percentage + '</strong></span></div>' +
+        '<div class="uptime-track" role="img" aria-label="' + esc(summary) + '" data-start="' + start + '" data-end="' + end + '" data-account="' + esc(accountId || '') + '" onmousemove="uptimeHover(event, this)" onmouseleave="uptimeHoverEnd(this)">' +
+            '<div class="uptime-bars">' + base + marks + grid + '</div><i class="uptime-cursor"></i><div class="uptime-tip"></div></div>' +
+        '<div class="uptime-labels">' + labels + '</div>' +
+        '<div class="uptime-totals">' + legend + '</div>' +
+        (totals.unknown > 0 ? '<p class="uptime-note">' + tr('До начала наблюдения история недоступна.') + '</p>' : '');
+}
+
+function uptimeHover(event, track) {
+    var account = (window._accounts || []).find(function(a) { return a.id === track.dataset.account; });
+    if (!account || !account.uptime) return;
+    var rect = track.getBoundingClientRect(), x = Math.min(Math.max(event.clientX - rect.left, 0), rect.width);
+    var start = Number(track.dataset.start), end = Number(track.dataset.end), perPixel = (end - start) / rect.width;
+    var t = start + x * perPixel, hit = null;
+    // Prefer a problem segment under the cursor: they are drawn wider than their real length.
+    (account.uptime.segments || []).forEach(function(segment) {
+        var problem = segment.status === 'waiting' || segment.status === 'down';
+        var slack = problem ? 3 * perPixel : 0;
+        if (segment.start - slack <= t && t < segment.end + slack && (!hit || problem)) hit = segment;
+    });
+    if (!hit) return;
+    var kind = hit.status || 'unknown', from = Math.max(hit.start, start), to = Math.min(hit.end, end);
+    var tip = track.querySelector('.uptime-tip'), cursor = track.querySelector('.uptime-cursor');
+    tip.innerHTML = '<b class="uptime-tip-' + kind + '">' + esc(tr(uptimeLabels[kind])) + '</b><span>' + esc(uptimePeriod(from, to)) + '</span><span>' +
+        esc(uptimeDuration(to - from)) + (to >= end ? ' · ' + esc(tr('до сих пор')) : '') + '</span>';
+    tip.style.left = x + 'px';
+    tip.dataset.edge = x < 120 ? 'start' : (x > rect.width - 120 ? 'end' : '');
+    cursor.style.left = x + 'px';
+    track.classList.add('hover');
+}
+
+function uptimeHoverEnd(track) { track.classList.remove('hover'); }
+
+// Ready = enabled with a valid token, from the uptime history of playback
+// accounts (catalog-only ones are left out). Per local calendar day: the
+// lowest and highest number of ready accounts and the time-weighted mean.
+function readyDayStats(accounts, dayStart, dayEnd) {
+    var events = [];
+    accounts.forEach(function(account) {
+        ((account.uptime || {}).segments || []).forEach(function(segment) {
+            var from = Math.max(dayStart, segment.start), to = Math.min(dayEnd, segment.end);
+            if (to <= from || !segment.status) return;
+            events.push([from, segment.status === 'up' ? 1 : 0, 1], [to, segment.status === 'up' ? -1 : 0, -1]);
+        });
+    });
+    events.sort(function(a, b) { return a[0] - b[0]; });
+    var ready = 0, known = 0, stats = {min: null, max: null, minAt: null, maxAt: null, sum: 0, observed: 0, series: []};
+    for (var i = 0; i < events.length; i++) {
+        ready += events[i][1]; known += events[i][2];
+        var at = events[i][0];
+        if (i + 1 < events.length && events[i + 1][0] === at) continue;
+        var next = i + 1 < events.length ? events[i + 1][0] : at;
+        stats.series.push([at, known > 0 ? ready : null]);
+        if (known <= 0 || next <= at) continue;
+        if (stats.min == null || ready < stats.min) { stats.min = ready; stats.minAt = at; }
+        if (stats.max == null || ready > stats.max) { stats.max = ready; stats.maxAt = at; }
+        stats.sum += ready * (next - at);
+        stats.observed += next - at;
+    }
+    stats.avg = stats.observed ? stats.sum / stats.observed : null;
+    return stats;
+}
+
+function readySparkline(series, dayStart, top) {
+    var width = 288, height = 40, path = '', area = '', open = false, last = null;
+    function x(ts) { return ((ts - dayStart) * width / 86400).toFixed(2); }
+    function y(n) { return (height - 2 - n * (height - 4) / Math.max(top, 1)).toFixed(2); }
+    series.forEach(function(point) {
+        if (point[1] == null) {
+            if (open) { path += 'H' + x(point[0]); area += 'H' + x(point[0]) + 'V' + height + 'Z'; }
+            open = false; return;
+        }
+        if (!open) { path += 'M' + x(point[0]) + ' ' + y(point[1]); area += 'M' + x(point[0]) + ' ' + height + 'V' + y(point[1]); open = true; }
+        else { path += 'H' + x(point[0]) + 'V' + y(point[1]); area += 'H' + x(point[0]) + 'V' + y(point[1]); }
+        last = point;
+    });
+    var grid = [6, 12, 18].map(function(h) { return '<line x1="' + (h * width / 24) + '" x2="' + (h * width / 24) + '" y1="0" y2="' + height + '"></line>'; }).join('');
+    return '<svg class="ready-spark" viewBox="0 0 ' + width + ' ' + height + '" preserveAspectRatio="none" aria-hidden="true"><g class="ready-grid">' + grid + '</g>' +
+        '<path class="ready-area" d="' + area + '"></path><path class="ready-line" d="' + path + '"></path></svg>';
+}
+
+function readyHistoryCard(accounts) {
+    var playback = (accounts || []).filter(function(a) { return !a.is_catalog && a.uptime; });
+    if (!playback.length) return '';
+    var now = Math.max.apply(null, playback.map(function(a) { return a.uptime.window_end; }));
+    var today = new Date(now * 1000); today.setHours(0, 0, 0, 0);
+    var locale = uptimeLocale(), cards = '';
+    for (var back = 0; back < 3; back++) {
+        var from = new Date(today); from.setDate(from.getDate() - back);
+        var to = new Date(from); to.setDate(to.getDate() + 1);
+        var dayStart = from.getTime() / 1000, dayEnd = Math.min(to.getTime() / 1000, now);
+        var stats = readyDayStats(playback, dayStart, dayEnd);
+        var name = back === 0 ? tr('Сегодня') : (back === 1 ? tr('Вчера') : from.toLocaleDateString(locale, {weekday:'short'}));
+        var avg = stats.avg == null ? '—' : stats.avg.toLocaleString(locale, {minimumFractionDigits:1, maximumFractionDigits:1});
+        var notes = [];
+        if (stats.min != null) notes.push(tr('мин. в') + ' ' + uptimeClock(stats.minAt), tr('макс. в') + ' ' + uptimeClock(stats.maxAt));
+        var gap = dayEnd - dayStart - stats.observed;
+        if (stats.observed && gap >= 600) notes.push(tr('нет данных') + ' ' + uptimeDuration(gap));
+        cards += '<div class="ready-day">' +
+            '<div class="ready-day-head"><span>' + esc(name) + '</span><span>' + esc(uptimeDay(dayStart)) + (back === 0 ? ' · ' + tr('до') + ' ' + esc(uptimeClock(now)) : '') + '</span></div>' +
+            (stats.observed ? '<div class="ready-nums">' +
+                '<div><small>' + tr('Минимум') + '</small><strong class="ready-min">' + stats.min + '</strong></div>' +
+                '<div><small>' + tr('Среднее') + '</small><strong>' + avg + '</strong></div>' +
+                '<div><small>' + tr('Максимум') + '</small><strong class="ready-max">' + stats.max + '</strong></div></div>' +
+                readySparkline(stats.series, dayStart, playback.length) +
+                '<div class="ready-foot">' + esc(notes.join(' · ')) + '</div>'
+              : '<div class="ready-empty">' + tr('Нет данных за этот день') + '</div>') +
+        '</div>';
+    }
+    return '<div class="ready-history-head"><div><h2>' + tr('Готовые аккаунты по дням') + '</h2><p>' +
+        tr('Аккаунты воспроизведения (без «только каталог»), включённые и с действующим токеном. Всего сейчас:') + ' <strong>' + playback.length + '</strong></p></div></div>' +
+        '<div class="ready-days">' + cards + '</div>';
 }
 
 function refreshUptimeCharts() {
     (window._accounts || []).forEach(function(account) {
         var element = document.getElementById('uptime-' + account.id);
-        if (element) element.innerHTML = uptimeCard(account.uptime);
+        if (element) element.innerHTML = uptimeCard(account.uptime, account.id);
     });
+    var history = document.getElementById('readyHistory');
+    if (history) history.innerHTML = readyHistoryCard(window._accounts);
 }
 
 function metricNumber(value, digits) {
@@ -817,6 +1016,35 @@ function tokenDescription(account) {
     if (status === 'missing') return 'Не получен';
     if (status === 'rejected') return 'Отклонён Tidal';
     return timeStr(account.token_expires_at);
+}
+
+var _subscriptions = {};
+
+// Result of the last manual subscription lookup, kept until the page reloads.
+function subscriptionRow(id) {
+    var result = _subscriptions[id];
+    if (!result) return '';
+    var html;
+    if (result.error) {
+        html = '<span class="sub-bad">' + esc(tr('Не удалось проверить:')) + ' ' + esc(result.error) + '</span>';
+    } else {
+        var body = result.subscription || {};
+        var plan = (body.subscription || {}).type || body.type;
+        var parts = [];
+        if (plan) parts.push('<strong>' + esc(plan) + '</strong>');
+        if (body.status) parts.push('<span class="' + (body.status === 'ACTIVE' ? 'sub-ok' : 'sub-bad') + '">' + esc(body.status) + '</span>');
+        var until = body.validUntil ? Date.parse(String(body.validUntil).replace(/([+-]\d\d)(\d\d)$/, '$1:$2')) : NaN;
+        if (!isNaN(until)) {
+            var date = new Date(until).toLocaleDateString(adminLanguage === 'ru' ? 'ru-RU' : 'en-GB', {day:'numeric', month:'short', year:'numeric'});
+            parts.push('<span class="' + (until < Date.now() ? 'sub-bad' : '') + '">' + esc(tr('до')) + ' ' + esc(date) + '</span>');
+        }
+        if (body.highestSoundQuality) parts.push(esc(body.highestSoundQuality));
+        if (!parts.length) parts.push('<code>' + esc(JSON.stringify(body).slice(0, 200)) + '</code>');
+        html = parts.join(' · ');
+    }
+    var checked = new Date((result.checked_at || Date.now() / 1000) * 1000).toLocaleTimeString(adminLanguage === 'ru' ? 'ru-RU' : 'en-GB', {hour:'2-digit', minute:'2-digit'});
+    return '<div class="cred-row" data-no-i18n><span class="cred-key">' + esc(tr('Подписка')) + '</span><span class="cred-value">' + html +
+        ' <span class="sub-checked">· ' + esc(tr('проверено в')) + ' ' + esc(checked) + '</span></span></div>';
 }
 
 function tokenRefreshDetails(account) {
@@ -878,17 +1106,18 @@ function accountsCard(stats) {
 
 function playbackCard(pb, readiness) {
     pb = pb || {}; readiness = readiness || {};
-    var limit = pb.pool_size || 0, active = pb.active || 0;
+    // `limit` is null when the per-account limit is off; older servers only send pool_size.
+    var unlimited = pb.limit === null, limit = unlimited ? 0 : (pb.limit != null ? pb.limit : (pb.pool_size || 0)), active = pb.active || 0;
     var meter = '<div class="stat-bar stat-meter" aria-hidden="true"><i style="width:' +
         (limit > 0 ? Math.min(100, active * 100 / limit) : 0).toFixed(1) + '%"></i></div>';
-    var rows = [metricRow('Лимит одновременно', esc(metricNumber(pb.pool_size))), metricRow('В очереди', esc(metricNumber(pb.pending)))];
+    var rows = [metricRow('Лимит одновременно', unlimited ? 'без лимита' : esc(metricNumber(limit))), metricRow('В очереди', esc(metricNumber(pb.pending)))];
     if (pb.pending > 0) rows.push(metricRow('Самое долгое ожидание', esc(uptimeDuration(pb.oldest_pending_secs))));
     var note = '';
     if (readiness.enabled === 0) note = '<span>Нет включённых аккаунтов воспроизведения.</span>';
-    else if (limit < readiness.enabled) note = '<span>Обслуживать запросы могут</span> <strong>' + esc(metricNumber(readiness.metadata_ready)) +
+    else if ((pb.pool_size || 0) < readiness.enabled) note = '<span>Обслуживать запросы могут</span> <strong>' + esc(metricNumber(readiness.metadata_ready)) +
         '</strong> <span>из</span> <strong>' + esc(metricNumber(readiness.enabled)) + '</strong> <span>включённых аккаунтов; остальные без токена или на паузе 429.</span>';
     return metricCard('Запросы воспроизведения', esc(metricNumber(pb.active)) + ' <span class="metric-unit">выполняются</span>', [],
-        'Запросы треков, видео и лицензий, выполняемые в момент обновления. Лимит равен числу аккаунтов воспроизведения с действующим токеном и без паузы 429.',
+        'Запросы треков, видео и лицензий, выполняемые в момент обновления. Лимит — число аккаунтов воспроизведения с действующим токеном и без паузы 429, умноженное на число одновременных запросов на аккаунт из настроек.',
         meter + metricRows(rows) + (note ? '<div class="stat-note">' + note + '</div>' : ''));
 }
 
@@ -935,7 +1164,7 @@ function proxyCard(proxy) {
 }
 
 // Stacking order of the per-second chart; the rate table doubles as its legend.
-var rateSeries = [['playback', 'Воспроизведение'], ['search', 'Поиск'], ['catalog', 'Каталог']];
+var rateSeries = [['playback', 'Воспроизведение'], ['search', 'Поиск'], ['catalog', 'Альбомы, артисты…']];
 
 function rateChart(history) {
     if (!history || !history.length) return '';
@@ -959,7 +1188,7 @@ function rateCard(rates, stats) {
     var unit = ' <span class="rate-unit">/с</span>';
     var cells = '<span></span><span class="rate-head">Сейчас</span><span class="rate-head">60 с</span><span class="rate-head">Пик</span>' +
         [['Всего', rates.all, ''], ['Воспроизведение', rates.playback, 'rate-playback'], ['Поиск', rates.search, 'rate-search'],
-            ['Каталог', rates.catalog, 'rate-catalog'], ['Из кэша', rates.cached, 'rate-cached']].map(function(row) {
+            ['Альбомы, артисты…', rates.catalog, 'rate-catalog'], ['Из кэша', rates.cached, 'rate-cached']].map(function(row) {
             var rate = row[1] || {};
             return '<span>' + (row[2] ? '<i class="rate-key ' + row[2] + '" aria-hidden="true"></i>' : '') + esc(row[0]) + '</span><strong>' +
                 esc(metricNumber(rate.now, 2)) + '</strong><strong>' + esc(metricNumber(rate.avg_60s, 2)) + '</strong><strong>' +
@@ -1339,6 +1568,7 @@ async function fetchData() {
                         '<div class="card-actions">' +
                             '<button class="btn" onclick="refreshAccount(\'' + a.id + '\')">Обновить токен</button>' +
                             '<button class="btn" onclick="checkPremium(\'' + a.id + '\')" title="Проверка FULL/PREVIEW отправляет до четырёх запросов к Tidal">Проверить FULL</button>' +
+                            '<button class="btn" onclick="checkSubscription(\'' + a.id + '\')" title="Запрашивает у Tidal тариф и срок подписки">Подписка</button>' +
                             '<button class="btn" onclick="openEdit(\'' + a.id + '\')">Изменить</button>' +
                             '<button class="btn" onclick="duplicateAccount(\'' + a.id + '\')">Дублировать</button>' +
                             catalogBtn +
@@ -1349,9 +1579,9 @@ async function fetchData() {
                     '<div class="card-body">' +
                         '<div class="cred-row"><span class="cred-key">CLIENT_ID</span><span class="cred-value">' + esc(a.client_id) + '</span></div>' +
                         '<div class="cred-row"><span class="cred-key">USER_ID</span><span class="cred-value">' + esc(uid) + '</span></div>' +
-                        '<div class="cred-row"><span class="cred-key">Роль</span><span class="cred-value">' + (a.is_catalog ? 'Только каталог' : 'Воспроизведение') + '</span></div>' + tokenRefreshDetails(a) +
+                        '<div class="cred-row"><span class="cred-key">Роль</span><span class="cred-value">' + (a.is_catalog ? 'Только каталог' : 'Воспроизведение') + '</span></div>' + subscriptionRow(a.id) + tokenRefreshDetails(a) +
                     '</div>' +
-                    '<div class="account-uptime" data-no-i18n id="uptime-' + esc(a.id) + '">' + uptimeCard(a.uptime) + '</div>' +
+                    '<div class="account-uptime" data-no-i18n id="uptime-' + esc(a.id) + '">' + uptimeCard(a.uptime, a.id) + '</div>' +
                     '<div class="card-footer">' +
                         '<div class="card-stats">' +
                             '<span class="card-stat" title="Обращения к этому аккаунту с запуска сервера, включая повторы для одного API-запроса">Обращений с запуска <strong>' + metricNumber(a.request_count) + '</strong></span>' +
@@ -1369,6 +1599,7 @@ async function fetchData() {
             }
         }
         document.getElementById('accounts-container').innerHTML = html;
+        document.getElementById('readyHistory').innerHTML = readyHistoryCard(accounts.accounts);
         var liveAccounts = Number(stats.live_accounts || 0);
         var totalAccounts = Number(stats.total_accounts || accounts.accounts.length || 0);
         document.getElementById('accountCount').innerHTML = '<span class="status-dot ' + (liveAccounts > 0 ? 'status-ok' : (totalAccounts > 0 ? 'status-warn' : 'status-unknown')) + '"></span><span>Готовы сейчас</span><strong>' + metricNumber(liveAccounts) + ' <span>из</span> ' + metricNumber(totalAccounts) + '</strong>';
@@ -1423,6 +1654,19 @@ async function checkPremium(id) {
     }
 }
 
+async function checkSubscription(id) {
+    try {
+        var res = await fetch('/admin/accounts/' + id + '/subscription', { method: 'POST', headers: headers() });
+        var data = await res.json();
+        if (!res.ok) throw new Error(data.detail || 'HTTP ' + res.status);
+        _subscriptions[id] = data;
+    } catch(e) {
+        _subscriptions[id] = { error: e.message, checked_at: Date.now() / 1000 };
+        document.getElementById('error').textContent = tr('Проверка подписки:') + ' ' + e.message;
+    }
+    fetchData();
+}
+
 async function toggleAccount(id, active) {
     try {
         var res = await fetch('/admin/accounts/' + id + '/toggle', {
@@ -1468,7 +1712,7 @@ function duplicateAccount(id) {
     document.getElementById('new-client-secret').value = a.client_secret || '';
     document.getElementById('new-refresh-token').value = a.refresh_token || '';
     document.getElementById('new-catalog').checked = !!a.is_catalog;
-    openAddAccount();
+    openAddAccount('manual');
 }
 
 async function addAccount() {
@@ -1520,7 +1764,8 @@ function startOAuth() {
     closeAddAccount();
     document.getElementById('oauthOverlay').classList.add('open');
     var lbl = (document.getElementById('new-label').value || '').trim();
-    fetch('/admin/setup', { method: 'POST', headers: headers(), body: JSON.stringify({ label: lbl || null }) })
+    var catalog = document.getElementById('new-catalog').checked;
+    fetch('/admin/setup', { method: 'POST', headers: headers(), body: JSON.stringify({ label: lbl || null, catalog: catalog }) })
         .then(function(r) {
             if (!r.ok) throw new Error('HTTP ' + r.status);
             return r.json();
@@ -1556,6 +1801,8 @@ function pollOAuth() {
             if (data.status === 'complete') {
                 document.getElementById('oauthStatus').textContent = 'Аккаунт «' + data.label + '» добавлен.';
                 if (oauthPollInterval) { clearInterval(oauthPollInterval); oauthPollInterval = null; }
+                document.getElementById('new-label').value = '';
+                document.getElementById('new-catalog').checked = false;
                 setTimeout(function() { closeOAuth(); fetchData().then(loadProxyStatus); }, 1500);
             } else if (data.status === 'error') {
                 document.getElementById('oauthStatus').textContent = 'Error: ' + data.error;
@@ -2109,6 +2356,12 @@ async function updateProxies(enabled, toggled) {
 function toggleProxies() { updateProxies(!proxyEnabled, true); }
 function saveProxyList() { updateProxies(proxyEnabled, false); }
 
+// 0 is a real value here (no limit, no pause), so it must not fall back to the default.
+function fillPlaybackLimits(r) {
+    document.getElementById('rl-track-concurrency').value = r.track_concurrency_per_account != null ? r.track_concurrency_per_account : 1;
+    document.getElementById('rl-track-delay').value = r.track_request_delay_ms != null ? r.track_request_delay_ms : 0;
+}
+
 async function loadSettings() {
     try {
         var res = await fetch('/admin/settings', { headers: headers() });
@@ -2116,6 +2369,7 @@ async function loadSettings() {
         var d = await res.json();
         var r = d.settings || d.rate_limits || {};
         document.getElementById('rl-atmos').value = r.atmos_mode || 'off';
+        fillPlaybackLimits(r);
         document.getElementById('rl-track-requests').value = r.track_requests_per_account || 1;
         document.getElementById('rl-catalog-requests').value = r.catalog_requests_per_account || 1;
         document.getElementById('rl-catalog-concurrency').value = r.catalog_concurrency_per_account || 0;
@@ -2160,7 +2414,9 @@ async function saveSettings() {
             atmos_mode: document.getElementById('rl-atmos').value,
             track_requests_per_account: Number(document.getElementById('rl-track-requests').value || 1),
             catalog_requests_per_account: Number(document.getElementById('rl-catalog-requests').value || 1),
-            catalog_concurrency_per_account: Number(document.getElementById('rl-catalog-concurrency').value || 0)
+            catalog_concurrency_per_account: Number(document.getElementById('rl-catalog-concurrency').value || 0),
+            track_concurrency_per_account: Number(document.getElementById('rl-track-concurrency').value || 0),
+            track_request_delay_ms: Number(document.getElementById('rl-track-delay').value || 0)
         }
     };
     try {
@@ -2172,6 +2428,7 @@ async function saveSettings() {
             var d = await res.json();
             var r = d.settings || d.rate_limits || {};
             document.getElementById('rl-atmos').value = r.atmos_mode || 'off';
+            fillPlaybackLimits(r);
             document.getElementById('rl-track-requests').value = r.track_requests_per_account || 1;
             document.getElementById('rl-catalog-requests').value = r.catalog_requests_per_account || 1;
             document.getElementById('rl-catalog-concurrency').value = r.catalog_concurrency_per_account || 0;

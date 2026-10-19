@@ -60,14 +60,14 @@ for (const language of ['en', 'ru']) {
         assert.match(html, new RegExp('class="value">' + n('7.40') + ' <span class="metric-unit">' + (language === 'en' ? 'now' : 'сейчас') + '<'));
         assert.ok(html.includes('<span class="rate-head">' + (language === 'en' ? 'Peak' : 'Пик') + '</span>'));
         for (const [en, ru, now, avg, peak] of [['Total', 'Всего', '7.40', '6.15', '12'], ['Playback', 'Воспроизведение', '2.20', '1.75', '3'], ['Search', 'Поиск', '4.00', '3.50', '6'],
-            ['Catalog', 'Каталог', '1.20', '0.90', '4'], ['From cache', 'Из кэша', '0.60', '0.50', language === 'en' ? '1,234' : '1\u00a0234']]) {
+            ['Albums, artists…', 'Альбомы, артисты…', '1.20', '0.90', '4'], ['From cache', 'Из кэша', '0.60', '0.50', language === 'en' ? '1,234' : '1\u00a0234']]) {
             assert.ok(html.includes('>' + (language === 'en' ? en : ru) + '</span><strong>' + n(now) + '</strong><strong>' + n(avg) + '</strong><strong>' + peak + '</strong>'), en);
         }
         // One bar per second, scaled to the busiest one; each class keeps its own colour and the tooltip spells it out.
         assert.equal((html.match(/class="rate-bar"/g) || []).length, 60);
         assert.match(html, /<i class="rate-playback" style="height:16\.7%"><\/i><i class="rate-search" style="height:50\.0%"><\/i><i class="rate-catalog" style="height:33\.3%"><\/i>/);
         assert.match(html, /<i class="rate-playback" style="height:25\.0%"><\/i><\/div>/);
-        assert.ok(html.includes(language === 'en' ? 'data-tip="1 s ago\nPlayback: 2\nSearch: 6\nCatalog: 4" data-edge="end"' : 'data-tip="1 с назад\nВоспроизведение: 2\nПоиск: 6\nКаталог: 4" data-edge="end"'));
+        assert.ok(html.includes(language === 'en' ? 'data-tip="1 s ago\nPlayback: 2\nSearch: 6\nAlbums, artists…: 4" data-edge="end"' : 'data-tip="1 с назад\nВоспроизведение: 2\nПоиск: 6\nАльбомы, артисты…: 4" data-edge="end"'));
         // Limits: the load each serving account carries, and Tidal's throttling.
         const unit = ' <span class="rate-unit">' + (language === 'en' ? '/s' : '/с') + '</span></strong>';
         assert.ok(html.includes((language === 'en' ? 'Playback per account' : 'Воспроизведение на один аккаунт') + '</span><strong>' + n('0.25') + unit));
@@ -200,6 +200,21 @@ test('cache card shows the hit rate, and a dash before any lookup', async () => 
     assert.equal(elements.get('cc-rate').textContent, '—');
 });
 
+for (const language of ['en', 'ru']) {
+    test(`playback limit is accounts times the per-account limit, or none (${language})`, () => {
+        const { ctx } = context(language);
+        const card = playback => localized(ctx, vm.runInContext('playbackCard(' + JSON.stringify(playback) + ', { enabled: 7 })', ctx));
+        const label = language === 'en' ? 'Concurrent request limit' : 'Лимит одновременно';
+        assert.ok(card({ active: 7, pending: 0, pool_size: 7, limit: 14 }).includes(label + '</span><strong>14<'));
+        assert.match(card({ active: 7, pending: 0, pool_size: 7, limit: 14 }), /width:50\.0%/);
+        const unlimited = card({ active: 3, pending: 0, pool_size: 7, limit: null });
+        assert.ok(unlimited.includes(label + '</span><strong>' + (language === 'en' ? 'no limit' : 'без лимита') + '<'));
+        assert.doesNotMatch(unlimited, /undefined|NaN/);
+        // Older servers send only the account count.
+        assert.ok(card({ active: 0, pending: 0, pool_size: 5 }).includes(label + '</span><strong>5<'));
+    });
+}
+
 test('uptime reset is sent only after confirmation and then reloads accounts', async () => {
     const { ctx, elements } = context();
     const calls = [];
@@ -224,8 +239,9 @@ test('uptime reset is sent only after confirmation and then reloads accounts', a
 });
 
 for (const language of ['en', 'ru']) {
-    test(`uptime is one strip and retains mixed states within each bar (${language})`, () => {
+    test(`uptime is a timeline with each state at its own time (${language})`, () => {
         const { ctx } = context(language);
+        ctx.uptimeRange = 7 * 86400;
         ctx.uptime = { window_start: 0, window_end: 6000, percentage: 50,
             up_seconds: 2950, down_seconds: 50, waiting_seconds: 100, unknown_seconds: 2900,
             segments: [
@@ -235,16 +251,65 @@ for (const language of ['en', 'ru']) {
                 { start: 3050, end: 3100, active: false, status: 'down' },
                 { start: 3100, end: 6000, active: true, status: 'up' },
             ] };
-        const html = vm.runInContext('uptimeCard(uptime)', ctx);
-        assert.equal((html.match(/class="uptime-bar"/g) || []).length, 60);
-        assert.doesNotMatch(html, /uptime-day|uptime-dates|undefined|NaN/);
-        assert.match(html, /uptime-span uptime-up" style="height:50%/);
-        assert.match(html, /uptime-span uptime-waiting" style="height:50%/);
-        assert.match(html, /uptime-span uptime-down" style="height:50%/);
-        // Every bar stacks in the same order, so the valid-token share reads as one chart.
-        assert.match(html, /uptime-up" style="height:50%"><\/span><span class="uptime-span uptime-waiting"/);
-        assert.match(html, /uptime-waiting" style="height:50%"><\/span><span class="uptime-span uptime-down"/);
+        const html = vm.runInContext('uptimeCard(uptime, "acc-1")', ctx);
+        assert.doesNotMatch(html, /undefined|NaN/);
+        assert.equal((html.match(/class="uptime-seg /g) || []).length, 5);
+        // Positions are shares of the window; problems come after the green spans so they stay on top.
+        assert.match(html, /uptime-seg uptime-waiting" style="left:49\.167%;width:1\.667%"/);
+        assert.match(html, /uptime-seg uptime-up" style="left:51\.667%;width:48\.333%"[^]*uptime-seg uptime-waiting/);
+        assert.match(html, /data-account="acc-1"/);
+        assert.equal((html.match(/aria-pressed="true"/g) || []).length, 1);
+        // Availability counts only observed time: 2950 of 3100 seconds.
+        assert.match(html, language === 'en' ? /Token availability<strong>95\.2%/ : /Доступность токена<strong>95,2%/);
+        assert.match(html, language === 'en' ? /Outages <strong>1</ : /Перерывов <strong>1</);
         if (language === 'en') assert.doesNotMatch(html, /[А-Яа-яЁё]/);
+        // The shorter range only keeps what falls inside it.
+        ctx.uptimeRange = 86400;
+        assert.match(vm.runInContext('uptimeCard(uptime, "acc-1")', ctx), /aria-pressed="true" onclick="setUptimeRange\(86400\)"/);
+    });
+
+    test(`daily ready stats skip catalog accounts and unknown time (${language})`, () => {
+        const { ctx } = context(language);
+        const day = new Date(2026, 9, 19); const start = day.getTime() / 1000;
+        const now = start + 12 * 3600;
+        const uptime = segments => ({ window_start: now - 7 * 86400, window_end: now, segments });
+        ctx.accounts = [
+            { id: 'a', is_catalog: false, uptime: uptime([{ start: start - 86400, end: now, status: 'up' }]) },
+            { id: 'b', is_catalog: false, uptime: uptime([{ start: start - 86400, end: start + 3 * 3600, status: 'up' },
+                { start: start + 3 * 3600, end: start + 6 * 3600, status: 'waiting' }, { start: start + 6 * 3600, end: now, status: 'up' }]) },
+            { id: 'c', is_catalog: false, uptime: uptime([{ start: now - 7 * 86400, end: start + 9 * 3600, status: null },
+                { start: start + 9 * 3600, end: now, status: 'up' }]) },
+            { id: 'cat', is_catalog: true, uptime: uptime([{ start: start - 86400, end: now, status: 'up' }]) },
+        ];
+        const stats = vm.runInContext('readyDayStats(accounts.filter(a => !a.is_catalog), ' + start + ', ' + now + ')', ctx);
+        assert.equal(stats.min, 1);
+        assert.equal(stats.max, 3);
+        assert.equal(stats.minAt, start + 3 * 3600);
+        // (3h×2 + 3h×1 + 3h×2 + 3h×3) / 12h
+        assert.equal(stats.avg, 2);
+        const html = vm.runInContext('readyHistoryCard(accounts)', ctx);
+        assert.equal((html.match(/class="ready-day"/g) || []).length, 3);
+        assert.match(html, /class="ready-min">1<[^]*class="ready-max">3</);
+        assert.match(html, /<strong>3<\/strong><\/p>/);
+        assert.doesNotMatch(html, /undefined|NaN/);
+        if (language === 'en') assert.doesNotMatch(html, /[А-Яа-яЁё]/);
+    });
+
+    test(`subscription row shows plan, status and expiry, safely escaped (${language})`, () => {
+        const { ctx } = context(language);
+        assert.equal(vm.runInContext('subscriptionRow("a")', ctx), '');
+        vm.runInContext('_subscriptions.a = ' + JSON.stringify({ checked_at: 1760000000, subscription:
+            { subscription: { type: 'HIFI' }, status: 'ACTIVE', validUntil: '2099-11-12T10:00:00.000+0000', highestSoundQuality: 'HI_RES_LOSSLESS' } }), ctx);
+        const html = vm.runInContext('subscriptionRow("a")', ctx);
+        assert.match(html, /<strong>HIFI<\/strong> · <span class="sub-ok">ACTIVE<\/span> · <span class="">[^<]*2099[^<]*<\/span> · HI_RES_LOSSLESS/);
+        assert.match(html, language === 'en' ? /Subscription/ : /Подписка/);
+        vm.runInContext('_subscriptions.a = ' + JSON.stringify({ subscription: { status: 'CANCELLED', validUntil: '2001-01-01T00:00:00.000+0000' } }), ctx);
+        assert.match(vm.runInContext('subscriptionRow("a")', ctx), /sub-bad">CANCELLED<[^]*sub-bad">[^<]*2001[^<]*</);
+        vm.runInContext('_subscriptions.a = { error: "Tidal HTTP 403: <b>x</b>" }', ctx);
+        const failed = vm.runInContext('subscriptionRow("a")', ctx);
+        assert.match(failed, /&lt;b&gt;/);
+        assert.doesNotMatch(failed, /undefined|NaN|<b>/);
+        if (language === 'en') assert.doesNotMatch(html + failed, /[А-Яа-яЁё]/);
     });
 
     test(`expired token shows the refresh failure, safely escaped (${language})`, () => {

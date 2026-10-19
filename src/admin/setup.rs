@@ -100,12 +100,16 @@ struct UserInfo {
 #[derive(Deserialize, Default)]
 pub struct StartSetupRequest {
     pub label: Option<String>,
+    /// When true, the new account serves metadata only.
+    #[serde(default)]
+    pub catalog: bool,
 }
 
 pub async fn start_setup(
     State(state): State<AppState>,
     body: Option<Json<StartSetupRequest>>,
 ) -> Result<Json<Value>, AppError> {
+    let catalog = body.as_ref().is_some_and(|b| b.catalog);
     let custom_label = body
         .and_then(|b| b.label.clone())
         .map(|s| s.trim().to_string())
@@ -240,6 +244,11 @@ pub async fn start_setup(
                 .await
             {
                 Ok(acc) => {
+                    if catalog {
+                        if let Err(e) = am.set_account_catalog(&acc.id, true).await {
+                            tracing::warn!("Could not mark {} as catalog-only: {}", user_id, e);
+                        }
+                    }
                     if let Err(e) = am
                         .store_refreshed_credentials(
                             &acc,

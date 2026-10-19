@@ -72,6 +72,11 @@ pub struct AccountState {
     pub catalog_inflight: AtomicUsize,
     /// Playback requests this account is serving right now.
     pub playback_inflight: AtomicUsize,
+    /// Metadata requests this playback account is serving right now.
+    pub metadata_inflight: AtomicUsize,
+    /// Unix milliseconds until which this playback account rests after its
+    /// last request (`track_request_delay_ms`).
+    pub rest_until_ms: AtomicI64,
     /// Selections counted for balancing. Unlike `request_count` it is
     /// levelled with the pool when the account (re)joins, so a new or
     /// returning account is not handed every request until it catches up.
@@ -134,6 +139,8 @@ impl AccountState {
             error_count: AtomicU64::new(0),
             catalog_inflight: AtomicUsize::new(0),
             playback_inflight: AtomicUsize::new(0),
+            metadata_inflight: AtomicUsize::new(0),
+            rest_until_ms: AtomicI64::new(0),
             balance_usage: AtomicU64::new(0),
             in_pool: AtomicBool::new(false),
             rate_limited_until: AtomicI64::new(0),
@@ -355,8 +362,44 @@ impl Drop for CatalogSlot {
     }
 }
 
-/// One in-flight playback request on an account; released on drop.
-pub struct PlaybackLease(Arc<AccountState>);
+/// What a pool lease is used for. Each kind has its own in-flight counter;
+/// the per-account limit applies to their sum.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LeaseKind {
+    /// Tracks, video, manifests and licenses.
+    Playback,
+    /// Metadata served by a playback account.
+    Metadata,
+}
+
+impl LeaseKind {
+    fn counter(self, account: &AccountState) -> &AtomicUsize {
+        match self {
+            LeaseKind::Playback => &account.playback_inflight,
+            LeaseKind::Metadata => &account.metadata_inflight,
+        }
+    }
+}
+
+impl AccountState {
+    /// Requests of any kind this playback account is sending to Tidal now.
+    fn pool_inflight(&self) -> usize {
+        self.playback_inflight.load(Ordering::SeqCst) + self.metadata_inflight.load(Ordering::SeqCst)
+    }
+}
+
+/// How long a request waits for a free per-account slot before giving up.
+const LEASE_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Woken whenever a pool lease is released, so waiting requests retry at once.
+fn lease_freed() -> &'static tokio::sync::Notify {
+    static FREED: OnceLock<tokio::sync::Notify> = OnceLock::new();
+    FREED.get_or_init(tokio::sync::Notify::new)
+}
+
+/// One in-flight request on a pool account; released on drop, after which
+/// the account rests for the given number of milliseconds.
+pub struct PlaybackLease(Arc<AccountState>, LeaseKind, u32);
 
 impl PlaybackLease {
     pub fn account(&self) -> &Arc<AccountState> {
@@ -366,7 +409,12 @@ impl PlaybackLease {
 
 impl Drop for PlaybackLease {
     fn drop(&mut self) {
-        self.0.playback_inflight.fetch_sub(1, Ordering::SeqCst);
+        if self.2 > 0 {
+            let until = Utc::now().timestamp_millis() + i64::from(self.2);
+            self.0.rest_until_ms.fetch_max(until, Ordering::SeqCst);
+        }
+        self.1.counter(&self.0).fetch_sub(1, Ordering::SeqCst);
+        lease_freed().notify_waiters();
     }
 }
 
@@ -784,17 +832,68 @@ impl AccountManager {
 
     /// Claim one in-flight playback request on an already chosen account.
     pub(crate) fn lease(account: &Arc<AccountState>) -> PlaybackLease {
-        account.playback_inflight.fetch_add(1, Ordering::SeqCst);
+        Self::lease_kind(account, LeaseKind::Playback, 0)
+    }
+
+    fn lease_kind(account: &Arc<AccountState>, kind: LeaseKind, rest_ms: u32) -> PlaybackLease {
+        kind.counter(account).fetch_add(1, Ordering::SeqCst);
         Self::note_selection(account);
-        PlaybackLease(account.clone())
+        PlaybackLease(account.clone(), kind, rest_ms)
     }
 
     /// Pick a playback account and hold one of its in-flight slots until the
-    /// returned lease is dropped.
+    /// returned lease is dropped. No per-account limit.
     pub async fn lease_account_excluding(
         &self,
         exclude_ids: &[String],
     ) -> Result<PlaybackLease, AppError> {
+        self.lease_account_for(exclude_ids, LeaseKind::Playback, 0, 0).await
+    }
+
+    /// Like `lease_account_excluding`, but an account busy with `limit`
+    /// requests (of any kind, 0 = unlimited) or still resting after its last
+    /// one is skipped for a free one. Released leases make the account rest
+    /// `rest_ms`. When every usable account is busy the request waits for a
+    /// slot, like a semaphore, and gives up after `LEASE_WAIT`.
+    pub async fn lease_account_for(
+        &self,
+        exclude_ids: &[String],
+        kind: LeaseKind,
+        limit: u32,
+        rest_ms: u32,
+    ) -> Result<PlaybackLease, AppError> {
+        let deadline = tokio::time::Instant::now() + LEASE_WAIT;
+        loop {
+            // Register before checking, so a release in between is not missed.
+            let freed = lease_freed().notified();
+            tokio::pin!(freed);
+            freed.as_mut().enable();
+            if let Some(lease) = self.try_lease(exclude_ids, kind, limit, rest_ms).await? {
+                return Ok(lease);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(AppError::ServiceUnavailableRetry(
+                    format!("Every playback account is busy (limit {limit} concurrent requests) or resting between requests"),
+                    1,
+                ));
+            }
+            // The timer also catches accounts that finish resting or become usable without a release.
+            tokio::select! {
+                _ = &mut freed => {}
+                _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+            }
+        }
+    }
+
+    /// One selection pass. `Ok(None)` means usable accounts exist but all
+    /// of them are at the limit.
+    async fn try_lease(
+        &self,
+        exclude_ids: &[String],
+        kind: LeaseKind,
+        limit: u32,
+        rest_ms: u32,
+    ) -> Result<Option<PlaybackLease>, AppError> {
         // Serialize select+account: without this, N concurrent requests read
         // the same counters and all pick the same (currently-best) account,
         // leaving the rest idle under load.
@@ -846,10 +945,22 @@ impl AccountManager {
             }
         }
 
-        let eligible: Vec<usize> = pool
+        let now_ms = Utc::now().timestamp_millis();
+        let usable: Vec<usize> = pool
             .into_iter()
             .filter(|&i| !exclude_ids.contains(&accounts[i].id))
             .collect();
+        let eligible: Vec<usize> = usable
+            .iter()
+            .copied()
+            .filter(|&i| {
+                (limit == 0 || accounts[i].pool_inflight() < limit as usize)
+                    && accounts[i].rest_until_ms.load(Ordering::SeqCst) <= now_ms
+            })
+            .collect();
+        if eligible.is_empty() && !usable.is_empty() {
+            return Ok(None);
+        }
 
         if eligible.is_empty() {
             if let Some(seconds) = shortest_pause {
@@ -881,7 +992,7 @@ impl AccountManager {
                 let total = account.request_count.load(Ordering::Relaxed);
                 let score =
                     Self::score_candidate(&self.weights, usage, max_usage, recency, errors, total);
-                (account.playback_inflight.load(Ordering::SeqCst), score, i)
+                (account.pool_inflight(), score, i)
             })
             .collect();
 
@@ -900,7 +1011,7 @@ impl AccountManager {
             a.0.cmp(&b.0)
                 .then(b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
         });
-        Ok(Self::lease(&accounts[scored[0].2]))
+        Ok(Some(Self::lease_kind(&accounts[scored[0].2], kind, rest_ms)))
     }
 
     pub async fn select_account_excluding(
@@ -2391,6 +2502,69 @@ mod tests {
         assert!(accounts.iter().all(|a| a.playback_inflight.load(Ordering::SeqCst) == 1));
         drop(leases);
         assert!(accounts.iter().all(|a| a.playback_inflight.load(Ordering::SeqCst) == 0));
+    }
+
+    #[tokio::test]
+    async fn busy_accounts_are_skipped_and_full_pool_waits_for_a_slot() {
+        use super::LeaseKind;
+        use std::sync::Arc;
+        let am = Arc::new(AccountManager::new(None, SwitchingWeights::default()));
+        for label in ["a", "b"] {
+            am.add_account(label.into(), "c".into(), "s".into(), format!("rt-{label}"), None)
+                .await
+                .unwrap();
+        }
+        let first = am.lease_account_for(&[], LeaseKind::Playback, 1, 0).await.unwrap();
+        // Metadata counts too: the second account now sends one request to Tidal.
+        let second = am.lease_account_for(&[], LeaseKind::Metadata, 1, 0).await.unwrap();
+        assert_ne!(first.account().id, second.account().id);
+
+        let waiting = {
+            let am = am.clone();
+            tokio::spawn(async move { am.lease_account_for(&[], LeaseKind::Playback, 1, 0).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(!waiting.is_finished(), "a full pool must wait instead of doubling up");
+        let freed = first.account().id.clone();
+        drop(first);
+        let third = tokio::time::timeout(std::time::Duration::from_secs(2), waiting)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(third.account().id, freed);
+        assert_eq!(third.account().playback_inflight.load(Ordering::SeqCst), 1);
+        drop(second);
+        drop(third);
+        // 0 lifts the limit.
+        let leases: Vec<_> = futures::future::join_all(
+            (0..4).map(|_| am.lease_account_for(&[], LeaseKind::Playback, 0, 0)),
+        )
+        .await;
+        assert!(leases.iter().all(|lease| lease.is_ok()));
+    }
+
+    #[tokio::test]
+    async fn account_rests_between_requests() {
+        use super::LeaseKind;
+        let am = AccountManager::new(None, SwitchingWeights::default());
+        for label in ["a", "b"] {
+            am.add_account(label.into(), "c".into(), "s".into(), format!("rt-{label}"), None)
+                .await
+                .unwrap();
+        }
+        let first = am.lease_account_for(&[], LeaseKind::Playback, 1, 300).await.unwrap();
+        let rested = first.account().id.clone();
+        drop(first);
+        // The resting account is skipped while another one is free.
+        let second = am.lease_account_for(&[], LeaseKind::Playback, 1, 300).await.unwrap();
+        assert_ne!(second.account().id, rested);
+        drop(second);
+        // Both rest now: the next request waits for the first rest to end.
+        let started = std::time::Instant::now();
+        let third = am.lease_account_for(&[], LeaseKind::Playback, 1, 300).await.unwrap();
+        assert_eq!(third.account().id, rested);
+        assert!(started.elapsed() >= std::time::Duration::from_millis(150));
     }
 
     #[tokio::test]

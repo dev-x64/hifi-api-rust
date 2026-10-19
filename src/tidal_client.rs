@@ -7,7 +7,7 @@ use rand::Rng;
 use reqwest::Client;
 use serde_json::{Value, json};
 
-use crate::account_manager::{AccountManager, AccountState, CatalogClaim};
+use crate::account_manager::{AccountManager, AccountState, CatalogClaim, LeaseKind, PlaybackLease};
 use crate::config::Config;
 use crate::error::AppError;
 use crate::notifier::Notifier;
@@ -115,8 +115,24 @@ impl TidalClient {
             preferred_account,
             None,
             self.settings.track_requests_per_account(),
+            LeaseKind::Playback,
         )
         .await
+    }
+
+    /// Lease a playback account for one request, skipping accounts already
+    /// sending `track_concurrency_per_account` requests to Tidal or resting
+    /// for `track_request_delay_ms` after their last one.
+    pub async fn lease_pool_account(
+        &self,
+        exclude_ids: &[String],
+        kind: LeaseKind,
+    ) -> Result<PlaybackLease, AppError> {
+        let limit = self.settings.track_concurrency_per_account();
+        let rest_ms = self.settings.track_request_delay_ms();
+        self.account_manager
+            .lease_account_for(exclude_ids, kind, limit, rest_ms)
+            .await
     }
 
     async fn make_request_with_limit(
@@ -126,6 +142,7 @@ impl TidalClient {
         preferred_account: Option<Arc<AccountState>>,
         account_limit: Option<usize>,
         requests_per_account: u32,
+        kind: LeaseKind,
     ) -> Result<Value, AppError> {
         let requests_per_account = requests_per_account.max(1);
 
@@ -151,7 +168,7 @@ impl TidalClient {
                             failed_ids.push(a.id.clone());
                             first_rate_limit_try = Some(account_try);
                             preferred_cooldown_consumed = true;
-                            match self.account_manager.lease_account_excluding(&failed_ids).await {
+                            match self.lease_pool_account(&failed_ids, kind).await {
                                 Ok(alternative) => alternative,
                                 Err(_) => return Err(AppError::RateLimited(seconds)),
                             }
@@ -162,8 +179,7 @@ impl TidalClient {
                         }
                     }
                     None => match self
-                        .account_manager
-                        .lease_account_excluding(&failed_ids)
+                        .lease_pool_account(&failed_ids, kind)
                         .await
                     {
                         Ok(a) => a,
@@ -175,8 +191,7 @@ impl TidalClient {
                 }
             } else {
                 match self
-                    .account_manager
-                    .lease_account_excluding(&failed_ids)
+                    .lease_pool_account(&failed_ids, kind)
                     .await
                 {
                     Ok(a) => a,
@@ -609,6 +624,7 @@ impl TidalClient {
                     None,
                     Some(1),
                     self.settings.catalog_requests_per_account(),
+                    LeaseKind::Metadata,
                 )
                 .await
             {
@@ -632,6 +648,7 @@ impl TidalClient {
             None,
             None,
             self.settings.catalog_requests_per_account(),
+            LeaseKind::Metadata,
         )
             .await
             .map(|wrapped| wrapped.get("data").cloned().unwrap_or(Value::Null))
@@ -801,6 +818,136 @@ impl TidalClient {
 
     /// FULL/PREVIEW diagnostic used by both the admin action and maintenance loop.
     /// It never changes the account's availability.
+    /// Manual, read-only lookup of the account's Tidal subscription.
+    pub async fn account_subscription(&self, account: &Arc<AccountState>) -> Result<Value, AppError> {
+        self.account_subscription_at(account, "https://api.tidal.com/v1").await
+    }
+
+    async fn account_subscription_at(
+        &self,
+        account: &Arc<AccountState>,
+        api_base: &str,
+    ) -> Result<Value, AppError> {
+        let client = self.working_client_for(&account.id).await?;
+        let mut token = self.token_manager.get_token(account, &client).await?;
+        let known_user = account
+            .user_id
+            .read()
+            .await
+            .clone()
+            .filter(|id| !id.is_empty() && id.chars().all(|c| c.is_ascii_digit()));
+        let (user_id, country) = match known_user {
+            Some(id) => (id, self.config.country_code.clone()),
+            None => {
+                let session = self
+                    .subscription_get(account, &client, &mut token, &format!("{api_base}/sessions"), &[])
+                    .await?;
+                let id = match &session["userId"] {
+                    Value::Number(n) => n.to_string(),
+                    Value::String(s) => s.clone(),
+                    _ => return Err(AppError::UpstreamError(
+                        reqwest::StatusCode::BAD_GATEWAY,
+                        "Tidal session has no user id".into(),
+                    )),
+                };
+                let country = session["countryCode"]
+                    .as_str()
+                    .unwrap_or(&self.config.country_code)
+                    .to_string();
+                (id, country)
+            }
+        };
+        let url = format!("{api_base}/users/{user_id}/subscription");
+        let body = self
+            .subscription_get(account, &client, &mut token, &url, &[("countryCode", country.as_str())])
+            .await?;
+        Ok(json!({ "user_id": user_id, "subscription": body }))
+    }
+
+    /// One GET for the subscription lookup: a 401 refreshes the token once,
+    /// a 429 pauses the account like any other request would.
+    async fn subscription_get(
+        &self,
+        account: &Arc<AccountState>,
+        client: &Client,
+        token: &mut String,
+        url: &str,
+        query: &[(&str, &str)],
+    ) -> Result<Value, AppError> {
+        let mut retried_unauthorized = false;
+        loop {
+            if let Some(seconds) = AccountManager::rate_limit_remaining(account) {
+                return Err(AppError::RateLimited(seconds));
+            }
+            let request = client
+                .get(url)
+                .query(query)
+                .header("authorization", format!("Bearer {}", token))
+                .header("X-Tidal-Token", account.client_id.as_str())
+                .header("User-Agent", self.config.user_agent.as_str());
+            let response = match tokio::time::timeout(Duration::from_secs(PROBE_REQ_SECS), request.send()).await {
+                Ok(Ok(response)) => {
+                    self.proxy_manager.note_success_for(&account.id).await;
+                    response
+                }
+                Ok(Err(error)) => {
+                    if error.is_connect() || error.is_timeout() {
+                        self.proxy_manager.note_failure_for(&account.id).await;
+                    }
+                    return Err(AppError::ServiceUnavailable(format!("Network error reaching Tidal: {error}")));
+                }
+                Err(_) => {
+                    self.proxy_manager.note_failure_for(&account.id).await;
+                    return Err(AppError::Timeout);
+                }
+            };
+            let status = response.status().as_u16();
+            match status {
+                200 => {
+                    return response.json::<Value>().await.map_err(|_| {
+                        AppError::UpstreamError(
+                            reqwest::StatusCode::BAD_GATEWAY,
+                            "Invalid subscription response from Tidal".into(),
+                        )
+                    });
+                }
+                401 if !retried_unauthorized => {
+                    retried_unauthorized = true;
+                    *token = self
+                        .token_manager
+                        .refresh_after_unauthorized(account, client, token)
+                        .await?;
+                }
+                429 => {
+                    let seconds = AccountManager::pause_account(
+                        account,
+                        response
+                            .headers()
+                            .get(reqwest::header::RETRY_AFTER)
+                            .and_then(|v| v.to_str().ok()),
+                    )
+                    .await;
+                    self.account_manager
+                        .mark_account_error(&account.id, "Tidal subscription check HTTP 429")
+                        .await;
+                    return Err(AppError::RateLimited(seconds));
+                }
+                _ => {
+                    if status == 401 {
+                        TokenManager::reject_refreshed_token(account, token).await;
+                    }
+                    let text = response.text().await.unwrap_or_default();
+                    let detail: String = text.chars().take(200).collect();
+                    // Never pass Tidal's 401/403 through: the panel reads those as its own session.
+                    return Err(AppError::UpstreamError(
+                        reqwest::StatusCode::BAD_GATEWAY,
+                        format!("Tidal HTTP {status}: {detail}"),
+                    ));
+                }
+            }
+        }
+    }
+
     pub async fn probe_account_premium(&self, account: &Arc<AccountState>) -> (String, String) {
         self.probe_account_premium_at(account, "https://api.tidal.com/v1")
             .await
@@ -1135,6 +1282,55 @@ mod rate_limit_tests {
         assert_eq!(status, "premium");
         assert!(reason.is_empty());
         assert_eq!(api_hits.load(Ordering::Relaxed), 2);
+        assert_eq!(auth_hits.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn subscription_lookup_finds_the_user_and_refreshes_once() {
+        use axum::extract::{Path, Query};
+        use axum::{Json, http::HeaderMap, routing::post};
+        use serde_json::json;
+        use std::collections::HashMap;
+        let auth_hits = Arc::new(AtomicUsize::new(0));
+        let refreshes = auth_hits.clone();
+        let app = Router::new()
+            .route("/token", post(move || {
+                let refreshes = refreshes.clone();
+                async move {
+                    refreshes.fetch_add(1, Ordering::Relaxed);
+                    Json(json!({"access_token":"fresh", "expires_in":3600}))
+                }
+            }))
+            .route("/sessions", get(|headers: HeaderMap| async move {
+                if headers["authorization"] == "Bearer fresh" {
+                    (StatusCode::OK, Json(json!({"userId": 208921067, "countryCode": "DE"})))
+                } else {
+                    (StatusCode::UNAUTHORIZED, Json(json!({})))
+                }
+            }))
+            .route("/users/{id}/subscription", get(
+                |Path(id): Path<String>, Query(query): Query<HashMap<String, String>>| async move {
+                    assert_eq!(id, "208921067");
+                    assert_eq!(query["countryCode"], "DE");
+                    Json(json!({"subscription": {"type": "HIFI"}, "status": "ACTIVE", "validUntil": "2026-11-12T10:00:00.000+0000"}))
+                },
+            ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (mut client, manager) = client_with_accounts(1).await;
+        let account = manager.list_accounts().await.remove(0);
+        let mut tm = TokenManager::new(None);
+        tm.token_url = format!("{base}/token");
+        tm.set_account_manager(manager);
+        tm.set_proxy_manager(client.proxy_manager.clone());
+        client.token_manager = Arc::new(tm);
+
+        let result = client.account_subscription_at(&account, &base).await.unwrap();
+        server.abort();
+        assert_eq!(result["user_id"], "208921067");
+        assert_eq!(result["subscription"]["subscription"]["type"], "HIFI");
+        assert_eq!(result["subscription"]["status"], "ACTIVE");
         assert_eq!(auth_hits.load(Ordering::Relaxed), 1);
     }
 

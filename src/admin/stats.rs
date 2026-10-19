@@ -155,7 +155,11 @@ pub async fn get_stats(State(state): State<AppState>) -> Result<Json<Value>, App
     }
     let playback_count = state.account_manager.playback_count().await;
     let pool = state.account_manager.playback_slots().await;
-    let playback = state.playback.stats(pool).await;
+    let playback_limit = crate::playback::PlaybackQueue::capacity(
+        pool,
+        state.settings.track_concurrency_per_account(),
+    );
+    let playback = state.playback.stats(pool, playback_limit).await;
     let catalog = if !state.config.catalog_token.is_empty() {
         json!({"mode": "static_token"})
     } else if let Some(account) = accounts.iter().find(|a| {

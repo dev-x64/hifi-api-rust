@@ -55,8 +55,8 @@ pub(crate) async fn fetch_video_playback(
             break;
         }
         let lease = match state
-            .account_manager
-            .lease_account_excluding(&failed_ids)
+            .tidal_client
+            .lease_pool_account(&failed_ids, crate::account_manager::LeaseKind::Playback)
             .await
         {
             Ok(a) => a,
