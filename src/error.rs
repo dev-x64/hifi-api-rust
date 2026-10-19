@@ -15,8 +15,26 @@ pub enum AppError {
     Timeout,
     ServiceUnavailable(String),
     ServiceUnavailableRetry(String, u64),
+    /// Every playback account is at its concurrency limit or resting; the
+    /// client should retry after the given seconds. Sent as 429.
+    AccountsBusy(String, u64),
     Internal(String),
 }
+
+impl AppError {
+    /// The error to report when no further account could be leased: a busy
+    /// pool is the actual reason and wins over the previous account's failure.
+    pub fn after_failover(self, previous: Option<AppError>) -> AppError {
+        match self {
+            AppError::AccountsBusy(..) => self,
+            other => previous.unwrap_or(other),
+        }
+    }
+}
+
+/// Start of every `AccountsBusy` message, so logs and stats can tell it apart
+/// from a 429 sent by Tidal.
+pub const ACCOUNTS_BUSY: &str = "All playback accounts are busy";
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
@@ -50,6 +68,18 @@ impl IntoResponse for AppError {
                 }
                 return resp;
             }
+            AppError::AccountsBusy(d, secs) => {
+                let mut resp = (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(json!({"detail": d, "code": "accounts_busy", "retry_after": secs})),
+                )
+                    .into_response();
+                resp.headers_mut().insert(
+                    axum::http::header::RETRY_AFTER,
+                    secs.max(1).to_string().parse().unwrap(),
+                );
+                return resp;
+            }
             AppError::Internal(d) => (StatusCode::INTERNAL_SERVER_ERROR, d),
         };
 
@@ -77,6 +107,7 @@ impl fmt::Display for AppError {
             AppError::ServiceUnavailableRetry(d, s) => {
                 write!(f, "Service unavailable: {} (retry in {}s)", d, s)
             }
+            AppError::AccountsBusy(d, _) => write!(f, "{}", d),
             AppError::Internal(d) => write!(f, "Internal error: {}", d),
         }
     }
@@ -101,6 +132,17 @@ mod tests {
         let resp = AppError::ServiceUnavailableRetry("busy".into(), 0).into_response();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(resp.headers().get("retry-after").is_none());
+    }
+
+    #[tokio::test]
+    async fn busy_accounts_are_429_with_a_code_and_retry_after() {
+        let resp = AppError::AccountsBusy(format!("{ACCOUNTS_BUSY}: retry"), 2).into_response();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(resp.headers().get("retry-after").unwrap(), "2");
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["code"], "accounts_busy");
+        assert!(body["detail"].as_str().unwrap().starts_with(ACCOUNTS_BUSY));
     }
 
     #[tokio::test]

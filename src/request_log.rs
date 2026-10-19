@@ -197,7 +197,12 @@ impl SecondCounts {
             search: u64::from(sent && traffic == Traffic::Search),
             catalog: u64::from(sent && traffic == Traffic::Catalog),
             cached: u64::from(traffic == Traffic::Cached),
-            throttled: u64::from(traffic != Traffic::Service && entry.status == 429),
+            // Our own "every account is busy" answer is not Tidal throttling.
+            throttled: u64::from(
+                traffic != Traffic::Service
+                    && entry.status == 429
+                    && !entry.error.starts_with(crate::error::ACCOUNTS_BUSY),
+            ),
         }
     }
 

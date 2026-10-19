@@ -185,7 +185,7 @@ impl TidalClient {
                         Ok(a) => a,
                         Err(e) => {
                             self.alert_if_all_down(&e).await;
-                            return Err(last_account_error.unwrap_or(e));
+                            return Err(e.after_failover(last_account_error));
                         }
                     },
                 }
@@ -197,7 +197,7 @@ impl TidalClient {
                     Ok(a) => a,
                     Err(e) => {
                         self.alert_if_all_down(&e).await;
-                        return Err(last_account_error.unwrap_or(e));
+                        return Err(e.after_failover(last_account_error));
                     }
                 }
             };

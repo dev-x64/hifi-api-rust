@@ -410,7 +410,7 @@ impl PlaybackQueue {
                                 j.error = Some(detail);
                                 j.error_status = status;
                                 j.error_retry_after = match e {
-                                    AppError::RateLimited(secs) => Some(secs),
+                                    AppError::RateLimited(secs) | AppError::AccountsBusy(_, secs) => Some(secs),
                                     _ => None,
                                 };
                             }
@@ -486,6 +486,7 @@ fn app_error_parts(e: &AppError) -> (u16, String) {
         AppError::Timeout => (429, "Upstream timeout".into()),
         AppError::ServiceUnavailable(d) => (503, d.clone()),
         AppError::ServiceUnavailableRetry(d, _) => (503, d.clone()),
+        AppError::AccountsBusy(d, _) => (429, d.clone()),
         AppError::Internal(d) => (500, d.clone()),
     }
 }

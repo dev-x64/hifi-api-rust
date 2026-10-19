@@ -61,7 +61,7 @@ pub(crate) async fn fetch_widevine_license(
                 }
                 return match last_http {
                     Some(r) => Ok(r),
-                    None => Err(last_err.unwrap_or(e)),
+                    None => Err(e.after_failover(last_err)),
                 };
             }
         };

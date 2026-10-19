@@ -195,6 +195,8 @@ var ruToEn = {
     'Нет качества HIGH': 'No HIGH quality',
     'Очередь переполнена': 'Queue full',
     'Каталог занят': 'Catalog busy',
+    'Все аккаунты заняты': 'All accounts busy',
+    'Каждый аккаунт воспроизведения уже отправлял в Tidal максимум одновременных запросов или отдыхал между запросами, и ни один не освободился за отведённое время. Клиент получил 429 с Retry-After и может повторить; если это повторяется, увеличьте лимит или паузу уменьшите, либо добавьте аккаунты.': 'Every playback account was already sending its maximum of concurrent requests to Tidal or resting between requests, and none freed up in time. The client got 429 with Retry-After and can retry; if this keeps happening, raise the limit, shorten the pause, or add accounts.',
     'Нет рабочих аккаунтов': 'No working accounts',
     'Прокси недоступен': 'Proxy unavailable',
     'Нет связи с Tidal': 'Tidal unreachable',

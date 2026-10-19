@@ -60,7 +60,7 @@ pub(crate) async fn fetch_video_playback(
             .await
         {
             Ok(a) => a,
-            Err(e) => return Err(last_err.unwrap_or(e)),
+            Err(e) => return Err(e.after_failover(last_err)),
         };
         let account = lease.account().clone();
         let hc = state.tidal_client.working_client_for(&account.id).await?;

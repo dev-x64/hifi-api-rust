@@ -382,6 +382,17 @@ impl LeaseKind {
 }
 
 impl AccountState {
+    /// Seconds until this account can try a token refresh again, when it has
+    /// no usable token and its last refresh failed. Such an account cannot
+    /// serve anything, so selection skips it instead of failing over from it.
+    async fn refresh_cooldown(&self, now: i64) -> Option<u64> {
+        let retry_at = self.heal_next_retry.load(Ordering::Relaxed);
+        if retry_at <= now || self.has_usable_token(now).await {
+            return None;
+        }
+        Some((retry_at - now) as u64)
+    }
+
     /// Requests of any kind this playback account is sending to Tidal now.
     fn pool_inflight(&self) -> usize {
         self.playback_inflight.load(Ordering::SeqCst) + self.metadata_inflight.load(Ordering::SeqCst)
@@ -872,8 +883,13 @@ impl AccountManager {
                 return Ok(lease);
             }
             if tokio::time::Instant::now() >= deadline {
-                return Err(AppError::ServiceUnavailableRetry(
-                    format!("Every playback account is busy (limit {limit} concurrent requests) or resting between requests"),
+                let rest = if rest_ms > 0 { format!(" and rests {rest_ms} ms after each") } else { String::new() };
+                return Err(AppError::AccountsBusy(
+                    format!(
+                        "{}: each serves at most {limit} request(s) to Tidal at a time{rest}, and none freed up within {} s. Retry shortly.",
+                        crate::error::ACCOUNTS_BUSY,
+                        LEASE_WAIT.as_secs()
+                    ),
                     1,
                 ));
             }
@@ -908,6 +924,7 @@ impl AccountManager {
         let now = Utc::now().timestamp();
         let mut pool: Vec<usize> = Vec::new();
         let mut shortest_pause: Option<u64> = None;
+        let mut shortest_cooldown: Option<u64> = None;
         for (i, account) in accounts.iter().enumerate() {
             // Catalog-only credentials never serve playback.
             if !account.is_active.load(Ordering::Relaxed)
@@ -921,6 +938,11 @@ impl AccountManager {
                 if !exclude_ids.contains(&account.id) {
                     shortest_pause = Some(shortest_pause.map_or(seconds, |old| old.min(seconds)));
                 }
+                continue;
+            }
+            if let Some(seconds) = account.refresh_cooldown(now).await {
+                account.in_pool.store(false, Ordering::Relaxed);
+                shortest_cooldown = Some(shortest_cooldown.map_or(seconds, |old| old.min(seconds)));
                 continue;
             }
             pool.push(i);
@@ -965,6 +987,12 @@ impl AccountManager {
         if eligible.is_empty() {
             if let Some(seconds) = shortest_pause {
                 return Err(AppError::RateLimited(seconds));
+            }
+            if let Some(seconds) = shortest_cooldown {
+                return Err(AppError::ServiceUnavailableRetry(
+                    "All accounts are waiting for a token refresh".into(),
+                    seconds,
+                ));
             }
             return Err(AppError::ServiceUnavailable(
                 "All accounts are inactive or have expired tokens".into(),
@@ -1106,14 +1134,17 @@ impl AccountManager {
     /// the overflow to the playback pool.
     pub async fn claim_catalog_slot(&self, limit: u32) -> CatalogClaim {
         let accounts = self.accounts.read().await;
-        let catalog: Vec<&Arc<AccountState>> = accounts
-            .iter()
-            .filter(|a| {
-                a.is_catalog.load(Ordering::Relaxed)
-                    && a.is_active.load(Ordering::Relaxed)
-                    && Self::rate_limit_remaining(a).is_none()
-            })
-            .collect();
+        let now = Utc::now().timestamp();
+        let mut catalog: Vec<&Arc<AccountState>> = Vec::new();
+        for a in accounts.iter() {
+            if a.is_catalog.load(Ordering::Relaxed)
+                && a.is_active.load(Ordering::Relaxed)
+                && Self::rate_limit_remaining(a).is_none()
+                && a.refresh_cooldown(now).await.is_none()
+            {
+                catalog.push(a);
+            }
+        }
         if catalog.is_empty() {
             return CatalogClaim::Unavailable;
         }
@@ -2542,6 +2573,43 @@ mod tests {
         )
         .await;
         assert!(leases.iter().all(|lease| lease.is_ok()));
+    }
+
+    #[tokio::test]
+    async fn accounts_waiting_for_a_token_refresh_are_not_selected() {
+        use super::LeaseKind;
+        let am = AccountManager::new(None, SwitchingWeights::default());
+        let mut accounts = Vec::new();
+        for label in ["dead", "alive"] {
+            accounts.push(
+                am.add_account(label.into(), "c".into(), "s".into(), format!("rt-{label}"), None)
+                    .await
+                    .unwrap(),
+            );
+        }
+        let now = chrono::Utc::now().timestamp();
+        *accounts[1].access_token.write().await = Some("token".into());
+        accounts[1].token_expires_at.store(now + 3600, Ordering::Relaxed);
+        accounts[0].heal_next_retry.store(now + 600, Ordering::Relaxed);
+        for _ in 0..5 {
+            let lease = am.lease_account_for(&[], LeaseKind::Playback, 0, 0).await.unwrap();
+            assert_eq!(lease.account().id, accounts[1].id);
+        }
+        assert_eq!(accounts[0].request_count.load(Ordering::Relaxed), 0);
+        // Once its cooldown ends, a request may try the refresh again.
+        accounts[0].heal_next_retry.store(now - 1, Ordering::Relaxed);
+        let busy = am.lease_account_for(&[], LeaseKind::Playback, 1, 0).await.unwrap();
+        let other = am.lease_account_for(&[], LeaseKind::Playback, 1, 0).await.unwrap();
+        assert_ne!(busy.account().id, other.account().id);
+        drop((busy, other));
+        // With nothing else left the caller learns when to come back.
+        accounts[0].heal_next_retry.store(now + 600, Ordering::Relaxed);
+        accounts[1].heal_next_retry.store(now + 60, Ordering::Relaxed);
+        accounts[1].token_expires_at.store(now - 1, Ordering::Relaxed);
+        assert!(matches!(
+            am.lease_account_for(&[], LeaseKind::Playback, 0, 0).await,
+            Err(AppError::ServiceUnavailableRetry(_, 55..=60))
+        ));
     }
 
     #[tokio::test]
