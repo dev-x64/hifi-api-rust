@@ -15,6 +15,9 @@ use crate::upstash::UpstashStore;
 /// Consecutive automatic FULL/PREVIEW checks that must return PREVIEW before
 /// a playback account is moved to catalog-only.
 pub const PREVIEW_CHECKS_BEFORE_CATALOG: i64 = 3;
+/// PREVIEW answers in a row, each for a track another account then got as
+/// FULL, after which ordinary traffic marks an account PREVIEW-only.
+pub const TRAFFIC_PREVIEWS_BEFORE_PREVIEW_ONLY: u64 = 10;
 
 /// How account selection weighs recent errors against time since last use.
 #[derive(Clone, Debug)]
@@ -110,6 +113,9 @@ pub struct AccountState {
     /// token refresh (0 = none). After `auth_failure_disable_hours` the
     /// account is switched off. Persisted, so restarts keep counting.
     pub auth_failing_since: AtomicI64,
+    /// PREVIEW answers in a row from ordinary track requests that another
+    /// account then served FULL. Reset by any FULL result.
+    pub traffic_preview_streak: AtomicU64,
     /// Tidal account country (ISO 3166-1 alpha-2), learned from auth or
     /// session responses. None until Tidal has told us.
     country_code: std::sync::RwLock<Option<String>>,
@@ -188,6 +194,7 @@ impl AccountState {
             auth_use_basic: AtomicBool::new(false),
             auth_forbidden_streak: AtomicU64::new(0),
             auth_failing_since: AtomicI64::new(0),
+            traffic_preview_streak: AtomicU64::new(0),
             country_code: std::sync::RwLock::new(None),
             subscription: std::sync::RwLock::new(None),
             subscription_checked_at: AtomicI64::new(0),
@@ -1368,6 +1375,7 @@ impl AccountManager {
     /// call on every such answer; it writes at most once a minute.
     pub async fn confirm_full(&self, account: &AccountState) {
         let now = Utc::now().timestamp();
+        account.traffic_preview_streak.store(0, Ordering::Relaxed);
         if account.premium_checked_at.load(Ordering::Relaxed) > now - 60
             && account.premium_status.read().await.as_str() == "premium"
         {
@@ -1380,6 +1388,27 @@ impl AccountManager {
         }
     }
 
+    /// This account answered PREVIEW to a track another account then served
+    /// FULL, so the track is fine and the account is not. After
+    /// `TRAFFIC_PREVIEWS_BEFORE_PREVIEW_ONLY` in a row it is marked
+    /// PREVIEW-only, which puts it last for playback until a FULL result.
+    /// Returns true when it was marked.
+    pub async fn note_traffic_preview(&self, account: &AccountState) -> bool {
+        let streak = account.traffic_preview_streak.fetch_add(1, Ordering::Relaxed) + 1;
+        if streak < TRAFFIC_PREVIEWS_BEFORE_PREVIEW_ONLY {
+            return false;
+        }
+        account.traffic_preview_streak.store(0, Ordering::Relaxed);
+        *account.premium_status.write().await = "preview-only".to_string();
+        account.premium_checked_at.store(Utc::now().timestamp(), Ordering::Relaxed);
+        tracing::warn!(
+            account = %account.label,
+            "Marked PREVIEW-only: {} tracks in a row came back PREVIEW but FULL on another account",
+            TRAFFIC_PREVIEWS_BEFORE_PREVIEW_ONLY
+        );
+        true
+    }
+
     pub async fn set_premium(&self, id: &str, status: &str) {
         if let Some(account) = self.get_account_by_id(id).await {
             *account.premium_status.write().await = status.to_string();
@@ -1388,6 +1417,9 @@ impl AccountManager {
                 .store(Utc::now().timestamp(), Ordering::Relaxed);
             // Only a confirmed FULL result ends a PREVIEW streak; an
             // inconclusive check says nothing about the subscription.
+            if status == "premium" {
+                account.traffic_preview_streak.store(0, Ordering::Relaxed);
+            }
             if status == "premium" && account.preview_streak.swap(0, Ordering::Relaxed) != 0 {
                 self.save_preview_streak(&account).await;
             }
@@ -2884,6 +2916,30 @@ mod tests {
         // A FULL result older than 8 hours no longer counts.
         accounts[2].premium_checked_at.store(now - super::FULL_CHECK_MAX_AGE_SECS - 1, Ordering::Relaxed);
         assert_eq!(accounts[2].full_tier(now).await, 1);
+    }
+
+    #[tokio::test]
+    async fn traffic_previews_mark_preview_only_after_a_streak_and_full_resets_it() {
+        let am = AccountManager::new(None, SwitchingWeights::default());
+        let account = am
+            .add_account("a".into(), "c".into(), "s".into(), "rt-a".into(), None)
+            .await
+            .unwrap();
+        let limit = super::TRAFFIC_PREVIEWS_BEFORE_PREVIEW_ONLY;
+        for _ in 1..limit {
+            assert!(!am.note_traffic_preview(&account).await);
+        }
+        // One FULL in between starts the count over.
+        am.confirm_full(&account).await;
+        for _ in 1..limit {
+            assert!(!am.note_traffic_preview(&account).await);
+        }
+        assert!(am.note_traffic_preview(&account).await);
+        assert_eq!(*account.premium_status.read().await, "preview-only");
+        assert_eq!(account.full_tier(chrono::Utc::now().timestamp()).await, 2);
+        // A later FULL (from traffic or the scheduled check) restores it.
+        am.confirm_full(&account).await;
+        assert_eq!(account.full_tier(chrono::Utc::now().timestamp()).await, 0);
     }
 
     #[tokio::test]

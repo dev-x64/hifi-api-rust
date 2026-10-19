@@ -129,6 +129,10 @@ struct Job {
 
 /// Completed track requests remembered for the response time card.
 const TIMING_SAMPLES: usize = 1000;
+/// How long an identical track, manifest or DASH answer is reused instead
+/// of asking Tidal again. Signed media URLs stay valid far longer.
+const TRACK_CACHE_SECS: u64 = 120;
+const TRACK_CACHE_ENTRIES: u64 = 2000;
 
 /// One successful track request: time waiting for a slot and in total,
 /// from arrival to a ready answer.
@@ -139,6 +143,9 @@ struct TrackTiming {
 }
 
 pub struct PlaybackQueue {
+    /// Recent successful track answers by request (see `cache_key`).
+    results: moka::future::Cache<String, JobResult>,
+    pub cache_hits: std::sync::atomic::AtomicU64,
     timings: std::sync::Mutex<VecDeque<TrackTiming>>,
     inflight: AtomicUsize,
     jobs: RwLock<HashMap<String, Job>>,
@@ -150,6 +157,11 @@ pub struct PlaybackQueue {
 impl PlaybackQueue {
     pub fn new() -> Self {
         Self {
+            results: moka::future::Cache::builder()
+                .time_to_live(Duration::from_secs(TRACK_CACHE_SECS))
+                .max_capacity(TRACK_CACHE_ENTRIES)
+                .build(),
+            cache_hits: std::sync::atomic::AtomicU64::new(0),
             timings: std::sync::Mutex::new(VecDeque::with_capacity(TIMING_SAMPLES)),
             inflight: AtomicUsize::new(0),
             jobs: RwLock::new(HashMap::new()),
@@ -305,6 +317,15 @@ impl PlaybackQueue {
     /// forever behind a backlog nobody will wait out.
     pub async fn dispatch(&self, state: &AppState, op: PlaybackOp) -> Result<Response, AppError> {
         self.prune().await;
+        let cache_key = Self::cache_key(&op, &Self::default_format(state));
+        if let Some(key) = &cache_key {
+            if let Some(hit) = self.results.get(key).await {
+                self.cache_hits.fetch_add(1, Ordering::Relaxed);
+                let mut response = job_result_response(&hit);
+                response.headers_mut().insert("X-Cache", HeaderValue::from_static("HIT"));
+                return Ok(response);
+            }
+        }
         let accounts = Self::pool_size(state).await;
         let pool = Self::capacity(accounts, state.settings.track_concurrency_per_account())
             .unwrap_or(usize::MAX);
@@ -315,6 +336,9 @@ impl PlaybackQueue {
                 tokio::time::timeout(Duration::from_secs(OP_TIMEOUT_SECS), run_op(state, &op))
                     .await;
             self.record_timing(&op, matches!(out, Ok(Ok(_))), Duration::ZERO, started.elapsed());
+            if let (Some(key), Ok(Ok(result))) = (&cache_key, &out) {
+                self.results.insert(key.clone(), result.clone()).await;
+            }
             return match out {
                 Ok(Ok(result)) => Ok(job_result_response(&result)),
                 Ok(Err(e)) => Err(e),
@@ -408,6 +432,9 @@ impl PlaybackQueue {
             ))
             .await;
             queue.record_timing(&op_owned, matches!(out, Ok(Ok(_))), waited, queued_at.elapsed());
+            if let (Some(key), Ok(Ok(result))) = (&cache_key, &out) {
+                queue.results.insert(key.clone(), result.clone()).await;
+            }
             {
                 let mut jobs = queue.jobs.write().await;
                 if let Some(j) = jobs.get_mut(&job_id) {
@@ -463,6 +490,39 @@ impl PlaybackQueue {
         let active = self.inflight.load(Ordering::Relaxed);
         let _ = pool;
         (active, pending, total, oldest)
+    }
+
+    /// Identity of a cacheable answer: every input that shapes it, plus the
+    /// server's default format. Video and licenses are never cached.
+    fn cache_key(op: &PlaybackOp, default_format: &str) -> Option<String> {
+        match op {
+            PlaybackOp::Track { id, quality, immersive } => {
+                Some(format!("track|{id}|{quality}|{immersive}|{default_format}"))
+            }
+            PlaybackOp::Manifest { track_id, params, raw_query, host } => Some(format!(
+                "manifest|{track_id}|{host}|{}|{}|{}|{}|{}|{:?}|{:?}|{default_format}",
+                raw_query.as_deref().unwrap_or(""),
+                params.adaptive,
+                params.manifestType,
+                params.uriScheme,
+                params.usage,
+                params.countryCode,
+                params.atmos,
+            )),
+            PlaybackOp::Dash { track_id, atmos } => {
+                Some(format!("dash|{track_id}|{atmos:?}|{default_format}"))
+            }
+            PlaybackOp::Video { .. } | PlaybackOp::Widevine { .. } => None,
+        }
+    }
+
+    fn default_format(state: &AppState) -> String {
+        state.settings.atmos_mode.read().map(|v| v.clone()).unwrap_or_default()
+    }
+
+    /// Drop every cached track answer (admin "clear cache").
+    pub fn clear_cache(&self) {
+        self.results.invalidate_all();
     }
 
     /// Remember a successful track request (tracks, manifests, DASH); video
@@ -771,6 +831,32 @@ pub async fn clear_playback_queue(State(state): State<AppState>) -> Result<Json<
 mod tests {
     use super::{Job, JobState, PENDING_TIMEOUT_SECS, PlaybackQueue};
     use std::collections::HashMap;
+
+    #[test]
+    fn cache_key_covers_every_input_and_skips_video_and_licenses() {
+        use super::PlaybackOp;
+        let track = |quality: &str| PlaybackOp::Track { id: 5, quality: quality.into(), immersive: false };
+        let key = |op: &PlaybackOp, format: &str| PlaybackQueue::cache_key(op, format);
+        assert_eq!(key(&track("LOSSLESS"), "off"), key(&track("LOSSLESS"), "off"));
+        assert_ne!(key(&track("LOSSLESS"), "off"), key(&track("HI_RES_LOSSLESS"), "off"));
+        // A new default format must not serve the old one for two minutes.
+        assert_ne!(key(&track("LOSSLESS"), "off"), key(&track("LOSSLESS"), "prefer"));
+        let manifest = |host: &str, query: &str| PlaybackOp::Manifest {
+            track_id: "5".into(),
+            params: serde_json::from_value(serde_json::json!({})).unwrap(),
+            raw_query: Some(query.into()),
+            host: host.into(),
+        };
+        assert_eq!(key(&manifest("a", "formats=FLAC"), "off"), key(&manifest("a", "formats=FLAC"), "off"));
+        assert_ne!(key(&manifest("a", "formats=FLAC"), "off"), key(&manifest("b", "formats=FLAC"), "off"));
+        assert_ne!(key(&manifest("a", "formats=FLAC"), "off"), key(&manifest("a", "formats=AACLC"), "off"));
+        let dash = PlaybackOp::Dash { track_id: "5".into(), atmos: Some("only".into()) };
+        assert!(key(&dash, "off").unwrap().starts_with("dash|5|"));
+        let video = PlaybackOp::Video { id: 1, quality: "HIGH".into(), mode: "STREAM".into(), presentation: "FULL".into() };
+        assert_eq!(key(&video, "off"), None);
+        let license = PlaybackOp::Widevine { method: "POST".into(), content_type: None, body: vec![1] };
+        assert_eq!(key(&license, "off"), None);
+    }
 
     #[test]
     fn track_latency_covers_tracks_only_and_counts_queue_waits() {

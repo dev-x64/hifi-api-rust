@@ -150,6 +150,9 @@ impl TidalClient {
         let requests_per_account = requests_per_account.max(1);
 
         let mut failed_ids: Vec<String> = Vec::new();
+        // Accounts that answered PREVIEW to this request; counted against them
+        // only if another account then gets FULL for the same track.
+        let mut previewed: Vec<Arc<AccountState>> = Vec::new();
         let account_count = self.account_manager.playback_count().await;
         let max_account_attempts = std::cmp::max(1, account_count)
             .min(account_limit.unwrap_or(usize::MAX));
@@ -400,8 +403,12 @@ impl TidalClient {
                         == Some("FULL");
                 if is_full && kind == LeaseKind::Playback {
                     self.account_manager.confirm_full(&account).await;
+                    for other in &previewed {
+                        self.account_manager.note_traffic_preview(other).await;
+                    }
                 }
                 if is_preview {
+                    previewed.push(account.clone());
                     failed_ids.push(account.id.clone());
                     last_account_error = Some(AppError::ServiceUnavailable(format!(
                         "Preview only for track: account {} cannot provide FULL (subscription required)",
@@ -1348,6 +1355,62 @@ mod rate_limit_tests {
         assert_eq!(result["subscription"]["status"], "ACTIVE");
         assert_eq!(account.country().as_deref(), Some("DE"));
         assert_eq!(auth_hits.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn previews_count_against_an_account_only_when_another_gets_full() {
+        use axum::{Json, http::HeaderMap};
+        use serde_json::json;
+        let app = Router::new().route(
+            "/tracks/{id}/playbackinfo",
+            get(|headers: HeaderMap| async move {
+                let presentation = if headers["authorization"] == "Bearer tok-preview" { "PREVIEW" } else { "FULL" };
+                Json(json!({"assetPresentation": presentation}))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/tracks/1/playbackinfo", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (client, manager) = client_with_accounts(2).await;
+        let accounts = manager.list_accounts().await;
+        let (preview, full) = (&accounts[0], &accounts[1]);
+        *preview.access_token.write().await = Some("tok-preview".into());
+        let limit = crate::account_manager::TRAFFIC_PREVIEWS_BEFORE_PREVIEW_ONLY;
+        for round in 1..=limit {
+            // Make the PREVIEW account the first pick each time.
+            preview.last_pick_ms.store(1, Ordering::Relaxed);
+            full.last_pick_ms.store(chrono::Utc::now().timestamp_millis(), Ordering::Relaxed);
+            full.premium_checked_at.store(0, Ordering::Relaxed);
+            let data = client.make_request(&url, None).await.unwrap();
+            assert_eq!(data["data"]["assetPresentation"], "FULL");
+            let marked = *preview.premium_status.read().await == "preview-only";
+            assert_eq!(marked, round == limit, "round {round}");
+        }
+        // The FULL account was confirmed by the same traffic.
+        assert_eq!(*full.premium_status.read().await, "premium");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn previews_from_every_account_say_nothing_about_any_of_them() {
+        use axum::Json;
+        use serde_json::json;
+        let app = Router::new().route(
+            "/tracks/{id}/playbackinfo",
+            get(|| async { Json(json!({"assetPresentation": "PREVIEW"})) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/tracks/1/playbackinfo", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (client, manager) = client_with_accounts(2).await;
+        for _ in 0..crate::account_manager::TRAFFIC_PREVIEWS_BEFORE_PREVIEW_ONLY + 2 {
+            assert!(client.make_request(&url, None).await.is_err());
+        }
+        for account in manager.list_accounts().await {
+            assert_eq!(account.traffic_preview_streak.load(Ordering::Relaxed), 0);
+            assert_ne!(*account.premium_status.read().await, "preview-only");
+        }
+        server.abort();
     }
 
     #[tokio::test]

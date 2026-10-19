@@ -12,7 +12,7 @@ use chrono::Utc;
 use futures::{StreamExt, stream};
 
 const LOOP_DELAY_SECS: u64 = 30;
-const FULL_CHECK_INTERVAL_SECS: i64 = 6 * 60 * 60;
+const FULL_CHECK_INTERVAL_SECS: i64 = 60 * 60;
 const FULL_CHECK_INITIAL_SPREAD_SECS: i64 = 5 * 60;
 const FULL_CHECK_REPEAT_SPREAD_SECS: i64 = 15 * 60;
 const SUBSCRIPTION_CHECK_INTERVAL_SECS: i64 = 24 * 60 * 60;

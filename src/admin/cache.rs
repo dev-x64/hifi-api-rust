@@ -13,10 +13,12 @@ pub async fn cache_stats(State(state): State<AppState>) -> Result<Json<Value>, A
         "coalesced": state.cache.coalesced.load(Ordering::Relaxed),
         "stale": state.cache.stale.load(Ordering::Relaxed),
         "negative": state.cache.negative_hits.load(Ordering::Relaxed),
+        "tracks": state.playback.cache_hits.load(Ordering::Relaxed),
     } })))
 }
 
 pub async fn cache_clear(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     state.cache.invalidate_all().await;
+    state.playback.clear_cache();
     Ok(Json(json!({"message": "Response cache cleared"})))
 }
