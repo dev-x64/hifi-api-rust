@@ -302,18 +302,53 @@ for (const language of ['en', 'ru']) {
         if (language === 'en') assert.doesNotMatch(html, /[А-Яа-яЁё]/);
     });
 
+    test(`a long 403 streak counts down to the switch-off, then explains it (${language})`, () => {
+        const { ctx } = context(language);
+        const now = Date.now() / 1000;
+        ctx.account = { is_active: true, availability: { token: 'expired' }, heal_next_retry: now + 600,
+            last_refresh_error: 'Upstream 403 Forbidden: Tidal auth HTTP 403 Forbidden', auth_failing_since: now - 20 * 3600, auth_disable_at: now + 4 * 3600 + 30 };
+        const html = vm.runInContext('tokenRefreshDetails(account)', ctx);
+        assert.match(html, /Tidal auth HTTP 403/);
+        assert.match(html, language === 'en' ? /answered 403 to token refreshes for <strong>20 hr<\/strong>; the account switches off in <strong>4 hr<\/strong>/ : /403 на обновление токена уже <strong>20 ч<\/strong>; аккаунт выключится через <strong>4 ч<\/strong>/);
+        ctx.account = { is_active: false, auto_disabled: false, availability: { state: 'disabled', token: 'expired' }, auth_failing_since: now - 30 * 3600, disabled_at: now - 6 * 3600 };
+        const off = vm.runInContext('tokenRefreshDetails(account)', ctx);
+        assert.match(off, language === 'en' ? /switched off: Tidal answered 403 to token refreshes for <strong>1 d<\/strong>/ : /выключен: Tidal отвечал 403 на обновление токена <strong>1 д<\/strong>/);
+        assert.equal(ctx.tr(vm.runInContext('accountStatus(account).text', ctx)), language === 'en' ? 'Off: token refresh kept failing' : 'Отключён: токен не обновлялся');
+        assert.equal(vm.runInContext('authFailureDetails({ auth_failing_since: 0 })', ctx), '');
+        ctx.account.last_refresh_error = 'Upstream 403 Forbidden: Tidal auth HTTP 403 Forbidden: abuse_detected (User account is suspended due to abuse)';
+        assert.equal(ctx.tr(vm.runInContext('accountStatus(account).text', ctx)), language === 'en' ? 'Off: Tidal abuse_detected' : 'Отключён: Tidal abuse_detected');
+        assert.doesNotMatch(html + off, /undefined|NaN/);
+        if (language === 'en') assert.doesNotMatch(html + off, /[А-Яа-яЁё]/);
+    });
+
+    test(`account country shows a flag, or when it will appear (${language})`, () => {
+        const { ctx } = context(language);
+        const row = vm.runInContext('countryRow({ country_code: "de" })', ctx);
+        assert.ok(row.includes('\u{1F1E9}\u{1F1EA} DE'));
+        assert.match(row, language === 'en' ? /Country/ : /Страна/);
+        const unknown = vm.runInContext('countryRow({ country_code: null })', ctx);
+        assert.match(unknown, language === 'en' ? /shown after the next token refresh/ : /появится после обновления токена/);
+        assert.doesNotMatch(vm.runInContext('countryRow({ country_code: "<b>" })', ctx), /<b>/);
+    });
+
     test(`subscription row shows plan, status and expiry, safely escaped (${language})`, () => {
         const { ctx } = context(language);
-        assert.equal(vm.runInContext('subscriptionRow("a")', ctx), '');
-        vm.runInContext('_subscriptions.a = ' + JSON.stringify({ checked_at: 1760000000, subscription:
-            { subscription: { type: 'HIFI' }, status: 'ACTIVE', validUntil: '2099-11-12T10:00:00.000+0000', highestSoundQuality: 'HI_RES_LOSSLESS' } }), ctx);
-        const html = vm.runInContext('subscriptionRow("a")', ctx);
-        assert.match(html, /<strong>HIFI<\/strong> · <span class="sub-ok">ACTIVE<\/span> · <span class="">[^<]*2099[^<]*<\/span> · HI_RES_LOSSLESS/);
+        const row = account => vm.runInContext('subscriptionRow(' + JSON.stringify(account) + ')', ctx);
+        assert.equal(row({ id: 'a' }), '');
+        // The real answer for a working account, stored by the server.
+        const html = row({ id: 'a', subscription_checked_at: 1760000000, subscription:
+            { startDate: '2026-10-18T16:55:24.723+0000', validUntil: '2099-11-17T16:55:22.503+0000', status: 'ACTIVE',
+              subscription: { type: 'HIFI', offlineGracePeriod: 30 }, highestSoundQuality: 'HI_RES', premiumAccess: true, paymentOverdue: false } });
+        assert.match(html, /<strong>HIFI<\/strong> · <span class="sub-ok">ACTIVE<\/span> · <span class="">[^<]*2099[^<]*<\/span> · HI_RES/);
         assert.match(html, language === 'en' ? /Subscription/ : /Подписка/);
-        vm.runInContext('_subscriptions.a = ' + JSON.stringify({ subscription: { status: 'CANCELLED', validUntil: '2001-01-01T00:00:00.000+0000' } }), ctx);
-        assert.match(vm.runInContext('subscriptionRow("a")', ctx), /sub-bad">CANCELLED<[^]*sub-bad">[^<]*2001[^<]*</);
-        vm.runInContext('_subscriptions.a = { error: "Tidal HTTP 403: <b>x</b>" }', ctx);
-        const failed = vm.runInContext('subscriptionRow("a")', ctx);
+        const soon = new Date(Date.now() + 2 * 86400000 - 30 * 60000).toISOString().replace('Z', '+0000');
+        assert.match(row({ id: 'a', subscription: { status: 'ACTIVE', validUntil: soon } }), language === 'en' ? /sub-bad">ends in 1 d 23 hr/ : /sub-bad">заканчивается через 1 д 23 ч/);
+        const cancelled = row({ id: 'a', subscription: { status: 'CANCELLED', validUntil: '2001-01-01T00:00:00.000+0000', paymentOverdue: true } });
+        assert.match(cancelled, /sub-bad">CANCELLED<[^]*sub-bad">[^<]*2001[^<]*</);
+        assert.match(cancelled, language === 'en' ? /sub-bad">payment overdue</ : /sub-bad">оплата просрочена</);
+        // A newer failed manual check is shown over the stored answer.
+        vm.runInContext('_subscriptions.a = { error: "Tidal HTTP 403: <b>x</b>", checked_at: 1800000000 }', ctx);
+        const failed = row({ id: 'a', subscription: { status: 'ACTIVE' }, subscription_checked_at: 1760000000 });
         assert.match(failed, /&lt;b&gt;/);
         assert.doesNotMatch(failed, /undefined|NaN|<b>/);
         if (language === 'en') assert.doesNotMatch(html + failed, /[А-Яа-яЁё]/);

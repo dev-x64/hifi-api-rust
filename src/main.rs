@@ -306,6 +306,7 @@ async fn main() {
         proxy_manager.clone(),
         tidal_client.clone(),
         notifier.clone(),
+        settings.clone(),
     )
     .await;
 

@@ -16,19 +16,62 @@ use crate::upstash::UpstashStore;
 /// a playback account is moved to catalog-only.
 pub const PREVIEW_CHECKS_BEFORE_CATALOG: i64 = 3;
 
+/// How account selection weighs recent errors against time since last use.
 #[derive(Clone, Debug)]
 pub struct SwitchingWeights {
-    pub balance: f64,
-    pub recency: f64,
-    pub error: f64,
+    /// An account whose recent requests all failed counts as used this many
+    /// milliseconds later than it really was; half the errors, half as much.
+    pub error_penalty_ms: i64,
 }
 
 impl Default for SwitchingWeights {
     fn default() -> Self {
         Self {
-            balance: 0.4,
-            recency: 0.3,
-            error: 0.3,
+            error_penalty_ms: 10 * 60 * 1000,
+        }
+    }
+}
+
+/// A FULL/PREVIEW result this recent decides playback priority.
+pub const FULL_CHECK_MAX_AGE_SECS: i64 = 8 * 60 * 60;
+/// Recent errors fade with this half-life.
+const RECENT_HALF_LIFE_MS: f64 = 15.0 * 60.0 * 1000.0;
+
+/// Limits a pool lease must respect; 0 turns each one off.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LeaseRules {
+    /// Requests one account sends to Tidal at once.
+    pub concurrency: u32,
+    /// Milliseconds an account rests after each request.
+    pub rest_ms: u32,
+    /// Requests one account may start within an hour.
+    pub per_hour: u32,
+}
+
+/// Requests and errors with exponential decay, so the error rate reflects
+/// roughly the last 15 minutes rather than the whole uptime.
+#[derive(Clone, Default)]
+struct RecentOutcomes {
+    requests: f64,
+    errors: f64,
+    at_ms: i64,
+}
+
+impl RecentOutcomes {
+    fn decay(&mut self, now_ms: i64) {
+        if self.at_ms > 0 && now_ms > self.at_ms {
+            let factor = 0.5f64.powf((now_ms - self.at_ms) as f64 / RECENT_HALF_LIFE_MS);
+            self.requests *= factor;
+            self.errors *= factor;
+        }
+        self.at_ms = self.at_ms.max(now_ms);
+    }
+
+    fn error_rate(&self) -> f64 {
+        if self.requests < 1e-6 {
+            0.0
+        } else {
+            (self.errors / self.requests).clamp(0.0, 1.0)
         }
     }
 }
@@ -63,6 +106,17 @@ pub struct AccountState {
     /// Consecutive auth-endpoint 403 responses on the account's current proxy.
     /// Four failures arm a proxy change for the next recovery cycle.
     pub auth_forbidden_streak: AtomicU64,
+    /// Unix time of the first 403 from Tidal auth since the last successful
+    /// token refresh (0 = none). After `auth_failure_disable_hours` the
+    /// account is switched off. Persisted, so restarts keep counting.
+    pub auth_failing_since: AtomicI64,
+    /// Tidal account country (ISO 3166-1 alpha-2), learned from auth or
+    /// session responses. None until Tidal has told us.
+    country_code: std::sync::RwLock<Option<String>>,
+    /// Latest Tidal subscription answer (plan, status, validUntil, …) and
+    /// when it was fetched. Refreshed daily by auto-heal or on demand.
+    subscription: std::sync::RwLock<Option<serde_json::Value>>,
+    pub subscription_checked_at: AtomicI64,
     pub rejected_access_token: RwLock<Option<String>>,
     pub notes: RwLock<String>,
     pub last_used: AtomicI64,
@@ -77,12 +131,13 @@ pub struct AccountState {
     /// Unix milliseconds until which this playback account rests after its
     /// last request (`track_request_delay_ms`).
     pub rest_until_ms: AtomicI64,
-    /// Selections counted for balancing. Unlike `request_count` it is
-    /// levelled with the pool when the account (re)joins, so a new or
-    /// returning account is not handed every request until it catches up.
-    pub balance_usage: AtomicU64,
-    /// Whether the selector saw this account as selectable on its last pass.
-    in_pool: AtomicBool,
+    /// Unix milliseconds of the latest selection; the least recently used
+    /// account goes first.
+    pub last_pick_ms: AtomicI64,
+    recent: std::sync::Mutex<RecentOutcomes>,
+    /// Start times (Unix ms) of requests within the last hour, for the
+    /// per-hour limit.
+    hour_picks: std::sync::Mutex<std::collections::VecDeque<i64>>,
     /// Temporary upstream 429 pause. Kept separate from account health so
     /// rate limiting never disables a valid credential.
     pub rate_limited_until: AtomicI64,
@@ -132,6 +187,10 @@ impl AccountState {
             last_refresh_error: std::sync::RwLock::new(None),
             auth_use_basic: AtomicBool::new(false),
             auth_forbidden_streak: AtomicU64::new(0),
+            auth_failing_since: AtomicI64::new(0),
+            country_code: std::sync::RwLock::new(None),
+            subscription: std::sync::RwLock::new(None),
+            subscription_checked_at: AtomicI64::new(0),
             rejected_access_token: RwLock::new(None),
             notes: RwLock::new(notes),
             last_used: AtomicI64::new(0),
@@ -141,8 +200,9 @@ impl AccountState {
             playback_inflight: AtomicUsize::new(0),
             metadata_inflight: AtomicUsize::new(0),
             rest_until_ms: AtomicI64::new(0),
-            balance_usage: AtomicU64::new(0),
-            in_pool: AtomicBool::new(false),
+            last_pick_ms: AtomicI64::new(0),
+            recent: std::sync::Mutex::new(RecentOutcomes::default()),
+            hour_picks: std::sync::Mutex::new(std::collections::VecDeque::new()),
             rate_limited_until: AtomicI64::new(0),
             premium_status: RwLock::new("unknown".to_string()),
             premium_checked_at: AtomicI64::new(0),
@@ -165,10 +225,14 @@ impl AccountState {
             .store(old.request_count.load(Ordering::Relaxed), Ordering::Relaxed);
         new.error_count
             .store(old.error_count.load(Ordering::Relaxed), Ordering::Relaxed);
-        new.balance_usage
-            .store(old.balance_usage.load(Ordering::Relaxed), Ordering::Relaxed);
-        new.in_pool
-            .store(old.in_pool.load(Ordering::Relaxed), Ordering::Relaxed);
+        new.last_pick_ms
+            .store(old.last_pick_ms.load(Ordering::Relaxed), Ordering::Relaxed);
+        if let (Ok(src), Ok(mut dst)) = (old.recent.lock(), new.recent.lock()) {
+            *dst = src.clone();
+        }
+        if let (Ok(src), Ok(mut dst)) = (old.hour_picks.lock(), new.hour_picks.lock()) {
+            *dst = src.clone();
+        }
         new.rate_limited_until.store(
             old.rate_limited_until.load(Ordering::Relaxed),
             Ordering::Relaxed,
@@ -189,6 +253,12 @@ impl AccountState {
             .store(old.disabled_at.load(Ordering::Relaxed), Ordering::Relaxed);
         new.heal_failures
             .store(old.heal_failures.load(Ordering::Relaxed), Ordering::Relaxed);
+        new.set_country(old.country());
+        *new.subscription.write().unwrap_or_else(|e| e.into_inner()) = old.subscription();
+        new.subscription_checked_at.store(
+            old.subscription_checked_at.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
         new.heal_next_retry.store(
             old.heal_next_retry.load(Ordering::Relaxed),
             Ordering::Relaxed,
@@ -204,6 +274,10 @@ impl AccountState {
             );
             new.auth_forbidden_streak.store(
                 old.auth_forbidden_streak.load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
+            new.auth_failing_since.store(
+                old.auth_failing_since.load(Ordering::Relaxed),
                 Ordering::Relaxed,
             );
             if let (Ok(src), Ok(mut dst)) = (old.access_token.try_read(), new.access_token.try_write()) {
@@ -302,6 +376,44 @@ impl AccountState {
         }
     }
 
+    pub fn subscription(&self) -> Option<serde_json::Value> {
+        self.subscription.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Keep the latest subscription answer, in memory and in SQLite.
+    pub(crate) async fn store_subscription(&self, subscription: serde_json::Value, checked_at: i64) {
+        *self.subscription.write().unwrap_or_else(|e| e.into_inner()) = Some(subscription.clone());
+        self.subscription_checked_at.store(checked_at, Ordering::Relaxed);
+        if let Some(db) = self.db.get() {
+            if let Err(error) = sqlx::query(
+                "UPDATE accounts SET subscription_json = ?, subscription_checked_at = ? WHERE id = ?",
+            )
+            .bind(subscription.to_string())
+            .bind(checked_at)
+            .bind(&self.id)
+            .execute(db)
+            .await
+            {
+                tracing::warn!(account = %self.id, "Could not save subscription: {error}");
+            }
+        }
+    }
+
+    pub fn country(&self) -> Option<String> {
+        self.country_code.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Keep a valid two-letter code; anything else is ignored.
+    pub(crate) fn set_country(&self, code: Option<String>) {
+        let Some(code) = code
+            .map(|c| c.trim().to_ascii_uppercase())
+            .filter(|c| c.len() == 2 && c.chars().all(|ch| ch.is_ascii_alphabetic()))
+        else {
+            return;
+        };
+        *self.country_code.write().unwrap_or_else(|e| e.into_inner()) = Some(code);
+    }
+
     pub fn last_refresh_error(&self) -> Option<String> {
         self.last_refresh_error.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
@@ -330,13 +442,16 @@ impl AccountState {
         // A late result from credentials replaced by an admin must not put
         // the replacement credentials into the old cooldown.
         sqlx::query(
-            "UPDATE accounts SET heal_failures = ?, heal_next_retry = ?, rejected_access_token = ?, last_refresh_error = ?
+            "UPDATE accounts SET heal_failures = ?, heal_next_retry = ?, rejected_access_token = ?, last_refresh_error = ?,
+             auth_failing_since = ?, country_code = COALESCE(?, country_code)
              WHERE id = ? AND client_id = ? AND client_secret = ? AND refresh_token = ?",
         )
         .bind(i64::try_from(self.heal_failures.load(Ordering::Relaxed)).unwrap_or(i64::MAX))
         .bind(self.heal_next_retry.load(Ordering::Relaxed))
         .bind(self.rejected_access_token.read().await.clone())
         .bind(self.last_refresh_error())
+        .bind(self.auth_failing_since.load(Ordering::Relaxed))
+        .bind(self.country())
         .bind(&self.id)
         .bind(&self.client_id)
         .bind(&self.client_secret)
@@ -382,6 +497,56 @@ impl LeaseKind {
 }
 
 impl AccountState {
+    /// Share of failed requests, weighted toward the last 15 minutes.
+    pub fn recent_error_rate(&self) -> f64 {
+        let now_ms = Utc::now().timestamp_millis();
+        self.recent
+            .lock()
+            .map(|mut recent| {
+                recent.decay(now_ms);
+                recent.error_rate()
+            })
+            .unwrap_or(0.0)
+    }
+
+    fn note_recent(&self, error: bool) {
+        if let Ok(mut recent) = self.recent.lock() {
+            recent.decay(Utc::now().timestamp_millis());
+            if error {
+                recent.errors += 1.0;
+            } else {
+                recent.requests += 1.0;
+            }
+        }
+    }
+
+    /// Requests started within the last hour.
+    pub fn requests_last_hour(&self, now_ms: i64) -> usize {
+        self.hour_picks
+            .lock()
+            .map(|mut picks| {
+                while picks.front().is_some_and(|at| *at <= now_ms - 3_600_000) {
+                    picks.pop_front();
+                }
+                picks.len()
+            })
+            .unwrap_or(0)
+    }
+
+    /// FULL/PREVIEW confidence for playback: 0 confirmed FULL, 1 not checked
+    /// lately, 2 recently returned PREVIEW.
+    async fn full_tier(&self, now: i64) -> u8 {
+        let checked = self.premium_checked_at.load(Ordering::Relaxed);
+        if checked <= 0 || checked < now - FULL_CHECK_MAX_AGE_SECS {
+            return 1;
+        }
+        match self.premium_status.read().await.as_str() {
+            "premium" => 0,
+            "preview-only" => 2,
+            _ => 1,
+        }
+    }
+
     /// Seconds until this account can try a token refresh again, when it has
     /// no usable token and its last refresh failed. Such an account cannot
     /// serve anything, so selection skips it instead of failing over from it.
@@ -473,6 +638,10 @@ pub struct DbAccountRow {
     pub last_refresh_error: Option<String>,
     pub preview_streak: i64,
     pub rate_limited_until: i64,
+    pub auth_failing_since: i64,
+    pub country_code: Option<String>,
+    pub subscription_json: Option<String>,
+    pub subscription_checked_at: i64,
 }
 
 /// Extract a numeric user id from an auto-generated "Tidal Account (<id>)" label.
@@ -620,7 +789,8 @@ impl AccountManager {
              a.user_id, a.is_active, a.auto_disabled, a.disabled_at, a.is_catalog, a.notes,
              t.access_token, t.expires_at, a.updated_at, a.created_at,
              a.heal_failures, a.heal_next_retry, a.rejected_access_token, a.last_refresh_error,
-             a.preview_streak, a.rate_limited_until
+             a.preview_streak, a.rate_limited_until, a.auth_failing_since, a.country_code,
+             a.subscription_json, a.subscription_checked_at
              FROM accounts a
              LEFT JOIN tokens t ON t.account_id = a.id
              ORDER BY a.created_at ASC",
@@ -689,6 +859,15 @@ impl AccountManager {
             state.set_last_refresh_error(row.last_refresh_error);
             state.preview_streak.store(row.preview_streak.max(0), Ordering::Relaxed);
             state.rate_limited_until.store(row.rate_limited_until.max(0), Ordering::Relaxed);
+            state.auth_failing_since.store(row.auth_failing_since.max(0), Ordering::Relaxed);
+            state.set_country(row.country_code);
+            *state.subscription.write().unwrap_or_else(|e| e.into_inner()) = row
+                .subscription_json
+                .as_deref()
+                .and_then(|json| serde_json::from_str(json).ok());
+            state
+                .subscription_checked_at
+                .store(row.subscription_checked_at.max(0), Ordering::Relaxed);
             self.load_uptime(&state).await?;
             accounts.push(state);
         }
@@ -798,10 +977,14 @@ impl AccountManager {
     /// pool selector, the catalog selector, and the preferred-account path
     /// so every served request is visible to the balancer.
     pub fn note_selection(account: &AccountState) {
-        let now = Utc::now().timestamp();
-        account.last_used.store(now, Ordering::Relaxed);
+        let now_ms = Utc::now().timestamp_millis();
+        account.last_used.store(now_ms / 1000, Ordering::Relaxed);
+        account.last_pick_ms.store(now_ms, Ordering::Relaxed);
         account.request_count.fetch_add(1, Ordering::Relaxed);
-        account.balance_usage.fetch_add(1, Ordering::Relaxed);
+        account.note_recent(false);
+        if let Ok(mut picks) = account.hour_picks.lock() {
+            picks.push_back(now_ms);
+        }
         crate::request_log::note_account(
             &account.id,
             &account.label,
@@ -813,32 +996,16 @@ impl AccountManager {
         );
     }
 
-    /// Pure weighted score for one candidate. Unit tested.
-    ///
-    /// - `usage` / `max_usage`: request counts; the balance term is
-    ///   normalized against the current max so it stays meaningful at any
-    ///   absolute volume (a plain `1/usage` decays to zero and stops
-    ///   balancing after a few hundred requests).
-    /// - `recency_secs`: seconds since last use (capped at 1h upstream).
-    /// - `errors` / `total`: raw counters; zero requests means zero error
-    ///   rate (never synthesize a phantom error for fresh accounts).
-    pub(crate) fn score_candidate(
+    /// When an account counts as last used for selection: its real last
+    /// pick, moved later by its recent error rate. The smallest value wins,
+    /// so the pool rotates least-recently-used first and an account that
+    /// keeps failing waits its turn longer. Pure function, unit tested.
+    pub(crate) fn effective_last_use(
         weights: &SwitchingWeights,
-        usage: u64,
-        max_usage: u64,
-        recency_secs: f64,
-        errors: u64,
-        total: u64,
-    ) -> f64 {
-        let error_rate = if total > 0 {
-            (errors as f64 / total as f64).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        let usage_score = weights.balance * (1.0 - usage as f64 / (max_usage as f64 + 1.0));
-        let recency_score = weights.recency * (recency_secs / 3600.0).clamp(0.0, 1.0);
-        let error_score = weights.error * (1.0 - error_rate);
-        usage_score + recency_score + error_score
+        last_pick_ms: i64,
+        recent_error_rate: f64,
+    ) -> i64 {
+        last_pick_ms + (weights.error_penalty_ms as f64 * recent_error_rate.clamp(0.0, 1.0)) as i64
     }
 
     /// Claim one in-flight playback request on an already chosen account.
@@ -858,39 +1025,50 @@ impl AccountManager {
         &self,
         exclude_ids: &[String],
     ) -> Result<PlaybackLease, AppError> {
-        self.lease_account_for(exclude_ids, LeaseKind::Playback, 0, 0).await
+        self.lease_account_for(exclude_ids, LeaseKind::Playback, LeaseRules::default()).await
     }
 
-    /// Like `lease_account_excluding`, but an account busy with `limit`
-    /// requests (of any kind, 0 = unlimited) or still resting after its last
-    /// one is skipped for a free one. Released leases make the account rest
-    /// `rest_ms`. When every usable account is busy the request waits for a
-    /// slot, like a semaphore, and gives up after `LEASE_WAIT`.
+    /// Like `lease_account_excluding`, but an account that is busy with
+    /// `rules.concurrency` requests (of any kind), resting after its last
+    /// one, or at its hourly limit is skipped for a free one. Released
+    /// leases make the account rest `rules.rest_ms`. When every usable
+    /// account is busy the request waits for a slot, like a semaphore, and
+    /// gives up after `LEASE_WAIT`.
     pub async fn lease_account_for(
         &self,
         exclude_ids: &[String],
         kind: LeaseKind,
-        limit: u32,
-        rest_ms: u32,
+        rules: LeaseRules,
     ) -> Result<PlaybackLease, AppError> {
+        let LeaseRules { concurrency: limit, rest_ms, per_hour } = rules;
         let deadline = tokio::time::Instant::now() + LEASE_WAIT;
         loop {
             // Register before checking, so a release in between is not missed.
             let freed = lease_freed().notified();
             tokio::pin!(freed);
             freed.as_mut().enable();
-            if let Some(lease) = self.try_lease(exclude_ids, kind, limit, rest_ms).await? {
+            if let Some(lease) = self.try_lease(exclude_ids, kind, rules).await? {
                 return Ok(lease);
             }
             if tokio::time::Instant::now() >= deadline {
-                let rest = if rest_ms > 0 { format!(" and rests {rest_ms} ms after each") } else { String::new() };
+                let mut limits = Vec::new();
+                if limit > 0 {
+                    limits.push(format!("at most {limit} request(s) to Tidal at a time"));
+                }
+                if rest_ms > 0 {
+                    limits.push(format!("a {rest_ms} ms rest after each"));
+                }
+                if per_hour > 0 {
+                    limits.push(format!("at most {per_hour} requests an hour"));
+                }
                 return Err(AppError::AccountsBusy(
                     format!(
-                        "{}: each serves at most {limit} request(s) to Tidal at a time{rest}, and none freed up within {} s. Retry shortly.",
+                        "{}: each allows {}, and none freed up within {} s. Retry shortly.",
                         crate::error::ACCOUNTS_BUSY,
+                        limits.join(", "),
                         LEASE_WAIT.as_secs()
                     ),
-                    1,
+                    if per_hour > 0 { 5 } else { 1 },
                 ));
             }
             // The timer also catches accounts that finish resting or become usable without a release.
@@ -907,9 +1085,9 @@ impl AccountManager {
         &self,
         exclude_ids: &[String],
         kind: LeaseKind,
-        limit: u32,
-        rest_ms: u32,
+        rules: LeaseRules,
     ) -> Result<Option<PlaybackLease>, AppError> {
+        let LeaseRules { concurrency: limit, rest_ms, per_hour } = rules;
         // Serialize select+account: without this, N concurrent requests read
         // the same counters and all pick the same (currently-best) account,
         // leaving the rest idle under load.
@@ -930,41 +1108,19 @@ impl AccountManager {
             if !account.is_active.load(Ordering::Relaxed)
                 || account.is_catalog.load(Ordering::Relaxed)
             {
-                account.in_pool.store(false, Ordering::Relaxed);
                 continue;
             }
             if let Some(seconds) = Self::rate_limit_remaining(account) {
-                account.in_pool.store(false, Ordering::Relaxed);
                 if !exclude_ids.contains(&account.id) {
                     shortest_pause = Some(shortest_pause.map_or(seconds, |old| old.min(seconds)));
                 }
                 continue;
             }
             if let Some(seconds) = account.refresh_cooldown(now).await {
-                account.in_pool.store(false, Ordering::Relaxed);
                 shortest_cooldown = Some(shortest_cooldown.map_or(seconds, |old| old.min(seconds)));
                 continue;
             }
             pool.push(i);
-        }
-
-        // An account that just (re)joined the pool (added, re-enabled or back
-        // from a 429 pause) starts level with the busiest account already in
-        // it. Left with its lower counter it would win every pick until it
-        // caught up, taking the whole load right after a pause.
-        let level = pool
-            .iter()
-            .map(|&i| &accounts[i])
-            .filter(|account| account.in_pool.load(Ordering::Relaxed))
-            .map(|account| account.balance_usage.load(Ordering::Relaxed))
-            .max();
-        for &i in &pool {
-            let account = &accounts[i];
-            if !account.in_pool.swap(true, Ordering::Relaxed) {
-                if let Some(level) = level {
-                    account.balance_usage.fetch_max(level, Ordering::Relaxed);
-                }
-            }
         }
 
         let now_ms = Utc::now().timestamp_millis();
@@ -978,6 +1134,7 @@ impl AccountManager {
             .filter(|&i| {
                 (limit == 0 || accounts[i].pool_inflight() < limit as usize)
                     && accounts[i].rest_until_ms.load(Ordering::SeqCst) <= now_ms
+                    && (per_hour == 0 || accounts[i].requests_last_hour(now_ms) < per_hour as usize)
             })
             .collect();
         if eligible.is_empty() && !usable.is_empty() {
@@ -999,47 +1156,30 @@ impl AccountManager {
             ));
         }
 
-        let max_usage = eligible
-            .iter()
-            .map(|&i| accounts[i].balance_usage.load(Ordering::Relaxed))
-            .max()
-            .unwrap_or(0);
-
-        let mut scored: Vec<(usize, f64, usize)> = eligible
-            .into_iter()
-            .map(|i| {
-                let account = &accounts[i];
-                let usage = account.balance_usage.load(Ordering::Relaxed);
-                let last_used = account.last_used.load(Ordering::Relaxed);
-                let recency = if last_used > 0 {
-                    (now - last_used).max(0) as f64
-                } else {
-                    3600.0
-                };
-                let errors = account.error_count.load(Ordering::Relaxed);
-                let total = account.request_count.load(Ordering::Relaxed);
-                let score =
-                    Self::score_candidate(&self.weights, usage, max_usage, recency, errors, total);
-                (account.pool_inflight(), score, i)
-            })
-            .collect();
-
-        // Stable sort keeps the pre-sort order among exact ties; rotate that
-        // order round-robin so tied accounts spread evenly instead of always
-        // starting at creation index 0.
-        let seq = self.rr_seq.fetch_add(1, Ordering::Relaxed);
-        if !scored.is_empty() {
-            let rot = (seq as usize) % scored.len();
-            scored.rotate_left(rot);
+        // Order: confirmed FULL first for playback (unchecked next, recent
+        // PREVIEW last), then fewest requests in flight, then the least
+        // recently used once recent errors are counted in.
+        let mut scored: Vec<(u8, usize, i64, usize)> = Vec::with_capacity(eligible.len());
+        for i in eligible {
+            let account = &accounts[i];
+            let tier = match kind {
+                LeaseKind::Playback => account.full_tier(now).await,
+                LeaseKind::Metadata => 0,
+            };
+            let last_use = Self::effective_last_use(
+                &self.weights,
+                account.last_pick_ms.load(Ordering::Relaxed),
+                account.recent_error_rate(),
+            );
+            scored.push((tier, account.pool_inflight(), last_use, i));
         }
-        // Fewest requests in flight first: parallel requests take one account
-        // each before any account gets a second. The weighted score orders
-        // accounts that are equally busy.
-        scored.sort_by(|a, b| {
-            a.0.cmp(&b.0)
-                .then(b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
-        });
-        Ok(Some(Self::lease_kind(&accounts[scored[0].2], kind, rest_ms)))
+        // Rotate before the stable sort so exact ties take turns instead of
+        // always starting at creation index 0.
+        let seq = self.rr_seq.fetch_add(1, Ordering::Relaxed);
+        let rot = (seq as usize) % scored.len();
+        scored.rotate_left(rot);
+        scored.sort_by_key(|&(tier, busy, last_use, _)| (tier, busy, last_use));
+        Ok(Some(Self::lease_kind(&accounts[scored[0].3], kind, rest_ms)))
     }
 
     pub async fn select_account_excluding(
@@ -1209,6 +1349,7 @@ impl AccountManager {
         let now = Utc::now().timestamp();
         if let Some(account) = self.get_account_by_id(id).await {
             account.error_count.fetch_add(1, Ordering::Relaxed);
+            account.note_recent(true);
             if let Some(db) = &self.db {
                 let _ = sqlx::query(
                     "UPDATE account_metrics SET error_count = error_count + 1, last_error_at = ?, last_error_message = ? WHERE account_id = ?",
@@ -1219,6 +1360,23 @@ impl AccountManager {
                 .execute(db)
                 .await;
             }
+        }
+    }
+
+    /// A real track request just came back FULL: the subscription works, so
+    /// the account needs no separate FULL check for a while. Cheap enough to
+    /// call on every such answer; it writes at most once a minute.
+    pub async fn confirm_full(&self, account: &AccountState) {
+        let now = Utc::now().timestamp();
+        if account.premium_checked_at.load(Ordering::Relaxed) > now - 60
+            && account.premium_status.read().await.as_str() == "premium"
+        {
+            return;
+        }
+        *account.premium_status.write().await = "premium".to_string();
+        account.premium_checked_at.store(now, Ordering::Relaxed);
+        if account.preview_streak.swap(0, Ordering::Relaxed) != 0 {
+            self.save_preview_streak(account).await;
         }
     }
 
@@ -1312,7 +1470,7 @@ impl AccountManager {
             let mut tx = db.begin().await?;
             sqlx::query(
                 "UPDATE accounts SET label = ?, client_id = ?, client_secret = ?, refresh_token = ?, user_id = ?, updated_at = ?,
-                 heal_failures = ?, heal_next_retry = ?, rejected_access_token = ?, last_refresh_error = ? WHERE id = ?",
+                 heal_failures = ?, heal_next_retry = ?, rejected_access_token = ?, last_refresh_error = ?, auth_failing_since = ? WHERE id = ?",
             )
             .bind(&updated.label)
             .bind(&updated.client_id)
@@ -1324,6 +1482,7 @@ impl AccountManager {
             .bind(updated.heal_next_retry.load(Ordering::Relaxed))
             .bind(updated.rejected_access_token.read().await.clone())
             .bind(updated.last_refresh_error())
+            .bind(updated.auth_failing_since.load(Ordering::Relaxed))
             .bind(&old.id)
             .execute(&mut *tx)
             .await?;
@@ -1388,11 +1547,13 @@ impl AccountManager {
             account.heal_failures.store(0, Ordering::Relaxed);
             account.heal_next_retry.store(0, Ordering::Relaxed);
             account.auth_forbidden_streak.store(0, Ordering::Relaxed);
+            // The owner decided: an auth-failure switch-off becomes a plain manual state.
+            account.auth_failing_since.store(0, Ordering::Relaxed);
             account.disabled_at.store(disabled_at, Ordering::Relaxed);
             account.updated_at.store(now, Ordering::Relaxed);
             self.observe_uptime(account).await;
             if let Some(db) = &self.db {
-                sqlx::query("UPDATE accounts SET is_active = ?, auto_disabled = 0, disabled_at = ?, updated_at = ?, heal_failures = 0, heal_next_retry = 0 WHERE id = ?")
+                sqlx::query("UPDATE accounts SET is_active = ?, auto_disabled = 0, disabled_at = ?, updated_at = ?, heal_failures = 0, heal_next_retry = 0, auth_failing_since = 0 WHERE id = ?")
                     .bind(active as i32)
                     .bind(disabled_at)
                     .bind(now)
@@ -1408,6 +1569,37 @@ impl AccountManager {
     }
 
     // --- Redis credential sync ---
+
+    /// Switch off an account whose token refresh has failed with 403 for
+    /// `max_secs`. Unlike `set_system_disabled` it is not auto-healed: the
+    /// account stays off, and stops retrying, until the owner turns it on.
+    pub(crate) async fn disable_after_auth_failures(&self, expected: &AccountState, max_secs: i64, now: i64) -> Result<bool, AppError> {
+        let accounts = self.accounts.write().await;
+        let Some(account) = accounts.iter().find(|a| std::ptr::eq(a.as_ref(), expected)) else {
+            return Ok(false);
+        };
+        let since = account.auth_failing_since.load(Ordering::Relaxed);
+        let enabled = account.is_active.load(Ordering::Relaxed) || account.auto_disabled.load(Ordering::Relaxed);
+        if max_secs <= 0 || since <= 0 || now - since < max_secs || !enabled {
+            return Ok(false);
+        }
+        account.is_active.store(false, Ordering::Relaxed);
+        account.auto_disabled.store(false, Ordering::Relaxed);
+        let disabled_at = match account.disabled_at.load(Ordering::Relaxed) {
+            0 => now,
+            at => at,
+        };
+        account.disabled_at.store(disabled_at, Ordering::Relaxed);
+        account.updated_at.store(now, Ordering::Relaxed);
+        self.observe_uptime(account).await;
+        if let Some(db) = &self.db {
+            sqlx::query("UPDATE accounts SET is_active = 0, auto_disabled = 0, disabled_at = ?, updated_at = ? WHERE id = ?")
+                .bind(disabled_at).bind(now).bind(&account.id)
+                .execute(db).await?;
+        }
+        self.push_account_to_redis(account).await;
+        Ok(true)
+    }
 
     /// Conditional background transition; an explicit owner OFF always wins.
     pub(crate) async fn set_system_disabled(&self, expected: &AccountState, disabled: bool) -> Result<bool, AppError> {
@@ -1580,7 +1772,7 @@ impl AccountManager {
                             "UPDATE accounts SET label = ?, client_id = ?, client_secret = ?,
                              refresh_token = ?, user_id = ?, is_active = ?, auto_disabled = ?, disabled_at = ?,
                              is_catalog = ?, notes = ?, updated_at = ?,
-                             heal_failures = ?, heal_next_retry = ?, rejected_access_token = ?, last_refresh_error = ? WHERE id = ?",
+                             heal_failures = ?, heal_next_retry = ?, rejected_access_token = ?, last_refresh_error = ?, auth_failing_since = ? WHERE id = ?",
                         )
                         .bind(&rebuilt.label)
                         .bind(&rebuilt.client_id)
@@ -1597,6 +1789,7 @@ impl AccountManager {
                         .bind(rebuilt.heal_next_retry.load(Ordering::Relaxed))
                         .bind(rebuilt.rejected_access_token.read().await.clone())
                         .bind(rebuilt.last_refresh_error())
+                        .bind(rebuilt.auth_failing_since.load(Ordering::Relaxed))
                         .bind(&rebuilt.id)
                         .execute(db)
                         .await;
@@ -1749,6 +1942,10 @@ mod tests {
     use super::{AccountManager, AccountState, SwitchingWeights, utc_day};
     use crate::error::AppError;
     use std::sync::atomic::Ordering;
+
+    fn rules(concurrency: u32, rest_ms: u32) -> super::LeaseRules {
+        super::LeaseRules { concurrency, rest_ms, per_hour: 0 }
+    }
 
     #[test]
     fn utc_day_boundaries() {
@@ -1960,28 +2157,29 @@ mod tests {
     }
 
     #[test]
-    fn score_candidate_math() {
+    fn selection_prefers_least_recently_used_and_penalizes_recent_errors() {
         use super::{AccountManager, SwitchingWeights};
         let w = SwitchingWeights::default();
-        // Fresh accounts carry no error penalty (zero requests ⇒ zero rate).
-        let fresh = AccountManager::score_candidate(&w, 0, 0, 3600.0, 0, 0);
-        let faulty = AccountManager::score_candidate(&w, 10, 10, 3600.0, 10, 10);
-        let clean = AccountManager::score_candidate(&w, 10, 10, 3600.0, 0, 10);
-        assert!(clean > faulty, "errors must lower the score");
-        assert!(
-            fresh >= clean,
-            "a fresh account must not look faulty: fresh={} clean={}",
-            fresh,
-            clean
-        );
-        // The balance term stays meaningful at volume: the behind account
-        // wins when recency/errors tie, even at 6-digit counts.
-        let ahead = AccountManager::score_candidate(&w, 100_001, 100_001, 0.0, 0, 100_001);
-        let behind = AccountManager::score_candidate(&w, 100_000, 100_001, 0.0, 0, 100_000);
-        assert!(
-            behind > ahead,
-            "usage lead must not become invisible at scale"
-        );
+        let clean = AccountManager::effective_last_use(&w, 1_000_000, 0.0);
+        assert_eq!(clean, 1_000_000);
+        // Failing every recent request counts as being used 10 minutes later.
+        assert_eq!(AccountManager::effective_last_use(&w, 1_000_000, 1.0), 1_600_000);
+        assert_eq!(AccountManager::effective_last_use(&w, 1_000_000, 0.5), 1_300_000);
+        // A slightly older pick with many errors loses to a clean, newer one.
+        assert!(AccountManager::effective_last_use(&w, 900_000, 0.8) > clean);
+    }
+
+    #[test]
+    fn recent_error_rate_fades_instead_of_lasting_forever() {
+        let mut recent = super::RecentOutcomes::default();
+        recent.decay(1);
+        recent.requests = 100.0;
+        recent.errors = 100.0;
+        assert_eq!(recent.error_rate(), 1.0);
+        // After a quiet hour four half-lives have passed; new clean traffic dominates.
+        recent.decay(1 + 60 * 60 * 1000);
+        recent.requests += 20.0;
+        assert!(recent.error_rate() < 0.25, "{}", recent.error_rate());
     }
 
     #[tokio::test]
@@ -2518,10 +2716,11 @@ mod tests {
                     .unwrap(),
             );
         }
-        am.select_account().await.unwrap();
-        // The weighted score alone would send every request to the first account.
-        accounts[1].balance_usage.store(1000, Ordering::Relaxed);
-        accounts[2].balance_usage.store(1000, Ordering::Relaxed);
+        // By recency alone every request would go to the first account.
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        accounts[0].last_pick_ms.store(1, Ordering::Relaxed);
+        accounts[1].last_pick_ms.store(now_ms, Ordering::Relaxed);
+        accounts[2].last_pick_ms.store(now_ms, Ordering::Relaxed);
         let mut leases = Vec::new();
         for _ in 0..3 {
             leases.push(am.lease_account_excluding(&[]).await.unwrap());
@@ -2545,14 +2744,14 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let first = am.lease_account_for(&[], LeaseKind::Playback, 1, 0).await.unwrap();
+        let first = am.lease_account_for(&[], LeaseKind::Playback, rules(1, 0)).await.unwrap();
         // Metadata counts too: the second account now sends one request to Tidal.
-        let second = am.lease_account_for(&[], LeaseKind::Metadata, 1, 0).await.unwrap();
+        let second = am.lease_account_for(&[], LeaseKind::Metadata, rules(1, 0)).await.unwrap();
         assert_ne!(first.account().id, second.account().id);
 
         let waiting = {
             let am = am.clone();
-            tokio::spawn(async move { am.lease_account_for(&[], LeaseKind::Playback, 1, 0).await })
+            tokio::spawn(async move { am.lease_account_for(&[], LeaseKind::Playback, rules(1, 0)).await })
         };
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         assert!(!waiting.is_finished(), "a full pool must wait instead of doubling up");
@@ -2569,7 +2768,7 @@ mod tests {
         drop(third);
         // 0 lifts the limit.
         let leases: Vec<_> = futures::future::join_all(
-            (0..4).map(|_| am.lease_account_for(&[], LeaseKind::Playback, 0, 0)),
+            (0..4).map(|_| am.lease_account_for(&[], LeaseKind::Playback, rules(0, 0))),
         )
         .await;
         assert!(leases.iter().all(|lease| lease.is_ok()));
@@ -2592,14 +2791,14 @@ mod tests {
         accounts[1].token_expires_at.store(now + 3600, Ordering::Relaxed);
         accounts[0].heal_next_retry.store(now + 600, Ordering::Relaxed);
         for _ in 0..5 {
-            let lease = am.lease_account_for(&[], LeaseKind::Playback, 0, 0).await.unwrap();
+            let lease = am.lease_account_for(&[], LeaseKind::Playback, rules(0, 0)).await.unwrap();
             assert_eq!(lease.account().id, accounts[1].id);
         }
         assert_eq!(accounts[0].request_count.load(Ordering::Relaxed), 0);
         // Once its cooldown ends, a request may try the refresh again.
         accounts[0].heal_next_retry.store(now - 1, Ordering::Relaxed);
-        let busy = am.lease_account_for(&[], LeaseKind::Playback, 1, 0).await.unwrap();
-        let other = am.lease_account_for(&[], LeaseKind::Playback, 1, 0).await.unwrap();
+        let busy = am.lease_account_for(&[], LeaseKind::Playback, rules(1, 0)).await.unwrap();
+        let other = am.lease_account_for(&[], LeaseKind::Playback, rules(1, 0)).await.unwrap();
         assert_ne!(busy.account().id, other.account().id);
         drop((busy, other));
         // With nothing else left the caller learns when to come back.
@@ -2607,9 +2806,113 @@ mod tests {
         accounts[1].heal_next_retry.store(now + 60, Ordering::Relaxed);
         accounts[1].token_expires_at.store(now - 1, Ordering::Relaxed);
         assert!(matches!(
-            am.lease_account_for(&[], LeaseKind::Playback, 0, 0).await,
+            am.lease_account_for(&[], LeaseKind::Playback, rules(0, 0)).await,
             Err(AppError::ServiceUnavailableRetry(_, 55..=60))
         ));
+    }
+
+    #[tokio::test]
+    async fn long_auth_403_streak_switches_the_account_off_until_the_owner_returns() {
+        let db = crate::db::init_pool("sqlite::memory:").await.unwrap();
+        let am = AccountManager::new(Some(db.clone()), SwitchingWeights::default());
+        let account = am
+            .add_account("a".into(), "c".into(), "s".into(), "rt-a".into(), None)
+            .await
+            .unwrap();
+        let day = 24 * 3600;
+        let now = 10 * day;
+        // No streak, or a shorter one, or the setting off: nothing happens.
+        assert!(!am.disable_after_auth_failures(&account, day, now).await.unwrap());
+        account.auth_failing_since.store(now - day + 1, Ordering::Relaxed);
+        account.persist_refresh_state().await.unwrap();
+        assert!(!am.disable_after_auth_failures(&account, day, now).await.unwrap());
+        assert!(!am.disable_after_auth_failures(&account, 0, now + day).await.unwrap());
+
+        assert!(am.disable_after_auth_failures(&account, day, now + 1).await.unwrap());
+        assert!(!account.is_active.load(Ordering::Relaxed));
+        // Not auto-disabled, so auto-heal leaves it alone.
+        assert!(!account.auto_disabled.load(Ordering::Relaxed));
+        assert_eq!(account.disabled_at.load(Ordering::Relaxed), now + 1);
+        assert!(!am.disable_after_auth_failures(&account, day, now + 2).await.unwrap());
+
+        // Both the switch-off and the streak survive a restart.
+        let reloaded = AccountManager::new(Some(db.clone()), SwitchingWeights::default());
+        reloaded.load_from_db().await.unwrap();
+        let restored = reloaded.get_account_by_id(&account.id).await.unwrap();
+        assert!(!restored.is_active.load(Ordering::Relaxed));
+        assert_eq!(restored.auth_failing_since.load(Ordering::Relaxed), now - day + 1);
+
+        // Turning it on is the owner's call and starts from a clean slate.
+        reloaded.set_account_active(&account.id, true).await.unwrap();
+        assert_eq!(restored.auth_failing_since.load(Ordering::Relaxed), 0);
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn playback_prefers_confirmed_full_then_unchecked_then_preview() {
+        use super::LeaseKind;
+        let am = AccountManager::new(None, SwitchingWeights::default());
+        let mut accounts = Vec::new();
+        for label in ["preview", "unchecked", "full"] {
+            accounts.push(
+                am.add_account(label.into(), "c".into(), "s".into(), format!("rt-{label}"), None)
+                    .await
+                    .unwrap(),
+            );
+        }
+        let now = chrono::Utc::now().timestamp();
+        *accounts[0].premium_status.write().await = "preview-only".into();
+        accounts[0].premium_checked_at.store(now, Ordering::Relaxed);
+        am.confirm_full(&accounts[2]).await;
+        for _ in 0..5 {
+            let lease = am.lease_account_for(&[], LeaseKind::Playback, rules(0, 0)).await.unwrap();
+            assert_eq!(lease.account().id, accounts[2].id);
+        }
+        // While the FULL account is busy, an unchecked one beats a PREVIEW one.
+        let busy = am.lease_account_for(&[], LeaseKind::Playback, rules(1, 0)).await.unwrap();
+        let next = am.lease_account_for(&[], LeaseKind::Playback, rules(1, 0)).await.unwrap();
+        assert_eq!((busy.account().id.as_str(), next.account().id.as_str()), (accounts[2].id.as_str(), accounts[1].id.as_str()));
+        let last = am.lease_account_for(&[], LeaseKind::Playback, rules(1, 0)).await.unwrap();
+        assert_eq!(last.account().id, accounts[0].id);
+        drop((busy, next, last));
+        // Metadata does not care about FULL.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..6 {
+            seen.insert(am.lease_account_for(&[], LeaseKind::Metadata, rules(0, 0)).await.unwrap().account().id.clone());
+        }
+        assert_eq!(seen.len(), 3);
+        // A FULL result older than 8 hours no longer counts.
+        accounts[2].premium_checked_at.store(now - super::FULL_CHECK_MAX_AGE_SECS - 1, Ordering::Relaxed);
+        assert_eq!(accounts[2].full_tier(now).await, 1);
+    }
+
+    #[tokio::test]
+    async fn hourly_limit_skips_accounts_that_used_their_quota() {
+        use super::{LeaseKind, LeaseRules};
+        let am = AccountManager::new(None, SwitchingWeights::default());
+        let mut accounts = Vec::new();
+        for label in ["a", "b"] {
+            accounts.push(
+                am.add_account(label.into(), "c".into(), "s".into(), format!("rt-{label}"), None)
+                    .await
+                    .unwrap(),
+            );
+        }
+        let per_hour = LeaseRules { concurrency: 0, rest_ms: 0, per_hour: 2 };
+        for _ in 0..4 {
+            am.lease_account_for(&[], LeaseKind::Playback, per_hour).await.unwrap();
+        }
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        assert!(accounts.iter().all(|a| a.requests_last_hour(now_ms) == 2));
+        // Both used their quota: a fifth request waits rather than exceeding it.
+        let waiting = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            am.lease_account_for(&[], LeaseKind::Playback, per_hour),
+        )
+        .await;
+        assert!(waiting.is_err());
+        // An hour later the quota is free again.
+        assert_eq!(accounts[0].requests_last_hour(now_ms + 3_600_001), 0);
     }
 
     #[tokio::test]
@@ -2621,16 +2924,16 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let first = am.lease_account_for(&[], LeaseKind::Playback, 1, 300).await.unwrap();
+        let first = am.lease_account_for(&[], LeaseKind::Playback, rules(1, 300)).await.unwrap();
         let rested = first.account().id.clone();
         drop(first);
         // The resting account is skipped while another one is free.
-        let second = am.lease_account_for(&[], LeaseKind::Playback, 1, 300).await.unwrap();
+        let second = am.lease_account_for(&[], LeaseKind::Playback, rules(1, 300)).await.unwrap();
         assert_ne!(second.account().id, rested);
         drop(second);
         // Both rest now: the next request waits for the first rest to end.
         let started = std::time::Instant::now();
-        let third = am.lease_account_for(&[], LeaseKind::Playback, 1, 300).await.unwrap();
+        let third = am.lease_account_for(&[], LeaseKind::Playback, rules(1, 300)).await.unwrap();
         assert_eq!(third.account().id, rested);
         assert!(started.elapsed() >= std::time::Duration::from_millis(150));
     }

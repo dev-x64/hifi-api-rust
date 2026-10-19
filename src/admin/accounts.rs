@@ -48,8 +48,10 @@ pub async fn list_accounts(State(state): State<AppState>) -> Result<Json<Value>,
     sort_accounts_by_created_at(&mut accounts);
     let mut list: Vec<Value> = Vec::with_capacity(accounts.len());
     let now = chrono::Utc::now().timestamp();
+    let disable_secs = i64::from(state.settings.auth_failure_disable_hours()) * 3600;
     for a in &accounts {
         let availability = super::stats::account_availability(a, now).await;
+        let failing_since = a.auth_failing_since.load(std::sync::atomic::Ordering::Relaxed);
         list.push(json!({
             "id": a.id,
             "label": a.label,
@@ -63,6 +65,14 @@ pub async fn list_accounts(State(state): State<AppState>) -> Result<Json<Value>,
             "heal_failures": a.heal_failures.load(std::sync::atomic::Ordering::Relaxed),
             "heal_next_retry": a.heal_next_retry.load(std::sync::atomic::Ordering::Relaxed),
             "last_refresh_error": a.last_refresh_error(),
+            "auth_failing_since": failing_since,
+            "country_code": a.country(),
+            "recent_error_rate": a.recent_error_rate(),
+            "requests_last_hour": a.requests_last_hour(now * 1000),
+            "subscription": a.subscription(),
+            "subscription_checked_at": a.subscription_checked_at.load(std::sync::atomic::Ordering::Relaxed),
+            // When the 403 streak switches the account off; null when it will not.
+            "auth_disable_at": (failing_since > 0 && disable_secs > 0).then(|| failing_since + disable_secs),
             "request_count": a.request_count.load(std::sync::atomic::Ordering::Relaxed),
             "error_count": a.error_count.load(std::sync::atomic::Ordering::Relaxed),
             "rate_limited_until": a.rate_limited_until.load(std::sync::atomic::Ordering::Relaxed),
@@ -264,8 +274,10 @@ pub async fn check_account_subscription(
         .await
         .ok_or_else(|| AppError::NotFound(format!("Account {} not found", id)))?;
     let mut result = state.tidal_client.account_subscription(&account).await?;
+    let now = chrono::Utc::now().timestamp();
+    account.store_subscription(result["subscription"].clone(), now).await;
     result["account_id"] = json!(id);
-    result["checked_at"] = json!(chrono::Utc::now().timestamp());
+    result["checked_at"] = json!(now);
     Ok(Json(result))
 }
 

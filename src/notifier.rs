@@ -179,6 +179,35 @@ impl Notifier {
         self.send_throttled("catalog", payload).await;
     }
 
+    /// Fired when an account is switched off after its token refresh kept
+    /// failing with 403.
+    pub async fn alert_auth_disabled(&self, label: &str, hours: u32, suspended: bool) {
+        let reason = if suspended {
+            format!("Token refresh has failed for {hours} h with HTTP 403 abuse_detected (Tidal reports the account as suspended).")
+        } else {
+            format!("Token refresh has failed with HTTP 403 for {hours} h.")
+        };
+        let payload = Self::embed(
+            "⛔ Account switched off",
+            &format!("{reason} The account stays off until it is turned on in the admin panel."),
+            0xF85149,
+            vec![json!({"name": "Account", "value": label, "inline": true})],
+        );
+        self.send_throttled(&format!("auth_disabled:{label}"), payload).await;
+    }
+
+    /// Fired by the daily subscription check when a plan is about to end,
+    /// has ended, or its payment is overdue.
+    pub async fn alert_subscription(&self, label: &str, problem: &str) {
+        let payload = Self::embed(
+            "💳 Subscription needs attention",
+            problem,
+            0xD29922,
+            vec![json!({"name": "Account", "value": label, "inline": true})],
+        );
+        self.send_throttled(&format!("subscription:{label}"), payload).await;
+    }
+
     /// Manual on-demand report from the admin panel (bypasses throttle).
     pub async fn send_report(&self, payload: Value) -> Result<(), String> {
         let url = self.settings.discord_webhook_url();

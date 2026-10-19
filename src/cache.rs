@@ -15,14 +15,9 @@ use tokio::sync::Mutex;
 use crate::AppState;
 
 const HOUR_SECS: u64 = 3600;
-const DAY_SECS: u64 = 24 * HOUR_SECS;
-/// Extra window after the fresh period during which entries still serve
-/// instantly (X-Cache: STALE) while a background refresh runs. Expiry
-/// misses become hits; only cold keys miss. Long on purpose: a stale serve
-/// always triggers a refresh, so changes still arrive with the next request.
-const STALE_WINDOW_SECS: u64 = 7 * DAY_SECS;
-/// Longest fresh period of any route (see `fresh_secs`).
-const MAX_FRESH_SECS: u64 = 7 * DAY_SECS;
+/// Longest fresh period of any route (see `fresh_secs`), and the cap on
+/// the stale window that follows it.
+const MAX_FRESH_SECS: u64 = 12 * HOUR_SECS;
 /// Hard memory bound for cached bodies (moka weight = body bytes).
 const MAX_CACHE_BYTES: u64 = 128 * 1024 * 1024;
 /// Hard memory bound for negatively cached error bodies.
@@ -84,21 +79,23 @@ fn normalize_query(query: Option<&str>) -> String {
 }
 
 /// How long a cached metadata answer stays fresh, by how often it changes:
-/// album, track info, covers and lyrics hardly ever; artists and
-/// recommendations now and then; search a few times a day; playlists and
-/// mixes often.
+/// playlists and mixes often, search a few times a day, everything else
+/// (albums, artists, track info, covers, lyrics, recommendations) rarely.
 fn fresh_secs(path: &str) -> u64 {
-    const STABLE: &[&str] = &["/album/", "/info/", "/cover/", "/lyrics/"];
-    const DAILY: &[&str] = &["/artist/", "/recommendations/"];
-    if STABLE.iter().any(|p| path.starts_with(p)) {
-        MAX_FRESH_SECS
-    } else if DAILY.iter().any(|p| path.starts_with(p)) {
-        12 * HOUR_SECS
+    if path.starts_with("/playlist/") || path.starts_with("/mix/") {
+        15 * 60
     } else if path.starts_with("/search/") {
-        6 * HOUR_SECS
+        4 * HOUR_SECS
     } else {
-        HOUR_SECS
+        MAX_FRESH_SECS
     }
+}
+
+/// After the fresh period an entry is still served instantly (X-Cache:
+/// STALE) for as long again, while a background request refreshes it, so
+/// expiry misses become hits and only cold keys miss.
+fn stale_secs(path: &str) -> u64 {
+    fresh_secs(path).min(MAX_FRESH_SECS)
 }
 
 /// Freshness of a cached entry of a given age (seconds). Entries younger
@@ -109,7 +106,7 @@ fn freshness(path: &str, age_secs: i64) -> Freshness {
     let fresh = fresh_secs(path);
     if age_secs < fresh as i64 {
         Freshness::Fresh
-    } else if age_secs < (fresh + STALE_WINDOW_SECS) as i64 {
+    } else if age_secs < (fresh + stale_secs(path)) as i64 {
         Freshness::Stale
     } else {
         Freshness::Expired
@@ -184,7 +181,7 @@ impl ResponseCache {
     pub fn new() -> Self {
         Self {
             cache: Cache::builder()
-                .time_to_live(Duration::from_secs(MAX_FRESH_SECS + STALE_WINDOW_SECS))
+                .time_to_live(Duration::from_secs(2 * MAX_FRESH_SECS))
                 .weigher(|_k, v: &CachedResponse| v.body.len() as u32)
                 .max_capacity(MAX_CACHE_BYTES)
                 .build(),
@@ -480,20 +477,22 @@ mod tests {
 
     #[test]
     fn freshness_windows() {
-        let week = 7 * 24 * 3600;
-        // Playlists change often: fresh for an hour, then served stale while refreshed.
+        let hour = 3600;
+        // Playlists and mixes: 15 minutes fresh, then 15 minutes served stale while refreshed.
         assert_eq!(freshness("/playlist/", 0), Freshness::Fresh);
-        assert_eq!(freshness("/playlist/", 3599), Freshness::Fresh);
-        assert_eq!(freshness("/playlist/", 3600), Freshness::Stale);
-        assert_eq!(freshness("/playlist/", 3600 + week - 1), Freshness::Stale);
-        assert_eq!(freshness("/playlist/", 3600 + week), Freshness::Expired);
-        // Search for 6 hours, artists for 12, albums and lyrics for a week.
-        assert_eq!(freshness("/search/", 6 * 3600 - 1), Freshness::Fresh);
-        assert_eq!(freshness("/search/", 6 * 3600), Freshness::Stale);
-        assert_eq!(freshness("/artist/similar/", 12 * 3600 - 1), Freshness::Fresh);
-        assert_eq!(freshness("/album/", week - 1), Freshness::Fresh);
-        assert_eq!(freshness("/lyrics/", 2 * week - 1), Freshness::Stale);
-        assert_eq!(freshness("/album/", 2 * week), Freshness::Expired);
+        assert_eq!(freshness("/mix/", 15 * 60 - 1), Freshness::Fresh);
+        assert_eq!(freshness("/playlist/", 15 * 60), Freshness::Stale);
+        assert_eq!(freshness("/playlist/", 30 * 60 - 1), Freshness::Stale);
+        assert_eq!(freshness("/playlist/", 30 * 60), Freshness::Expired);
+        // Search: 4 + 4 hours.
+        assert_eq!(freshness("/search/", 4 * hour - 1), Freshness::Fresh);
+        assert_eq!(freshness("/search/", 4 * hour), Freshness::Stale);
+        assert_eq!(freshness("/search/", 8 * hour), Freshness::Expired);
+        // Everything else: 12 + 12 hours at most.
+        assert_eq!(freshness("/album/", 12 * hour - 1), Freshness::Fresh);
+        assert_eq!(freshness("/artist/similar/", 12 * hour), Freshness::Stale);
+        assert_eq!(freshness("/lyrics/", 24 * hour - 1), Freshness::Stale);
+        assert_eq!(freshness("/info/", 24 * hour), Freshness::Expired);
     }
 
     #[test]

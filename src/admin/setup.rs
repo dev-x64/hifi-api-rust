@@ -93,7 +93,7 @@ struct TokenResponse {
 struct UserInfo {
     #[serde(rename = "userId", deserialize_with = "de_string_or_int")]
     user_id: String,
-    #[serde(default)]
+    #[serde(default, rename = "countryCode")]
     country_code: String,
 }
 
@@ -244,6 +244,7 @@ pub async fn start_setup(
                 .await
             {
                 Ok(acc) => {
+                    acc.set_country(token_resp.user.as_ref().map(|u| u.country_code.clone()));
                     if catalog {
                         if let Err(e) = am.set_account_catalog(&acc.id, true).await {
                             tracing::warn!("Could not mark {} as catalog-only: {}", user_id, e);

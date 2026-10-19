@@ -24,6 +24,11 @@ pub struct AppSettings {
     /// Pause in milliseconds a playback account takes after each request
     /// before it may take the next one. 0 = no pause.
     track_request_delay_ms: RwLock<u32>,
+    /// Hours of token refresh failing with 403 before an account is switched
+    /// off for good (until the owner turns it on). 0 = never.
+    auth_failure_disable_hours: RwLock<u32>,
+    /// Requests one playback account may start within an hour. 0 = no limit.
+    requests_per_hour_per_account: RwLock<u32>,
     /// Secret: never include this in API snapshots or logs.
     discord_webhook_url: RwLock<String>,
     /// Shared cross-instance state (None = single-host mode, skip sync).
@@ -39,6 +44,8 @@ impl AppSettings {
             catalog_concurrency_per_account: RwLock::new(0),
             track_concurrency_per_account: RwLock::new(1),
             track_request_delay_ms: RwLock::new(0),
+            auth_failure_disable_hours: RwLock::new(24),
+            requests_per_hour_per_account: RwLock::new(0),
             discord_webhook_url: RwLock::new(
                 std::env::var("DISCORD_WEBHOOK_URL").unwrap_or_default(),
             ),
@@ -66,6 +73,8 @@ impl AppSettings {
             "catalog_concurrency_per_account": self.catalog_concurrency_per_account(),
             "track_concurrency_per_account": self.track_concurrency_per_account(),
             "track_request_delay_ms": self.track_request_delay_ms(),
+            "auth_failure_disable_hours": self.auth_failure_disable_hours(),
+            "requests_per_hour_per_account": self.requests_per_hour_per_account(),
         })
     }
 
@@ -100,6 +109,20 @@ impl AppSettings {
     pub fn track_request_delay_ms(&self) -> u32 {
         *self
             .track_request_delay_ms
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn auth_failure_disable_hours(&self) -> u32 {
+        *self
+            .auth_failure_disable_hours
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn requests_per_hour_per_account(&self) -> u32 {
+        *self
+            .requests_per_hour_per_account
             .read()
             .unwrap_or_else(|e| e.into_inner())
     }
@@ -167,6 +190,18 @@ impl AppSettings {
                 .track_concurrency_per_account
                 .write()
                 .unwrap_or_else(|e| e.into_inner()) = normalize_concurrency_per_account(v);
+        }
+        if let Some(v) = first_opt_u32(updates, "requests_per_hour_per_account")? {
+            *self
+                .requests_per_hour_per_account
+                .write()
+                .unwrap_or_else(|e| e.into_inner()) = normalize_requests_per_hour(v);
+        }
+        if let Some(v) = first_opt_u32(updates, "auth_failure_disable_hours")? {
+            *self
+                .auth_failure_disable_hours
+                .write()
+                .unwrap_or_else(|e| e.into_inner()) = normalize_disable_hours(v);
         }
         if let Some(v) = first_opt_u32(updates, "track_request_delay_ms")? {
             *self
@@ -248,6 +283,22 @@ impl AppSettings {
                         .unwrap_or_else(|e| e.into_inner()) = normalize_concurrency_per_account(value);
                 }
             }
+            "requests_per_hour_per_account" => {
+                if let Ok(value) = value.parse::<u32>() {
+                    *self
+                        .requests_per_hour_per_account
+                        .write()
+                        .unwrap_or_else(|e| e.into_inner()) = normalize_requests_per_hour(value);
+                }
+            }
+            "auth_failure_disable_hours" => {
+                if let Ok(value) = value.parse::<u32>() {
+                    *self
+                        .auth_failure_disable_hours
+                        .write()
+                        .unwrap_or_else(|e| e.into_inner()) = normalize_disable_hours(value);
+                }
+            }
             "track_request_delay_ms" => {
                 if let Ok(value) = value.parse::<u32>() {
                     *self
@@ -269,6 +320,8 @@ impl AppSettings {
         "catalog_concurrency_per_account",
         "track_concurrency_per_account",
         "track_request_delay_ms",
+        "auth_failure_disable_hours",
+        "requests_per_hour_per_account",
     ];
 
     /// Canonical (key, value) snapshot, shared by the SQLite and Redis writers.
@@ -301,6 +354,14 @@ impl AppSettings {
             (
                 "track_request_delay_ms",
                 self.track_request_delay_ms().to_string(),
+            ),
+            (
+                "auth_failure_disable_hours",
+                self.auth_failure_disable_hours().to_string(),
+            ),
+            (
+                "requests_per_hour_per_account",
+                self.requests_per_hour_per_account().to_string(),
             ),
         ]
         .into_iter()
@@ -428,6 +489,15 @@ fn normalize_concurrency_per_account(value: u32) -> u32 {
     value.min(1000)
 }
 
+fn normalize_requests_per_hour(value: u32) -> u32 {
+    value.min(10_000)
+}
+
+/// Up to 30 days.
+fn normalize_disable_hours(value: u32) -> u32 {
+    value.min(720)
+}
+
 /// Capped below the lease wait, so a resting pool never times requests out.
 fn normalize_request_delay_ms(value: u32) -> u32 {
     value.min(10_000)
@@ -540,6 +610,14 @@ mod tests {
         assert_eq!(settings.snapshot()["track_request_delay_ms"], 750);
         settings.apply_kv("track_request_delay_ms", "99999");
         assert_eq!(settings.track_request_delay_ms(), 10_000);
+        assert_eq!(settings.auth_failure_disable_hours(), 24);
+        settings.apply(&serde_json::json!({"auth_failure_disable_hours": 0})).unwrap();
+        assert_eq!(settings.snapshot()["auth_failure_disable_hours"], 0);
+        settings.apply_kv("auth_failure_disable_hours", "100000");
+        assert_eq!(settings.auth_failure_disable_hours(), 720);
+        assert_eq!(settings.requests_per_hour_per_account(), 0);
+        settings.apply(&serde_json::json!({"requests_per_hour_per_account": 300})).unwrap();
+        assert_eq!(settings.snapshot()["requests_per_hour_per_account"], 300);
         // Redis seeding pairs these two lists by position.
         let entries = settings.settings_entries();
         assert_eq!(entries.len(), AppSettings::REDIS_SETTING_NAMES.len());

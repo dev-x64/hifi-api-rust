@@ -19,6 +19,10 @@ const AUTH_INITIAL_ATTEMPTS: usize = 4;
 const AUTH_RETRY_BASE_MS: u64 = 1_500;
 const AUTH_RETRY_MAX_MS: u64 = 20_000;
 const AUTH_FORBIDDEN_ROTATE_THRESHOLD: u64 = 4;
+/// OAuth error Tidal returns (HTTP 403, sub_status 12001, "User account is
+/// suspended due to abuse"). Seen for a single request while the account
+/// kept working elsewhere, so it is not treated as final on its own.
+pub const ACCOUNT_SUSPENDED: &str = "abuse_detected";
 const AUTH_CONCURRENCY: usize = 2;
 
 struct TokenAttemptFailure {
@@ -126,6 +130,7 @@ impl TokenManager {
         *account.access_token.write().await = Some(token.into());
         account.token_expires_at.store(expires, Ordering::Relaxed);
         account.set_last_refresh_error(None);
+        account.auth_failing_since.store(0, Ordering::Relaxed);
         Self::save_refresh_state(account).await;
         account.observe_uptime(Utc::now().timestamp()).await;
         Some(token.into())
@@ -251,6 +256,7 @@ impl TokenManager {
                 account.heal_failures.store(0, Ordering::Relaxed);
                 account.heal_next_retry.store(0, Ordering::Relaxed);
                 account.auth_forbidden_streak.store(0, Ordering::Relaxed);
+                account.auth_failing_since.store(0, Ordering::Relaxed);
                 Ok(token)
             }
             result => {
@@ -283,6 +289,15 @@ impl TokenManager {
                     AppError::Unauthorized(_) => 300,
                     _ => 0,
                 };
+                // Start the clock for switching off an account Tidal keeps refusing.
+                if matches!(&error, AppError::UpstreamError(status, _) if *status == reqwest::StatusCode::FORBIDDEN) {
+                    let _ = account.auth_failing_since.compare_exchange(
+                        0,
+                        Utc::now().timestamp(),
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    );
+                }
                 account.set_last_refresh_error(Some(error.to_string()));
                 let delay = Self::defer_retry(account, minimum).await;
                 tracing::warn!(account = %account.label, retry_in = delay, "Token refresh failed: {}", error);
@@ -454,13 +469,18 @@ impl TokenManager {
                 .as_deref()
                 .map(|value| AccountManager::retry_after_secs(Some(value)))
                 .unwrap_or(0);
+            // Keep Tidal's own reason, e.g. "abuse_detected (User account is
+            // suspended due to abuse)", instead of a bare status.
+            let description = data.get("error_description").and_then(Value::as_str).unwrap_or("");
+            let message = match (oauth_error, description) {
+                ("", "") => format!("Tidal auth HTTP {status}"),
+                ("", text) | (text, "") => format!("Tidal auth HTTP {status}: {text}"),
+                (code, text) => format!("Tidal auth HTTP {status}: {code} ({text})"),
+            };
             let error = if retry_after.is_some() {
-                AppError::ServiceUnavailableRetry(
-                    format!("Tidal auth HTTP {status}"),
-                    retry_after_secs,
-                )
+                AppError::ServiceUnavailableRetry(message, retry_after_secs)
             } else {
-                AppError::UpstreamError(status, format!("Tidal auth HTTP {status}"))
+                AppError::UpstreamError(status, message)
             };
             return Err(TokenAttemptFailure {
                 error,
@@ -501,6 +521,11 @@ impl TokenManager {
             .get("refresh_token")
             .and_then(Value::as_str)
             .filter(|t| !t.is_empty());
+        account.set_country(
+            data.pointer("/user/countryCode")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        );
 
         // Serialize credential persistence with account replacement/deletion.
         if let Some(am) = self.account_manager.get() {
@@ -583,9 +608,10 @@ pub(crate) async fn persist_token(
 ) -> Result<(), AppError> {
     let mut tx = db.begin().await?;
     let changed = sqlx::query(
-        "UPDATE accounts SET refresh_token = ?, updated_at = ?, heal_failures = 0, heal_next_retry = 0, last_refresh_error = NULL
+        "UPDATE accounts SET refresh_token = ?, updated_at = ?, heal_failures = 0, heal_next_retry = 0, last_refresh_error = NULL, auth_failing_since = 0,
+         country_code = COALESCE(?, country_code)
          WHERE id = ? AND refresh_token = ? AND client_id = ? AND client_secret = ?",
-    ).bind(rotated.unwrap_or(old_refresh)).bind(Utc::now().timestamp()).bind(&account.id)
+    ).bind(rotated.unwrap_or(old_refresh)).bind(Utc::now().timestamp()).bind(account.country()).bind(&account.id)
         .bind(old_refresh).bind(&account.client_id).bind(&account.client_secret).execute(&mut *tx).await?;
     if changed.rows_affected() == 0 {
         return Err(AppError::ServiceUnavailable(
@@ -957,7 +983,7 @@ mod tests {
 
     #[tokio::test]
     async fn rotated_refresh_and_normalized_secret_survive_reload() {
-        let mock = MockAuth::new(StatusCode::OK, serde_json::json!({"access_token":"new", "refresh_token":"rotated+=", "expires_in":3600})).await;
+        let mock = MockAuth::new(StatusCode::OK, serde_json::json!({"access_token":"new", "refresh_token":"rotated+=", "expires_in":3600, "user": {"userId": 1, "countryCode": "se"}})).await;
         let db = crate::db::init_pool("sqlite::memory:").await.unwrap();
         let am = Arc::new(AccountManager::new(
             Some(db.clone()),
@@ -986,6 +1012,8 @@ mod tests {
         assert_eq!(restored.refresh_token(), "rotated+=");
         assert_eq!(restored.client_secret, "secret=");
         assert_eq!(restored.access_token.read().await.as_deref(), Some("new"));
+        // The country Tidal reports with the token is kept across restarts.
+        assert_eq!(restored.country().as_deref(), Some("SE"));
         let requests = mock.requests.lock().await;
         let (headers, body) = &requests[0];
         assert!(!headers.contains_key("authorization"));
@@ -1018,6 +1046,9 @@ mod tests {
             AUTH_FORBIDDEN_ROTATE_THRESHOLD
         );
         assert!(account.heal_next_retry.load(Ordering::Relaxed) >= Utc::now().timestamp() + 29);
+        // The 403 streak clock starts at the first refusal and is not moved by later ones.
+        let since = account.auth_failing_since.load(Ordering::Relaxed);
+        assert!(since > 0 && since <= Utc::now().timestamp());
         {
             let requests = mock.requests.lock().await;
             assert_eq!(requests.len(), AUTH_INITIAL_ATTEMPTS);
@@ -1038,11 +1069,33 @@ mod tests {
             mock.calls.load(Ordering::Relaxed),
             AUTH_INITIAL_ATTEMPTS + 1
         );
+        assert_eq!(account.auth_failing_since.load(Ordering::Relaxed), since);
         let requests = mock.requests.lock().await;
         let (headers, body) = &requests[AUTH_INITIAL_ATTEMPTS];
         assert!(!headers.contains_key("authorization"));
         assert!(body.contains("client_secret=secret%3D"));
         assert!(!body.contains("%253D"));
+    }
+
+    #[tokio::test]
+    async fn abuse_verdict_keeps_tidals_reason() {
+        // The body Tidal really sends for a suspended account.
+        let mock = MockAuth::new(
+            StatusCode::FORBIDDEN,
+            serde_json::json!({"error": "abuse_detected", "error_description": "User account is suspended due to abuse", "status": 403, "sub_status": 12001}),
+        )
+        .await;
+        let (am, account) = account().await;
+        let mut tm = TokenManager::new(None);
+        tm.token_url = mock.url.clone();
+        tm.set_account_manager(am);
+        assert!(tm.refresh_token(&account, &Client::new()).await.is_err());
+        // Retried like any 403: Tidal has been seen to answer it for one request only.
+        assert_eq!(mock.calls.load(Ordering::Relaxed), AUTH_INITIAL_ATTEMPTS);
+        let cause = account.last_refresh_error().unwrap();
+        assert!(cause.contains("abuse_detected (User account is suspended due to abuse)"), "{cause}");
+        assert!(cause.contains(ACCOUNT_SUSPENDED));
+        assert!(account.auth_failing_since.load(Ordering::Relaxed) > 0);
     }
 
     #[tokio::test]
@@ -1152,7 +1205,8 @@ mod tests {
             tm,
             pm,
             tidal,
-            Notifier::new(settings),
+            Notifier::new(settings.clone()),
+            settings,
         )
         .await;
         tokio::time::timeout(Duration::from_secs(3), async {

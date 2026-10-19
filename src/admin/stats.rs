@@ -8,7 +8,7 @@ use crate::AppState;
 use crate::account_manager::AccountState;
 use crate::error::AppError;
 
-const LIVE_PROBE_MAX_AGE_SECS: i64 = 8 * 60 * 60;
+const LIVE_PROBE_MAX_AGE_SECS: i64 = crate::account_manager::FULL_CHECK_MAX_AGE_SECS;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]

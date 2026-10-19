@@ -530,10 +530,10 @@ button:focus-visible,input:focus-visible,select:focus-visible { outline:2px soli
     <div class="section-head"><div><h2>Системные настройки</h2><p>Интеграции, резервные копии и обслуживание.</p></div></div>
     <div class="system-grid">
       <div class="form-section"><h3>Настройки панели</h3><p class="form-copy">Язык интерфейса сохраняется в cookie этого браузера.</p><div class="form-group"><label for="panel-language">Язык интерфейса</label><select id="panel-language" class="select" style="width:100%;padding:10px 12px" onchange="setLanguage(this.value)"><option value="en">English</option><option value="ru">Русский</option></select></div></div>
-      <div class="form-section"><h3>Воспроизведение</h3><p class="form-copy">Настройки выбора формата и исходящих запросов к Tidal.</p><div class="form-group" style="margin-bottom:16px"><label>Формат по умолчанию</label><select id="rl-atmos" class="select" style="width:100%;padding:10px 12px"><option value="high">HIGH · AAC 320 kbps (v1)</option><option value="off">FLAC в приоритете</option><option value="prefer">Atmos в приоритете</option></select></div><div class="form-row"><div class="form-group"><label for="rl-track-concurrency">Одновременных запросов на аккаунт воспроизведения</label><input type="number" id="rl-track-concurrency" min="0" max="1000" value="1"></div><div class="form-group"><label for="rl-track-delay">Пауза аккаунта между запросами, мс</label><input type="number" id="rl-track-delay" min="0" max="10000" step="50" value="0"></div></div><p class="form-copy">Сколько запросов один аккаунт воспроизведения одновременно отправляет в Tidal — треки, видео, лицензии и метаданные, если они попали в пул. Занятый или отдыхающий аккаунт пропускается, запрос берёт свободный; если свободных нет, запрос ждёт в очереди. 0 — без ограничения. Пауза — сколько аккаунт отдыхает после каждого запроса, прежде чем взять следующий (до 10 000 мс). Аккаунтов «только каталог» это не касается.</p><div class="form-row"><div class="form-group"><label for="rl-track-requests">Попыток на одном аккаунте · треки и видео</label><input type="number" id="rl-track-requests" min="1" max="10" value="1"></div><div class="form-group"><label for="rl-catalog-requests">Попыток на одном аккаунте · метаданные</label><input type="number" id="rl-catalog-requests" min="1" max="10" value="1"></div></div><p class="form-copy">Сколько раз один запрос может обратиться к одному и тому же аккаунту, считая первую попытку. 1 — без повторов; 2 — один повтор, например после обновления токена при 401. Метаданные — это поиск, альбомы, артисты, плейлисты и т. п., с любого аккаунта. Если аккаунт не справился, запрос уходит на следующий независимо от этой настройки; цепочка аккаунтов видна в журнале.</p><div class="form-group" style="margin-bottom:8px"><label for="rl-catalog-concurrency">Одновременных запросов на аккаунт «только каталог»</label><input type="number" id="rl-catalog-concurrency" min="0" max="1000" value="0"></div><p class="form-copy">Касается только аккаунтов «только каталог». 0 — без ограничения. Когда все они заняты, запросы метаданных уходят в пул воспроизведения.</p><p class="form-copy">Автовосстановление всегда включено. Отключённые вручную аккаунты остаются выключенными.</p><div class="section-actions"><button class="btn btn-primary" onclick="saveSettings()">Сохранить</button><button class="btn" id="clearPlaybackBtn" onclick="clearPlaybackQueue()">Очистить очередь</button></div></div>
+      <div class="form-section"><h3>Воспроизведение</h3><p class="form-copy">Настройки выбора формата и исходящих запросов к Tidal.</p><div class="form-group" style="margin-bottom:16px"><label>Формат по умолчанию</label><select id="rl-atmos" class="select" style="width:100%;padding:10px 12px"><option value="high">HIGH · AAC 320 kbps (v1)</option><option value="off">FLAC в приоритете</option><option value="prefer">Atmos в приоритете</option></select></div><div class="form-row"><div class="form-group"><label for="rl-track-concurrency">Одновременных запросов на аккаунт воспроизведения</label><input type="number" id="rl-track-concurrency" min="0" max="1000" value="1"></div><div class="form-group"><label for="rl-track-delay">Пауза аккаунта между запросами, мс</label><input type="number" id="rl-track-delay" min="0" max="10000" step="50" value="0"></div></div><p class="form-copy">Сколько запросов один аккаунт воспроизведения одновременно отправляет в Tidal — треки, видео, лицензии и метаданные, если они попали в пул. Занятый или отдыхающий аккаунт пропускается, запрос берёт свободный; если свободных нет, запрос ждёт в очереди. 0 — без ограничения. Пауза — сколько аккаунт отдыхает после каждого запроса, прежде чем взять следующий (до 10 000 мс). Аккаунтов «только каталог» это не касается.</p><div class="form-row"><div class="form-group"><label for="rl-track-requests">Попыток на одном аккаунте · треки и видео</label><input type="number" id="rl-track-requests" min="1" max="10" value="1"></div><div class="form-group"><label for="rl-catalog-requests">Попыток на одном аккаунте · метаданные</label><input type="number" id="rl-catalog-requests" min="1" max="10" value="1"></div></div><p class="form-copy">Сколько раз один запрос может обратиться к одному и тому же аккаунту, считая первую попытку. 1 — без повторов; 2 — один повтор, например после обновления токена при 401. Метаданные — это поиск, альбомы, артисты, плейлисты и т. п., с любого аккаунта. Если аккаунт не справился, запрос уходит на следующий независимо от этой настройки; цепочка аккаунтов видна в журнале.</p><div class="form-group" style="margin-bottom:8px"><label for="rl-catalog-concurrency">Одновременных запросов на аккаунт «только каталог»</label><input type="number" id="rl-catalog-concurrency" min="0" max="1000" value="0"></div><p class="form-copy">Касается только аккаунтов «только каталог». 0 — без ограничения. Когда все они заняты, запросы метаданных уходят в пул воспроизведения.</p><div class="form-group" style="margin-bottom:8px"><label for="rl-per-hour">Запросов в час на аккаунт воспроизведения</label><input type="number" id="rl-per-hour" min="0" max="10000" value="0"></div><p class="form-copy">Аккаунт, который уже начал столько запросов за последний час, пропускается до освобождения квоты. Помогает не перегружать отдельные аккаунты. 0 — без ограничения.</p><div class="form-group" style="margin-bottom:8px"><label for="rl-auth-disable">Отключать аккаунт после 403 при обновлении токена, ч</label><input type="number" id="rl-auth-disable" min="0" max="720" value="24"></div><p class="form-copy">Если Tidal отвечает 403 на каждое обновление токена дольше этого времени, аккаунт выключается и больше не пробует обновиться, пока вы не включите его сами. Отсчёт идёт с первого 403 и сбрасывается при успешном обновлении. 0 — никогда не выключать.</p><p class="form-copy">Автовосстановление всегда включено. Отключённые вручную аккаунты остаются выключенными.</p><div class="section-actions"><button class="btn btn-primary" onclick="saveSettings()">Сохранить</button><button class="btn" id="clearPlaybackBtn" onclick="clearPlaybackQueue()">Очистить очередь</button></div></div>
       <div class="form-section"><h3>Прокси</h3><p class="form-copy">Маршрутизация исходящих запросов. Изменения применяются сразу.</p><div class="card-stats" style="margin-bottom:16px"><span class="card-stat">Статус <strong id="px-status">—</strong></span><span class="card-stat">Назначено <strong id="px-current">—</strong></span><span class="card-stat">В пуле <strong id="px-pool">—</strong></span><span class="card-stat">Проверено назначений <strong id="px-verified">—</strong></span><span class="card-stat" title="Сумма последовательных ошибок по текущим назначениям; сбрасываются после успешного запроса">Ошибок подряд <strong id="px-fails">—</strong></span></div><div id="px-assignments" class="helper" style="white-space:pre-line;margin-bottom:16px"></div><div class="form-group"><label for="px-list">Адреса прокси · по одному в строке</label><textarea id="px-list" spellcheck="false" placeholder="http://user:password@host:port" oninput="proxyListDirty=true"></textarea></div><div class="section-actions" style="margin-top:12px"><button class="btn btn-primary" id="pxToggleBtn" onclick="toggleProxies()">Включить прокси</button><button class="btn" id="pxSaveBtn" onclick="saveProxyList()">Сохранить список</button></div><p class="helper" id="px-persist" style="margin-top:11px"></p></div>
       <div class="form-section"><h3>Уведомления</h3><p class="form-copy">Discord-оповещения о риске блокировки и недоступности аккаунтов.</p><div class="card-stats" style="margin-bottom:15px"><span class="card-stat">Discord <strong id="al-discord">—</strong></span></div><div class="form-group"><label for="al-webhook">URL вебхука Discord</label><input type="password" id="al-webhook" placeholder="https://discord.com/api/webhooks/…" autocomplete="new-password" spellcheck="false"></div><p class="helper" style="margin:8px 0 14px">Сохранённый URL скрыт. Введите новый, чтобы заменить его.</p><div class="section-actions" style="margin-bottom:15px"><button class="btn btn-primary" onclick="saveDiscordWebhook()" id="saveWebhookBtn">Сохранить вебхук</button><button class="btn btn-danger" onclick="disableDiscordWebhook()" id="disableWebhookBtn">Отключить вебхук</button></div><div class="section-actions"><button class="btn" onclick="testAlert()" id="alertTestBtn">Тест</button><button class="btn" onclick="sendReport('status')" id="reportStatusBtn">Статус</button><button class="btn" onclick="sendReport('accounts')" id="reportAccountsBtn">Аккаунты</button></div></div>
-      <div class="form-section"><h3>Кэш</h3><p class="form-copy">Кэшируются только метаданные, треки — никогда. Альбомы, обложки, тексты и info свежие неделю, артисты и рекомендации — 12 ч, поиск — 6 ч, плейлисты и миксы — 1 ч. После этого запись ещё неделю отдаётся мгновенно и обновляется в фоне. Кэш хранится в памяти и сбрасывается при перезапуске.</p><p class="form-copy">Счётчики запросов с запуска сервера. Устаревшие и объединённые ответы входят в попадания. Очистка кэша не обнуляет счётчики.</p><div class="card-stats" style="margin-bottom:15px"><span class="card-stat">Попадания <strong id="cc-hits">—</strong></span><span class="card-stat">Промахи <strong id="cc-misses">—</strong></span><span class="card-stat" title="Попадания от суммы попаданий и промахов">Доля попаданий <strong id="cc-rate">—</strong></span><span class="card-stat">Из устаревшего кэша <strong id="cc-stale">—</strong></span><span class="card-stat">Ошибок из кэша <strong id="cc-negative">—</strong></span><span class="card-stat">Объединённых запросов <strong id="cc-coalesced">—</strong></span></div><button class="btn" onclick="clearCache()" id="clearCacheBtn">Очистить кэш</button></div>
+      <div class="form-section"><h3>Кэш</h3><p class="form-copy">Кэшируются только метаданные, треки — никогда. Плейлисты и миксы свежие 15 мин, поиск — 4 ч, остальное (альбомы, артисты, обложки, тексты, info, рекомендации) — 12 ч. После этого запись ещё столько же отдаётся мгновенно и обновляется в фоне. Кэш хранится в памяти и сбрасывается при перезапуске.</p><p class="form-copy">Счётчики запросов с запуска сервера. Устаревшие и объединённые ответы входят в попадания. Очистка кэша не обнуляет счётчики.</p><div class="card-stats" style="margin-bottom:15px"><span class="card-stat">Попадания <strong id="cc-hits">—</strong></span><span class="card-stat">Промахи <strong id="cc-misses">—</strong></span><span class="card-stat" title="Попадания от суммы попаданий и промахов">Доля попаданий <strong id="cc-rate">—</strong></span><span class="card-stat">Из устаревшего кэша <strong id="cc-stale">—</strong></span><span class="card-stat">Ошибок из кэша <strong id="cc-negative">—</strong></span><span class="card-stat">Объединённых запросов <strong id="cc-coalesced">—</strong></span></div><button class="btn" onclick="clearCache()" id="clearCacheBtn">Очистить кэш</button></div>
       <div class="form-section"><h3>Аптайм аккаунтов</h3><p class="form-copy">Сброс удаляет историю доступности всех аккаунтов и начинает отсчёт заново — например, чтобы проверить стабильность после обновления.</p><button class="btn btn-danger" onclick="resetUptime()" id="resetUptimeBtn">Сбросить аптайм</button></div>
       <div class="form-section"><h3>Учётные данные</h3><p class="form-copy">Экспортируйте или импортируйте Tidal-аккаунты в JSON. Дубликаты токенов будут пропущены.</p><div class="section-actions"><button class="btn" onclick="exportCredentials()">Экспорт JSON</button><button class="btn" onclick="document.getElementById('importFile').click()">Импорт JSON</button><input type="file" id="importFile" accept=".json,application/json" style="display:none" onchange="importCredentials(event)"></div><div id="importResult" class="helper" style="margin-top:10px"></div></div>
       <div class="form-section"><h3>База данных</h3><p class="form-copy">Скачайте полный снимок или восстановите состояние без перезапуска.</p><div class="section-actions"><button class="btn" onclick="downloadBackup()">Скачать копию</button><button class="btn btn-danger" onclick="document.getElementById('restoreFile').click()">Восстановить</button><input type="file" id="restoreFile" accept=".db,.sqlite,.sqlite3,application/x-sqlite3" style="display:none" onchange="restoreBackup(event)"></div><div id="restoreResult" class="helper" style="margin-top:10px"></div></div>
@@ -1000,7 +1000,8 @@ function metricNumber(value, digits) {
 function accountStatus(account) {
     var state = (account.availability || {}).state;
     if (state === 'ready') return {tone:'status-ok', text:account.is_catalog ? 'Готов к каталогу' : 'Готов к FULL'};
-    if (state === 'disabled') return {tone:'status-err', text:account.auto_disabled ? 'Автоотключён' : 'Отключён вручную'};
+    if (state === 'disabled') return {tone:'status-err', text:account.auto_disabled ? 'Автоотключён' :
+        (account.auth_failing_since > 0 ? (String(account.last_refresh_error || '').indexOf('abuse_detected') !== -1 ? 'Отключён: Tidal abuse_detected' : 'Отключён: токен не обновлялся') : 'Отключён вручную')};
     if (state === 'no_token') {
         var token = (account.availability || {}).token;
         return {tone:'status-warn', text:token === 'rejected' ? 'Токен отклонён' : (token === 'expired' ? 'Токен истёк' : 'Нет токена')};
@@ -1018,11 +1019,23 @@ function tokenDescription(account) {
     return timeStr(account.token_expires_at);
 }
 
+// Two-letter country with its flag; Tidal reports it on sign-in and token refresh.
+function countryRow(account) {
+    var code = String(account.country_code || '').toUpperCase();
+    var value = /^[A-Z]{2}$/.test(code)
+        ? String.fromCodePoint.apply(null, code.split('').map(function(c) { return 0x1F1E6 + c.charCodeAt(0) - 65; })) + ' ' + esc(code)
+        : '<span class="sub-checked">' + esc(tr('появится после обновления токена или проверки подписки')) + '</span>';
+    return '<div class="cred-row" data-no-i18n><span class="cred-key">' + esc(tr('Страна')) + '</span><span class="cred-value">' + value + '</span></div>';
+}
+
+// Failed manual lookups, kept until the page reloads; answers are stored on the server.
 var _subscriptions = {};
 
-// Result of the last manual subscription lookup, kept until the page reloads.
-function subscriptionRow(id) {
-    var result = _subscriptions[id];
+// The latest subscription answer: checked daily by the server or on demand.
+function subscriptionRow(account) {
+    var failed = _subscriptions[account.id];
+    var stored = account.subscription ? { subscription: account.subscription, checked_at: account.subscription_checked_at } : null;
+    var result = failed && (!stored || failed.checked_at > stored.checked_at) ? failed : stored;
     if (!result) return '';
     var html;
     if (result.error) {
@@ -1036,28 +1049,51 @@ function subscriptionRow(id) {
         var until = body.validUntil ? Date.parse(String(body.validUntil).replace(/([+-]\d\d)(\d\d)$/, '$1:$2')) : NaN;
         if (!isNaN(until)) {
             var date = new Date(until).toLocaleDateString(adminLanguage === 'ru' ? 'ru-RU' : 'en-GB', {day:'numeric', month:'short', year:'numeric'});
-            parts.push('<span class="' + (until < Date.now() ? 'sub-bad' : '') + '">' + esc(tr('до')) + ' ' + esc(date) + '</span>');
+            var daysLeft = (until - Date.now()) / 86400000;
+            parts.push('<span class="' + (daysLeft < 3 ? 'sub-bad' : '') + '">' + esc(tr('до')) + ' ' + esc(date) + '</span>');
+            if (daysLeft > 0 && daysLeft < 3) parts.push('<span class="sub-bad">' + esc(tr('заканчивается через')) + ' ' + esc(uptimeDuration(daysLeft * 86400)) + '</span>');
         }
         if (body.highestSoundQuality) parts.push(esc(body.highestSoundQuality));
+        if (body.paymentOverdue) parts.push('<span class="sub-bad">' + esc(tr('оплата просрочена')) + '</span>');
         if (!parts.length) parts.push('<code>' + esc(JSON.stringify(body).slice(0, 200)) + '</code>');
         html = parts.join(' · ');
     }
-    var checked = new Date((result.checked_at || Date.now() / 1000) * 1000).toLocaleTimeString(adminLanguage === 'ru' ? 'ru-RU' : 'en-GB', {hour:'2-digit', minute:'2-digit'});
+    var checkedAt = new Date((result.checked_at || Date.now() / 1000) * 1000);
+    var sameDay = checkedAt.toDateString() === new Date().toDateString();
+    var checked = checkedAt.toLocaleString(adminLanguage === 'ru' ? 'ru-RU' : 'en-GB', sameDay ? {hour:'2-digit', minute:'2-digit'} : {day:'numeric', month:'short', hour:'2-digit', minute:'2-digit'});
     return '<div class="cred-row" data-no-i18n><span class="cred-key">' + esc(tr('Подписка')) + '</span><span class="cred-value">' + html +
         ' <span class="sub-checked">· ' + esc(tr('проверено в')) + ' ' + esc(checked) + '</span></span></div>';
+}
+
+// How long Tidal has answered 403 to token refreshes, and when (or that)
+// the account is switched off for it.
+function authFailureDetails(account) {
+    var since = Number(account.auth_failing_since) || 0;
+    if (since <= 0) return '';
+    var now = Date.now() / 1000;
+    var text;
+    if (!account.is_active && !account.auto_disabled) {
+        text = tr('Аккаунт выключен: Tidal отвечал 403 на обновление токена') + ' <strong>' + esc(uptimeDuration((Number(account.disabled_at) || now) - since)) + '</strong>. ' +
+            tr('Попыток больше нет; включите аккаунт, когда он снова заработает.');
+    } else {
+        text = tr('Tidal отвечает 403 на обновление токена уже') + ' <strong>' + esc(uptimeDuration(now - since)) + '</strong>' +
+            (account.auth_disable_at ? '; ' + tr('аккаунт выключится через') + ' <strong>' + esc(uptimeDuration(Math.max(0, account.auth_disable_at - now))) + '</strong>' : '') + '.';
+    }
+    return '<div class="token-refresh-error" data-no-i18n>' + text + '</div>';
 }
 
 function tokenRefreshDetails(account) {
     var token = (account.availability || {}).token;
     var coolingDown = account.heal_next_retry > Date.now() / 1000;
-    if (token === 'valid' && !coolingDown && !account.auto_disabled) return '';
+    var streak = authFailureDetails(account);
+    if (token === 'valid' && !coolingDown && !account.auto_disabled) return streak;
     var reason = account.last_refresh_error;
     if (reason) {
-        return '<div class="token-refresh-error" data-no-i18n>' + tr('Обновление токена не удалось:') + ' <strong>' + esc(reason) + '</strong></div>';
+        return '<div class="token-refresh-error" data-no-i18n>' + tr('Обновление токена не удалось:') + ' <strong>' + esc(reason) + '</strong></div>' + streak;
     }
     var description = token === 'expired' ? 'Срок действия access token закончился.' :
         (token === 'rejected' ? 'Tidal отклонил access token.' : '');
-    return description ? '<div class="token-refresh-error" data-no-i18n>' + tr(description) + '</div>' : '';
+    return (description ? '<div class="token-refresh-error" data-no-i18n>' + tr(description) + '</div>' : '') + streak;
 }
 
 function metricPair(label, value) {
@@ -1601,13 +1637,16 @@ async function fetchData() {
                     '<div class="card-body">' +
                         '<div class="cred-row"><span class="cred-key">CLIENT_ID</span><span class="cred-value">' + esc(a.client_id) + '</span></div>' +
                         '<div class="cred-row"><span class="cred-key">USER_ID</span><span class="cred-value">' + esc(uid) + '</span></div>' +
-                        '<div class="cred-row"><span class="cred-key">Роль</span><span class="cred-value">' + (a.is_catalog ? 'Только каталог' : 'Воспроизведение') + '</span></div>' + subscriptionRow(a.id) + tokenRefreshDetails(a) +
+                        countryRow(a) +
+                        '<div class="cred-row"><span class="cred-key">Роль</span><span class="cred-value">' + (a.is_catalog ? 'Только каталог' : 'Воспроизведение') + '</span></div>' + subscriptionRow(a) + tokenRefreshDetails(a) +
                     '</div>' +
                     '<div class="account-uptime" data-no-i18n id="uptime-' + esc(a.id) + '">' + uptimeCard(a.uptime, a.id) + '</div>' +
                     '<div class="card-footer">' +
                         '<div class="card-stats">' +
                             '<span class="card-stat" title="Обращения к этому аккаунту с запуска сервера, включая повторы для одного API-запроса">Обращений с запуска <strong>' + metricNumber(a.request_count) + '</strong></span>' +
                             '<span class="card-stat" title="Ошибки запросов и обновления токена этого аккаунта с запуска сервера">Ошибок с запуска <strong>' + metricNumber(a.error_count) + '</strong></span>' +
+                            '<span class="card-stat" title="Доля ошибок с учётом примерно последних 15 минут. Чем она выше, тем позже аккаунт получает следующий запрос.">Свежие ошибки <strong>' + metricNumber((a.recent_error_rate || 0) * 100) + '%</strong></span>' +
+                            '<span class="card-stat" title="Запросы, начатые этим аккаунтом за последний час; лимит задаётся в настройках">За час <strong>' + metricNumber(a.requests_last_hour) + '</strong></span>' +
                             (a.heal_next_retry > Date.now() / 1000 ? '<span class="card-stat">Повтор обновления через <strong>' + esc(uptimeDuration(a.heal_next_retry - Date.now() / 1000)) + '</strong></span>' : (a.auto_disabled ? '<span class="card-stat">Восстановление <strong>ожидает попытки</strong></span>' : '')) +
                             (a.rate_limited_until > Date.now() / 1000 ? '<span class="card-stat">Пауза 429 ещё <strong>' + esc(uptimeDuration(a.rate_limited_until - Date.now() / 1000)) + '</strong></span>' : '') +
                             (!a.is_active ? '<span class="card-stat">' + (a.auto_disabled ? 'Автоотключён с' : 'Отключён с') + ' <strong>' + disabledSince + '</strong></span>' +
@@ -2383,6 +2422,8 @@ function saveProxyList() { updateProxies(proxyEnabled, false); }
 function fillPlaybackLimits(r) {
     document.getElementById('rl-track-concurrency').value = r.track_concurrency_per_account != null ? r.track_concurrency_per_account : 1;
     document.getElementById('rl-track-delay').value = r.track_request_delay_ms != null ? r.track_request_delay_ms : 0;
+    document.getElementById('rl-auth-disable').value = r.auth_failure_disable_hours != null ? r.auth_failure_disable_hours : 24;
+    document.getElementById('rl-per-hour').value = r.requests_per_hour_per_account != null ? r.requests_per_hour_per_account : 0;
 }
 
 async function loadSettings() {
@@ -2439,7 +2480,9 @@ async function saveSettings() {
             catalog_requests_per_account: Number(document.getElementById('rl-catalog-requests').value || 1),
             catalog_concurrency_per_account: Number(document.getElementById('rl-catalog-concurrency').value || 0),
             track_concurrency_per_account: Number(document.getElementById('rl-track-concurrency').value || 0),
-            track_request_delay_ms: Number(document.getElementById('rl-track-delay').value || 0)
+            track_request_delay_ms: Number(document.getElementById('rl-track-delay').value || 0),
+            auth_failure_disable_hours: Number(document.getElementById('rl-auth-disable').value || 0),
+            requests_per_hour_per_account: Number(document.getElementById('rl-per-hour').value || 0)
         }
     };
     try {

@@ -7,7 +7,7 @@ use rand::Rng;
 use reqwest::Client;
 use serde_json::{Value, json};
 
-use crate::account_manager::{AccountManager, AccountState, CatalogClaim, LeaseKind, PlaybackLease};
+use crate::account_manager::{AccountManager, AccountState, CatalogClaim, LeaseKind, LeaseRules, PlaybackLease};
 use crate::config::Config;
 use crate::error::AppError;
 use crate::notifier::Notifier;
@@ -121,17 +121,20 @@ impl TidalClient {
     }
 
     /// Lease a playback account for one request, skipping accounts already
-    /// sending `track_concurrency_per_account` requests to Tidal or resting
-    /// for `track_request_delay_ms` after their last one.
+    /// sending `track_concurrency_per_account` requests to Tidal, resting for
+    /// `track_request_delay_ms` after their last one, or at their hourly limit.
     pub async fn lease_pool_account(
         &self,
         exclude_ids: &[String],
         kind: LeaseKind,
     ) -> Result<PlaybackLease, AppError> {
-        let limit = self.settings.track_concurrency_per_account();
-        let rest_ms = self.settings.track_request_delay_ms();
+        let rules = LeaseRules {
+            concurrency: self.settings.track_concurrency_per_account(),
+            rest_ms: self.settings.track_request_delay_ms(),
+            per_hour: self.settings.requests_per_hour_per_account(),
+        };
         self.account_manager
-            .lease_account_for(exclude_ids, kind, limit, rest_ms)
+            .lease_account_for(exclude_ids, kind, rules)
             .await
     }
 
@@ -387,6 +390,17 @@ impl TidalClient {
                         .pointer("/data/attributes/trackPresentation")
                         .and_then(|v| v.as_str())
                         == Some("PREVIEW");
+                // Ordinary traffic doubles as the FULL check: a FULL answer proves
+                // the subscription, so the scheduled probe can skip busy accounts.
+                // A PREVIEW may be about this one track, so it proves nothing.
+                let is_full = data.get("assetPresentation").and_then(|v| v.as_str()) == Some("FULL")
+                    || data
+                        .pointer("/data/attributes/trackPresentation")
+                        .and_then(|v| v.as_str())
+                        == Some("FULL");
+                if is_full && kind == LeaseKind::Playback {
+                    self.account_manager.confirm_full(&account).await;
+                }
                 if is_preview {
                     failed_ids.push(account.id.clone());
                     last_account_error = Some(AppError::ServiceUnavailable(format!(
@@ -836,8 +850,8 @@ impl TidalClient {
             .await
             .clone()
             .filter(|id| !id.is_empty() && id.chars().all(|c| c.is_ascii_digit()));
-        let (user_id, country) = match known_user {
-            Some(id) => (id, self.config.country_code.clone()),
+        let (user_id, country) = match known_user.zip(account.country()) {
+            Some((id, country)) => (id, country),
             None => {
                 let session = self
                     .subscription_get(account, &client, &mut token, &format!("{api_base}/sessions"), &[])
@@ -850,10 +864,11 @@ impl TidalClient {
                         "Tidal session has no user id".into(),
                     )),
                 };
-                let country = session["countryCode"]
-                    .as_str()
-                    .unwrap_or(&self.config.country_code)
-                    .to_string();
+                account.set_country(session["countryCode"].as_str().map(str::to_string));
+                if let Err(error) = account.persist_refresh_state().await {
+                    tracing::warn!(account = %account.id, "Could not save account country: {error}");
+                }
+                let country = account.country().unwrap_or_else(|| self.config.country_code.clone());
                 (id, country)
             }
         };
@@ -1331,6 +1346,7 @@ mod rate_limit_tests {
         assert_eq!(result["user_id"], "208921067");
         assert_eq!(result["subscription"]["subscription"]["type"], "HIFI");
         assert_eq!(result["subscription"]["status"], "ACTIVE");
+        assert_eq!(account.country().as_deref(), Some("DE"));
         assert_eq!(auth_hits.load(Ordering::Relaxed), 1);
     }
 
