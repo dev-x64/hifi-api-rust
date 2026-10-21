@@ -95,6 +95,14 @@ impl TidalClient {
         &self.account_manager
     }
 
+    pub fn v1_playback_url(&self, track_id: i64) -> String {
+        self.v1_playback_url_at("https://api.tidal.com/v1", track_id)
+    }
+
+    fn v1_playback_url_at(&self, api_base: &str, track_id: i64) -> String {
+        format!("{}/tracks/{}/{}", api_base, track_id, self.settings.v1_playback_endpoint())
+    }
+
     pub async fn make_request(
         &self,
         url: &str,
@@ -1012,7 +1020,7 @@ impl TidalClient {
                         );
                     }
                 };
-                let url = format!("{}/tracks/{}/playbackinfo", api_base, track_id);
+                let url = self.v1_playback_url_at(api_base, *track_id);
                 let request = client
                     .get(&url)
                     .query(&[
@@ -1272,7 +1280,7 @@ mod rate_limit_tests {
                 }),
             )
             .route(
-                "/tracks/{id}/playbackinfo",
+                "/tracks/{id}/playbackinfopostpaywall",
                 get(move |headers: HeaderMap| {
                     let calls = calls.clone();
                     async move {
@@ -1305,6 +1313,42 @@ mod rate_limit_tests {
         assert!(reason.is_empty());
         assert_eq!(api_hits.load(Ordering::Relaxed), 2);
         assert_eq!(auth_hits.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn full_probe_uses_the_selected_v1_endpoint() {
+        use axum::{Json, extract::{Path, Query}, http::HeaderMap};
+        use serde_json::json;
+        use std::collections::HashMap;
+        let endpoints = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = endpoints.clone();
+        let app = Router::new().route("/tracks/{id}/{endpoint}", get(
+            move |Path((id, endpoint)): Path<(i64, String)>, Query(params): Query<HashMap<String, String>>, headers: HeaderMap| {
+                let observed = observed.clone();
+                async move {
+                    assert!(super::PROBE_TRACK_IDS.contains(&id));
+                    assert_eq!(params["assetpresentation"], "FULL");
+                    assert_eq!(params["audioquality"], "HI_RES_LOSSLESS");
+                    assert_eq!(headers["authorization"], "Bearer test-token");
+                    assert_eq!(headers["x-tidal-token"], "client");
+                    observed.lock().unwrap().push(endpoint);
+                    Json(json!({"assetPresentation": "FULL"}))
+                }
+            },
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (client, manager) = client_with_accounts(1).await;
+        let account = manager.list_accounts().await.remove(0);
+        for endpoint in ["playbackinfopostpaywall", "playbackinfo"] {
+            client.settings.apply(&json!({"v1_playback_endpoint": endpoint})).unwrap();
+            assert_eq!(client.v1_playback_url(42), format!("https://api.tidal.com/v1/tracks/42/{endpoint}"));
+            let (status, _) = client.probe_account_premium_at(&account, &base).await;
+            assert_eq!(status, "premium");
+        }
+        server.abort();
+        assert_eq!(*endpoints.lock().unwrap(), ["playbackinfopostpaywall", "playbackinfo"]);
     }
 
     #[tokio::test]

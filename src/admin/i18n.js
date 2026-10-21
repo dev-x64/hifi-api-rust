@@ -1,6 +1,10 @@
 // The existing markup and renderers use Russian source strings. Keep their
 // originals so switching languages never translates an already translated text.
 var ruToEn = {
+    'Метод воспроизведения v1': 'v1 playback method',
+    'postpaywall (по умолчанию)': 'postpaywall (default)',
+    'playbackinfo (старый)': 'playbackinfo (legacy)',
+    'Применяется к v1-запросам треков и проверкам FULL. Изменения действуют сразу.': 'Applies to v1 track requests and FULL checks. Changes take effect immediately.',
     'Ожидают проверки': 'Awaiting verification',
     'Доступность токена': 'Token availability',
     "из": "of",

@@ -5,8 +5,33 @@ use sqlx::SqlitePool;
 
 use crate::upstash::UpstashStore;
 
+#[derive(Clone, Copy, Default)]
+enum V1PlaybackEndpoint {
+    #[default]
+    Postpaywall,
+    Legacy,
+}
+
+impl V1PlaybackEndpoint {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value.trim() {
+            "playbackinfopostpaywall" => Ok(Self::Postpaywall),
+            "playbackinfo" => Ok(Self::Legacy),
+            _ => Err("v1_playback_endpoint must be playbackinfopostpaywall or playbackinfo".into()),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Postpaywall => "playbackinfopostpaywall",
+            Self::Legacy => "playbackinfo",
+        }
+    }
+}
+
 /// Server preferences persisted in SQLite and optionally shared through Redis.
 pub struct AppSettings {
+    v1_playback_endpoint: RwLock<V1PlaybackEndpoint>,
     /// off (FLAC) | prefer (Atmos) | high (AAC 320 kbps).
     /// Query param `atmos=` overrides per request.
     pub atmos_mode: RwLock<String>,
@@ -38,6 +63,7 @@ pub struct AppSettings {
 impl AppSettings {
     pub fn from_env() -> Self {
         Self {
+            v1_playback_endpoint: RwLock::new(V1PlaybackEndpoint::default()),
             atmos_mode: RwLock::new(default_atmos_mode()),
             track_requests_per_account: RwLock::new(1),
             catalog_requests_per_account: RwLock::new(1),
@@ -66,6 +92,7 @@ impl AppSettings {
 
     pub fn snapshot(&self) -> Value {
         json!({
+            "v1_playback_endpoint": self.v1_playback_endpoint(),
             "auto_heal": true,
             "atmos_mode": self.atmos_mode.read().map(|v| v.clone()).unwrap_or_else(|_| "prefer".to_string()),
             "track_requests_per_account": self.track_requests_per_account(),
@@ -76,6 +103,13 @@ impl AppSettings {
             "auth_failure_disable_hours": self.auth_failure_disable_hours(),
             "requests_per_hour_per_account": self.requests_per_hour_per_account(),
         })
+    }
+
+    pub fn v1_playback_endpoint(&self) -> &'static str {
+        self.v1_playback_endpoint
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_str()
     }
 
     pub fn track_requests_per_account(&self) -> u32 {
@@ -162,6 +196,10 @@ impl AppSettings {
     }
 
     pub fn apply(&self, updates: &Value) -> Result<(), String> {
+        if let Some(value) = first_opt_string(updates, &["v1_playback_endpoint"])? {
+            let endpoint = V1PlaybackEndpoint::parse(&value)?;
+            *self.v1_playback_endpoint.write().unwrap_or_else(|e| e.into_inner()) = endpoint;
+        }
         if let Some(v) = first_opt_string(updates, &["atmos_mode"])? {
             if let Ok(mut w) = self.atmos_mode.write() {
                 *w = normalize_atmos_mode(&v);
@@ -240,6 +278,11 @@ impl AppSettings {
     /// Apply one persisted setting. Shared by the SQLite and Redis loaders.
     fn apply_kv(&self, key: &str, value: &str) {
         match key {
+            "v1_playback_endpoint" => {
+                if let Ok(endpoint) = V1PlaybackEndpoint::parse(value) {
+                    *self.v1_playback_endpoint.write().unwrap_or_else(|e| e.into_inner()) = endpoint;
+                }
+            }
             "atmos_mode" => {
                 if let Ok(mut w) = self.atmos_mode.write() {
                     *w = normalize_atmos_mode(value);
@@ -313,6 +356,7 @@ impl AppSettings {
 
     /// Setting names mirrored to Redis (same keys as the SQLite table).
     const REDIS_SETTING_NAMES: &'static [&'static str] = &[
+        "v1_playback_endpoint",
         "atmos_mode",
         "discord_webhook_url",
         "track_requests_per_account",
@@ -327,6 +371,7 @@ impl AppSettings {
     /// Canonical (key, value) snapshot, shared by the SQLite and Redis writers.
     fn settings_entries(&self) -> Vec<(String, String)> {
         vec![
+            ("v1_playback_endpoint", self.v1_playback_endpoint().to_string()),
             (
                 "atmos_mode",
                 self.atmos_mode
@@ -538,6 +583,37 @@ fn first_opt_string(obj: &Value, keys: &[&str]) -> Result<Option<String>, String
 #[cfg(test)]
 mod tests {
     use super::{AppSettings, default_atmos_mode, normalize_atmos_mode};
+
+    #[tokio::test]
+    async fn v1_endpoint_defaults_to_postpaywall_and_persists_legacy_choice() {
+        let db = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::query("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            .execute(&db).await.unwrap();
+        let settings = AppSettings::from_env();
+        settings.load_from_db(&db).await;
+        assert_eq!(settings.snapshot()["v1_playback_endpoint"], "playbackinfopostpaywall");
+        settings.apply(&serde_json::json!({"v1_playback_endpoint": "playbackinfo"})).unwrap();
+        settings.save_to_db(&db).await;
+
+        let restored = AppSettings::from_env();
+        restored.load_from_db(&db).await;
+        assert_eq!(restored.v1_playback_endpoint(), "playbackinfo");
+        // Redis uses the same loader and canonical entries as SQLite.
+        restored.apply_kv("v1_playback_endpoint", "playbackinfopostpaywall");
+        assert_eq!(restored.v1_playback_endpoint(), "playbackinfopostpaywall");
+        assert!(AppSettings::REDIS_SETTING_NAMES.contains(&"v1_playback_endpoint"));
+    }
+
+    #[test]
+    fn invalid_v1_endpoint_is_rejected_without_changing_the_choice() {
+        let settings = AppSettings::from_env();
+        for value in [serde_json::json!("other"), serde_json::json!(false), serde_json::json!(17)] {
+            assert!(settings.apply(&serde_json::json!({"v1_playback_endpoint": value})).is_err());
+            assert_eq!(settings.v1_playback_endpoint(), "playbackinfopostpaywall");
+        }
+        settings.apply_kv("v1_playback_endpoint", "other");
+        assert_eq!(settings.v1_playback_endpoint(), "playbackinfopostpaywall");
+    }
 
     #[test]
     fn obsolete_autoheal_switch_cannot_disable_recovery() {

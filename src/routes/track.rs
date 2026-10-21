@@ -145,7 +145,7 @@ pub(crate) async fn fetch_track_playback(
     quality: &str,
     immersive: bool,
 ) -> Result<Value, AppError> {
-    let url = format!("https://api.tidal.com/v1/tracks/{}/playbackinfo", id);
+    let url = state.tidal_client.v1_playback_url(id);
     let immersive_str = if immersive { "true" } else { "false" };
     let result = state
         .tidal_client

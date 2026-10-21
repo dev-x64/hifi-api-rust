@@ -452,3 +452,37 @@ test('every error cause is recognised from the server message or, failing that, 
     assert.equal(elements.get('er-causes').innerHTML, '');
     assert.match(localized(ctx, elements.get('er-list').innerHTML), /No errors yet\./);
 });
+
+test('v1 method loads, saves and stays localized', async () => {
+    for (const language of ['en', 'ru']) {
+        const { ctx, elements } = context(language);
+        vm.runInContext(script.slice(script.indexOf('function fillPlaybackLimits('), script.indexOf('async function exportCredentials(')), ctx);
+        vm.runInContext(script.slice(script.indexOf('async function saveSettings()')), ctx);
+        let current = {};
+        let sent;
+        ctx.fetch = async (_url, options) => {
+            if (options.method === 'PUT') {
+                sent = JSON.parse(options.body).settings;
+                current = sent;
+            }
+            return { ok: true, json: async () => ({ settings: current }) };
+        };
+        await vm.runInContext('loadSettings()', ctx);
+        assert.equal(elements.get('rl-v1-endpoint').value, 'playbackinfopostpaywall');
+        elements.get('rl-v1-endpoint').value = 'playbackinfo';
+        await vm.runInContext('saveSettings()', ctx);
+        assert.equal(sent.v1_playback_endpoint, 'playbackinfo');
+        assert.equal(elements.get('rl-v1-endpoint').value, 'playbackinfo');
+        current = { v1_playback_endpoint: 'playbackinfopostpaywall' };
+        await vm.runInContext('loadSettings()', ctx);
+        assert.equal(elements.get('rl-v1-endpoint').value, 'playbackinfopostpaywall');
+        const control = source.match(/<label for="rl-v1-endpoint">[^]*?<\/p>/)[0];
+        const html = localized(ctx, control);
+        assert.match(html, /value="playbackinfopostpaywall"/);
+        assert.match(html, /value="playbackinfo"/);
+        if (language === 'en') {
+            assert.doesNotMatch(html, /[А-Яа-яЁё]/);
+            assert.match(html, /postpaywall \(default\)/);
+        } else assert.match(html, /postpaywall \(по умолчанию\)/);
+    }
+});

@@ -317,7 +317,9 @@ impl PlaybackQueue {
     /// forever behind a backlog nobody will wait out.
     pub async fn dispatch(&self, state: &AppState, op: PlaybackOp) -> Result<Response, AppError> {
         self.prune().await;
-        let cache_key = Self::cache_key(&op, &Self::default_format(state));
+        let cache_key = Self::cache_key(
+            &op, &Self::default_format(state), state.settings.v1_playback_endpoint(),
+        );
         if let Some(key) = &cache_key {
             if let Some(hit) = self.results.get(key).await {
                 self.cache_hits.fetch_add(1, Ordering::Relaxed);
@@ -493,11 +495,11 @@ impl PlaybackQueue {
     }
 
     /// Identity of a cacheable answer: every input that shapes it, plus the
-    /// server's default format. Video and licenses are never cached.
-    fn cache_key(op: &PlaybackOp, default_format: &str) -> Option<String> {
+    /// server's playback preferences. Video and licenses are never cached.
+    fn cache_key(op: &PlaybackOp, default_format: &str, v1_endpoint: &str) -> Option<String> {
         match op {
             PlaybackOp::Track { id, quality, immersive } => {
-                Some(format!("track|{id}|{quality}|{immersive}|{default_format}"))
+                Some(format!("track|{id}|{quality}|{immersive}|{default_format}|{v1_endpoint}"))
             }
             PlaybackOp::Manifest { track_id, params, raw_query, host } => Some(format!(
                 "manifest|{track_id}|{host}|{}|{}|{}|{}|{}|{:?}|{:?}|{default_format}",
@@ -510,7 +512,7 @@ impl PlaybackQueue {
                 params.atmos,
             )),
             PlaybackOp::Dash { track_id, atmos } => {
-                Some(format!("dash|{track_id}|{atmos:?}|{default_format}"))
+                Some(format!("dash|{track_id}|{atmos:?}|{default_format}|{v1_endpoint}"))
             }
             PlaybackOp::Video { .. } | PlaybackOp::Widevine { .. } => None,
         }
@@ -836,7 +838,7 @@ mod tests {
     fn cache_key_covers_every_input_and_skips_video_and_licenses() {
         use super::PlaybackOp;
         let track = |quality: &str| PlaybackOp::Track { id: 5, quality: quality.into(), immersive: false };
-        let key = |op: &PlaybackOp, format: &str| PlaybackQueue::cache_key(op, format);
+        let key = |op: &PlaybackOp, format: &str| PlaybackQueue::cache_key(op, format, "playbackinfopostpaywall");
         assert_eq!(key(&track("LOSSLESS"), "off"), key(&track("LOSSLESS"), "off"));
         assert_ne!(key(&track("LOSSLESS"), "off"), key(&track("HI_RES_LOSSLESS"), "off"));
         // A new default format must not serve the old one for two minutes.
@@ -852,6 +854,12 @@ mod tests {
         assert_ne!(key(&manifest("a", "formats=FLAC"), "off"), key(&manifest("a", "formats=AACLC"), "off"));
         let dash = PlaybackOp::Dash { track_id: "5".into(), atmos: Some("only".into()) };
         assert!(key(&dash, "off").unwrap().starts_with("dash|5|"));
+        for op in [track("HIGH"), dash] {
+            assert_ne!(
+                PlaybackQueue::cache_key(&op, "high", "playbackinfo"),
+                PlaybackQueue::cache_key(&op, "high", "playbackinfopostpaywall"),
+            );
+        }
         let video = PlaybackOp::Video { id: 1, quality: "HIGH".into(), mode: "STREAM".into(), presentation: "FULL".into() };
         assert_eq!(key(&video, "off"), None);
         let license = PlaybackOp::Widevine { method: "POST".into(), content_type: None, body: vec![1] };
