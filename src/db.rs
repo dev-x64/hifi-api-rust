@@ -65,6 +65,8 @@ pub async fn init_pool(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
         ("country_code", "TEXT"),
         ("subscription_json", "TEXT"),
         ("subscription_checked_at", "INTEGER NOT NULL DEFAULT 0"),
+        ("subscription_error", "TEXT"),
+        ("subscription_error_at", "INTEGER NOT NULL DEFAULT 0"),
     ] {
         if !cols.iter().any(|c| c.1 == name) {
             sqlx::query(&format!("ALTER TABLE accounts ADD COLUMN {name} {definition}"))

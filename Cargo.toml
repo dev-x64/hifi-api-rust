@@ -1,6 +1,6 @@
 [package]
 name = "hifi-api"
-version = "2.16.0"
+version = "2.17.0"
 edition = "2024"
 description = "Tidal Music Proxy with intelligent multi-account management"
 

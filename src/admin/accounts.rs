@@ -71,6 +71,8 @@ pub async fn list_accounts(State(state): State<AppState>) -> Result<Json<Value>,
             "requests_last_hour": a.requests_last_hour(now * 1000),
             "subscription": a.subscription(),
             "subscription_checked_at": a.subscription_checked_at.load(std::sync::atomic::Ordering::Relaxed),
+            "subscription_error": a.subscription_error(),
+            "subscription_error_at": a.subscription_error_at.load(std::sync::atomic::Ordering::Relaxed),
             // When the 403 streak switches the account off; null when it will not.
             "auth_disable_at": (failing_since > 0 && disable_secs > 0).then(|| failing_since + disable_secs),
             "request_count": a.request_count.load(std::sync::atomic::Ordering::Relaxed),
@@ -226,6 +228,16 @@ pub async fn refresh_account_token(
     match state.token_manager.refresh_token(&account, &hc).await {
         Ok(_) => {
             state.account_manager.set_account_active(&id, true).await?;
+            // A fresh token is a good moment to look at the plan as well.
+            if !account.is_catalog.load(std::sync::atomic::Ordering::Relaxed) {
+                crate::autoheal::check_subscription_now(
+                    &state.tidal_client,
+                    &state.account_manager,
+                    &state.notifier,
+                    &account,
+                )
+                .await;
+            }
             Ok(Json(
                 json!({"status": "ok", "message": "Token refreshed, account reactivated"}),
             ))
@@ -275,8 +287,16 @@ pub async fn check_account_subscription(
         .ok_or_else(|| AppError::NotFound(format!("Account {} not found", id)))?;
     let mut result = state.tidal_client.account_subscription(&account).await?;
     let now = chrono::Utc::now().timestamp();
-    account.store_subscription(result["subscription"].clone(), now).await;
+    crate::autoheal::apply_subscription(
+        &state.account_manager,
+        &state.notifier,
+        &account,
+        result["subscription"].clone(),
+        now,
+    )
+    .await;
     result["account_id"] = json!(id);
+    result["is_catalog"] = json!(account.is_catalog.load(std::sync::atomic::Ordering::Relaxed));
     result["checked_at"] = json!(now);
     Ok(Json(result))
 }

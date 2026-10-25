@@ -1178,6 +1178,9 @@ mod tests {
             account
                 .premium_checked_at
                 .store(Utc::now().timestamp(), Ordering::Relaxed);
+            account
+                .subscription_checked_at
+                .store(Utc::now().timestamp(), Ordering::Relaxed);
         }
         let mut config = Config::from_env();
         config.use_proxies = false;

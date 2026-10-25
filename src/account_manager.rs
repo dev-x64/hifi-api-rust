@@ -120,9 +120,14 @@ pub struct AccountState {
     /// session responses. None until Tidal has told us.
     country_code: std::sync::RwLock<Option<String>>,
     /// Latest Tidal subscription answer (plan, status, validUntil, …) and
-    /// when it was fetched. Refreshed daily by auto-heal or on demand.
+    /// when it was fetched. Refreshed daily and after token refreshes by
+    /// auto-heal, or on demand.
     subscription: std::sync::RwLock<Option<serde_json::Value>>,
     pub subscription_checked_at: AtomicI64,
+    /// Why the latest automatic check failed, and when; cleared by the next
+    /// answer. A failure never replaces the stored answer.
+    subscription_error: std::sync::RwLock<Option<String>>,
+    pub subscription_error_at: AtomicI64,
     pub rejected_access_token: RwLock<Option<String>>,
     pub notes: RwLock<String>,
     pub last_used: AtomicI64,
@@ -198,6 +203,8 @@ impl AccountState {
             country_code: std::sync::RwLock::new(None),
             subscription: std::sync::RwLock::new(None),
             subscription_checked_at: AtomicI64::new(0),
+            subscription_error: std::sync::RwLock::new(None),
+            subscription_error_at: AtomicI64::new(0),
             rejected_access_token: RwLock::new(None),
             notes: RwLock::new(notes),
             last_used: AtomicI64::new(0),
@@ -264,6 +271,11 @@ impl AccountState {
         *new.subscription.write().unwrap_or_else(|e| e.into_inner()) = old.subscription();
         new.subscription_checked_at.store(
             old.subscription_checked_at.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        *new.subscription_error.write().unwrap_or_else(|e| e.into_inner()) = old.subscription_error();
+        new.subscription_error_at.store(
+            old.subscription_error_at.load(Ordering::Relaxed),
             Ordering::Relaxed,
         );
         new.heal_next_retry.store(
@@ -387,13 +399,19 @@ impl AccountState {
         self.subscription.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
+    pub fn subscription_error(&self) -> Option<String> {
+        self.subscription_error.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
     /// Keep the latest subscription answer, in memory and in SQLite.
     pub(crate) async fn store_subscription(&self, subscription: serde_json::Value, checked_at: i64) {
         *self.subscription.write().unwrap_or_else(|e| e.into_inner()) = Some(subscription.clone());
+        *self.subscription_error.write().unwrap_or_else(|e| e.into_inner()) = None;
+        self.subscription_error_at.store(0, Ordering::Relaxed);
         self.subscription_checked_at.store(checked_at, Ordering::Relaxed);
         if let Some(db) = self.db.get() {
             if let Err(error) = sqlx::query(
-                "UPDATE accounts SET subscription_json = ?, subscription_checked_at = ? WHERE id = ?",
+                "UPDATE accounts SET subscription_json = ?, subscription_checked_at = ?, subscription_error = NULL, subscription_error_at = 0 WHERE id = ?",
             )
             .bind(subscription.to_string())
             .bind(checked_at)
@@ -402,6 +420,26 @@ impl AccountState {
             .await
             {
                 tracing::warn!(account = %self.id, "Could not save subscription: {error}");
+            }
+        }
+    }
+
+    /// Keep why an automatic check failed, so the panel shows it and the
+    /// next attempt comes sooner; the last good answer and its time stay.
+    pub(crate) async fn store_subscription_error(&self, error: String, failed_at: i64) {
+        *self.subscription_error.write().unwrap_or_else(|e| e.into_inner()) = Some(error.clone());
+        self.subscription_error_at.store(failed_at, Ordering::Relaxed);
+        if let Some(db) = self.db.get() {
+            if let Err(error) = sqlx::query(
+                "UPDATE accounts SET subscription_error = ?, subscription_error_at = ? WHERE id = ?",
+            )
+            .bind(error)
+            .bind(failed_at)
+            .bind(&self.id)
+            .execute(db)
+            .await
+            {
+                tracing::warn!(account = %self.id, "Could not save subscription error: {error}");
             }
         }
     }
@@ -649,6 +687,8 @@ pub struct DbAccountRow {
     pub country_code: Option<String>,
     pub subscription_json: Option<String>,
     pub subscription_checked_at: i64,
+    pub subscription_error: Option<String>,
+    pub subscription_error_at: i64,
 }
 
 /// Extract a numeric user id from an auto-generated "Tidal Account (<id>)" label.
@@ -797,7 +837,8 @@ impl AccountManager {
              t.access_token, t.expires_at, a.updated_at, a.created_at,
              a.heal_failures, a.heal_next_retry, a.rejected_access_token, a.last_refresh_error,
              a.preview_streak, a.rate_limited_until, a.auth_failing_since, a.country_code,
-             a.subscription_json, a.subscription_checked_at
+             a.subscription_json, a.subscription_checked_at, a.subscription_error,
+             a.subscription_error_at
              FROM accounts a
              LEFT JOIN tokens t ON t.account_id = a.id
              ORDER BY a.created_at ASC",
@@ -875,6 +916,10 @@ impl AccountManager {
             state
                 .subscription_checked_at
                 .store(row.subscription_checked_at.max(0), Ordering::Relaxed);
+            *state.subscription_error.write().unwrap_or_else(|e| e.into_inner()) = row.subscription_error;
+            state
+                .subscription_error_at
+                .store(row.subscription_error_at.max(0), Ordering::Relaxed);
             self.load_uptime(&state).await?;
             accounts.push(state);
         }

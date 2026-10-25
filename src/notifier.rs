@@ -179,6 +179,18 @@ impl Notifier {
         self.send_throttled("catalog", payload).await;
     }
 
+    /// Fired when the subscription check finds a FREE plan and the account
+    /// leaves playback.
+    pub async fn alert_free_plan(&self, label: &str) {
+        let payload = Self::embed(
+            "⚠️ Account moved to catalog-only",
+            "Tidal reports a FREE plan. The account now serves metadata only.",
+            0xD29922,
+            vec![json!({"name": "Account", "value": label, "inline": true})],
+        );
+        self.send_throttled(&format!("free:{label}"), payload).await;
+    }
+
     /// Fired when an account is switched off after its token refresh kept
     /// failing with 403.
     pub async fn alert_auth_disabled(&self, label: &str, hours: u32, suspended: bool) {

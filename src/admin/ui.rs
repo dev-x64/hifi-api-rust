@@ -413,6 +413,23 @@ button:focus-visible,input:focus-visible,select:focus-visible { outline:2px soli
 .helper { color:var(--muted); font-size:11px; line-height:1.5; }
 .account-summary { display:inline-flex; align-items:center; gap:7px; min-height:38px; padding:0 12px; border:1px solid var(--line); border-radius:9px; background:#0e1319; color:var(--muted); font-size:12px; white-space:nowrap; }
 .account-summary strong { color:var(--green); font-size:13px; }
+.account-summary.warn strong { color:var(--amber); }
+.account-summary.calm strong { color:var(--muted); }
+.toolbar-stats { display:flex; flex-wrap:wrap; align-items:center; gap:8px; }
+.account-group { display:flex; flex-direction:column; gap:12px; }
+.account-group + .account-group { margin-top:12px; }
+.account-group-head { display:flex; flex-wrap:wrap; align-items:center; gap:4px 10px; padding-bottom:10px; border-bottom:1px solid var(--line); }
+.account-group-head h3 { font-size:14px; letter-spacing:-.1px; }
+.account-group-head p { flex-basis:100%; color:var(--muted); font-size:12px; }
+.account-group-head .group-mark { width:10px; height:10px; border-radius:3px; }
+.account-group-head .group-count { padding:1px 8px; border-radius:999px; font-size:12px; font-weight:600; font-variant-numeric:tabular-nums; }
+.account-group[data-group="playback"] .group-mark { background:#2fa36b; }
+.account-group[data-group="playback"] .group-count { color:#64df9b; background:rgba(46,160,103,.13); }
+.account-group[data-group="catalog"] .group-mark { background:#d2a8ff; }
+.account-group[data-group="catalog"] .group-count { color:#d2a8ff; background:rgba(210,168,255,.1); }
+.account-group-list { display:flex; flex-direction:column; gap:20px; }
+.account-card.role-playback { border-left:3px solid #2fa36b; }
+.account-card.role-catalog { border-left:3px solid #b78cf0; }
 .auth-error { min-height:20px; color:#ff8e8e; font-size:12px; margin-top:10px; }
 .mobile-bar,.sidebar-scrim { display:none; }
 .overlay { background:rgba(3,5,8,.75); }
@@ -511,7 +528,7 @@ button:focus-visible,input:focus-visible,select:focus-visible { outline:2px soli
   <section id="view-accounts" class="view">
     <div id="readyHistory" class="ready-history" data-no-i18n></div>
     <div class="section-head"><div><h2>Tidal-аккаунты</h2><p>Управляйте пулом воспроизведения, токенами и каталогом.</p></div><div class="section-actions"><button class="btn" onclick="testAll()" id="testAllBtn">Проверить все</button><button class="btn btn-primary" onclick="openAddAccount()">+ Добавить</button></div></div>
-    <div class="toolbar"><div class="search-wrap"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg><input id="accountSearch" type="search" placeholder="Найти аккаунт..." oninput="filterAccounts(this.value)"></div><div class="account-summary" id="accountCount"><span class="status-dot status-ok"></span><span>Готовы сейчас</span><strong>— / —</strong></div></div>
+    <div class="toolbar"><div class="search-wrap"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg><input id="accountSearch" type="search" placeholder="Найти аккаунт..." oninput="filterAccounts(this.value)"></div><div class="toolbar-stats"><div class="account-summary" id="accountCount"><span class="status-dot status-ok"></span><span>Готовы сейчас</span><strong>— / —</strong></div><div class="toolbar-stats" id="subscriptionSummary" data-no-i18n></div></div></div>
     <div id="accounts-container" class="accounts-grid"></div>
     <div class="test-results-section" id="testResultsSection" style="display:none"><div class="test-results-header"><h3>Результаты проверки</h3><div class="test-summary" id="testSummary"></div></div><div class="test-results-body" id="testResultsList"></div></div>
   </section>
@@ -704,6 +721,10 @@ function filterAccounts(query) {
     var q = (query || '').trim().toLowerCase();
     document.querySelectorAll('#accounts-container .account-card').forEach(function(card) {
         card.style.display = !q || (card.dataset.search || '').indexOf(q) !== -1 ? '' : 'none';
+    });
+    document.querySelectorAll('#accounts-container .account-group').forEach(function(group) {
+        var visible = Array.prototype.some.call(group.querySelectorAll('.account-card'), function(card) { return card.style.display !== 'none'; });
+        group.style.display = visible ? '' : 'none';
     });
 }
 
@@ -1031,38 +1052,83 @@ function countryRow(account) {
 // Failed manual lookups, kept until the page reloads; answers are stored on the server.
 var _subscriptions = {};
 
-// The latest subscription answer: checked daily by the server or on demand.
+// Plans ending within this many days are highlighted and counted above the list.
+var SUBSCRIPTION_SOON_DAYS = 3;
+
+function subscriptionPlan(body) {
+    return String(((body || {}).subscription || {}).type || (body || {}).type || '');
+}
+
+function subscriptionDaysLeft(body) {
+    var until = body && body.validUntil ? Date.parse(String(body.validUntil).replace(/([+-]\d\d)(\d\d)$/, '$1:$2')) : NaN;
+    return isNaN(until) ? NaN : (until - Date.now()) / 86400000;
+}
+
+function subscriptionTime(seconds) {
+    var at = new Date(seconds * 1000);
+    var sameDay = at.toDateString() === new Date().toDateString();
+    return at.toLocaleString(adminLanguage === 'ru' ? 'ru-RU' : 'en-GB', sameDay ? {hour:'2-digit', minute:'2-digit'} : {day:'numeric', month:'short', hour:'2-digit', minute:'2-digit'});
+}
+
+// The last good subscription answer: checked daily, after a token refresh, or
+// on demand. A failed check never hides it, it is only noted next to it.
 function subscriptionRow(account) {
-    var failed = _subscriptions[account.id];
-    var stored = account.subscription ? { subscription: account.subscription, checked_at: account.subscription_checked_at } : null;
-    var result = failed && (!stored || failed.checked_at > stored.checked_at) ? failed : stored;
-    if (!result) return '';
-    var html;
-    if (result.error) {
-        html = '<span class="sub-bad">' + esc(tr('Не удалось проверить:')) + ' ' + esc(result.error) + '</span>';
-    } else {
-        var body = result.subscription || {};
-        var plan = (body.subscription || {}).type || body.type;
+    var body = account.subscription;
+    var checkedAt = Number(account.subscription_checked_at) || 0;
+    var failure = account.subscription_error ? { error: account.subscription_error, at: Number(account.subscription_error_at) || 0 } : null;
+    var manual = _subscriptions[account.id];
+    if (manual && (!failure || manual.checked_at > failure.at)) failure = { error: manual.error, at: manual.checked_at };
+    if (failure && body && checkedAt >= failure.at) failure = null;
+    if (!body && !failure) return '';
+    var html = '';
+    if (body) {
+        var plan = subscriptionPlan(body);
         var parts = [];
-        if (plan) parts.push('<strong>' + esc(plan) + '</strong>');
+        if (plan) parts.push('<strong class="' + (plan.toUpperCase() === 'FREE' ? 'sub-bad' : '') + '">' + esc(plan) + '</strong>');
         if (body.status) parts.push('<span class="' + (body.status === 'ACTIVE' ? 'sub-ok' : 'sub-bad') + '">' + esc(body.status) + '</span>');
-        var until = body.validUntil ? Date.parse(String(body.validUntil).replace(/([+-]\d\d)(\d\d)$/, '$1:$2')) : NaN;
-        if (!isNaN(until)) {
-            var date = new Date(until).toLocaleDateString(adminLanguage === 'ru' ? 'ru-RU' : 'en-GB', {day:'numeric', month:'short', year:'numeric'});
-            var daysLeft = (until - Date.now()) / 86400000;
-            parts.push('<span class="' + (daysLeft < 3 ? 'sub-bad' : '') + '">' + esc(tr('до')) + ' ' + esc(date) + '</span>');
-            if (daysLeft > 0 && daysLeft < 3) parts.push('<span class="sub-bad">' + esc(tr('заканчивается через')) + ' ' + esc(uptimeDuration(daysLeft * 86400)) + '</span>');
+        var daysLeft = subscriptionDaysLeft(body);
+        if (!isNaN(daysLeft)) {
+            var date = new Date(Date.now() + daysLeft * 86400000).toLocaleDateString(adminLanguage === 'ru' ? 'ru-RU' : 'en-GB', {day:'numeric', month:'short', year:'numeric'});
+            parts.push('<span class="' + (daysLeft < SUBSCRIPTION_SOON_DAYS ? 'sub-bad' : '') + '">' + esc(tr('до')) + ' ' + esc(date) + '</span>');
+            if (daysLeft > 0 && daysLeft < SUBSCRIPTION_SOON_DAYS) parts.push('<span class="sub-bad">' + esc(tr('заканчивается через')) + ' ' + esc(uptimeDuration(daysLeft * 86400)) + '</span>');
         }
         if (body.highestSoundQuality) parts.push(esc(body.highestSoundQuality));
         if (body.paymentOverdue) parts.push('<span class="sub-bad">' + esc(tr('оплата просрочена')) + '</span>');
         if (!parts.length) parts.push('<code>' + esc(JSON.stringify(body).slice(0, 200)) + '</code>');
-        html = parts.join(' · ');
+        html = parts.join(' · ') + ' <span class="sub-checked">· ' + esc(tr('проверено в')) + ' ' + esc(subscriptionTime(checkedAt || Date.now() / 1000)) + '</span>';
     }
-    var checkedAt = new Date((result.checked_at || Date.now() / 1000) * 1000);
-    var sameDay = checkedAt.toDateString() === new Date().toDateString();
-    var checked = checkedAt.toLocaleString(adminLanguage === 'ru' ? 'ru-RU' : 'en-GB', sameDay ? {hour:'2-digit', minute:'2-digit'} : {day:'numeric', month:'short', hour:'2-digit', minute:'2-digit'});
-    return '<div class="cred-row" data-no-i18n><span class="cred-key">' + esc(tr('Подписка')) + '</span><span class="cred-value">' + html +
-        ' <span class="sub-checked">· ' + esc(tr('проверено в')) + ' ' + esc(checked) + '</span></span></div>';
+    if (failure) {
+        html += body
+            ? ' <span class="sub-bad" title="' + esc(failure.error) + '">· ' + esc(tr('последняя проверка не удалась')) + ' ' + esc(subscriptionTime(failure.at)) + '</span>'
+            : '<span class="sub-bad">' + esc(tr('Не удалось проверить:')) + ' ' + esc(failure.error) + '</span> <span class="sub-checked">· ' + esc(subscriptionTime(failure.at)) + '</span>';
+    }
+    return '<div class="cred-row" data-no-i18n><span class="cred-key">' + esc(tr('Подписка')) + '</span><span class="cred-value">' + html + '</span></div>';
+}
+
+// Counters above the account list: FREE plans, plans ending soon, plans that
+// ended or are overdue, and playback accounts without any answer yet.
+function subscriptionSummary(accounts) {
+    var groups = { free: [], soon: [], ended: [], unknown: [] };
+    accounts.forEach(function(a) {
+        var label = a.label || a.id.slice(0, 8);
+        var body = a.subscription;
+        if (!body) {
+            if (!a.is_catalog && a.is_active) groups.unknown.push(label);
+            return;
+        }
+        var daysLeft = subscriptionDaysLeft(body);
+        if (subscriptionPlan(body).toUpperCase() === 'FREE') groups.free.push(label);
+        else if (body.paymentOverdue || (body.status && body.status !== 'ACTIVE') || daysLeft <= 0) groups.ended.push(label);
+        else if (daysLeft < SUBSCRIPTION_SOON_DAYS) groups.soon.push(label);
+    });
+    function chip(names, text, always) {
+        if (!names.length && !always) return '';
+        return '<div class="account-summary' + (names.length ? ' warn' : ' calm') + '"' + (names.length ? ' title="' + esc(names.join(', ')) + '"' : '') + '><span>' + esc(tr(text)) + '</span><strong>' + metricNumber(names.length) + '</strong></div>';
+    }
+    return chip(groups.free, 'FREE-подписка', true) +
+        chip(groups.soon, 'Подписка кончается за ' + SUBSCRIPTION_SOON_DAYS + ' дн.', true) +
+        chip(groups.ended, 'Подписка закончилась', false) +
+        chip(groups.unknown, 'Подписка не проверена', false);
 }
 
 // How long Tidal has answered 403 to token refreshes, and when (or that)
@@ -1567,11 +1633,15 @@ async function fetchData() {
         renderOverview(stats);
 
         var html = '';
+        var groupCards = { playback: '', catalog: '' };
+        var groupSize = { playback: 0, catalog: 0 };
         if (accounts.accounts.length === 0) {
             html = '<div class="empty-state"><p>Аккаунтов пока нет</p><p class="hint">Подключите первый через OAuth — это займёт меньше минуты.</p><button class="btn btn-primary" style="margin-top:16px" onclick="openAddAccount()">Добавить аккаунт</button></div>';
         } else {
             for (var i = 0; i < accounts.accounts.length; i++) {
                 var a = accounts.accounts[i];
+                var group = a.is_catalog ? 'catalog' : 'playback';
+                var number = ++groupSize[group];
                 var label = a.label || a.id.slice(0, 8);
                 var readiness = accountStatus(a);
                 var statusClass = 'status-dot ' + readiness.tone;
@@ -1620,9 +1690,9 @@ async function fetchData() {
                 var catalogBtn = a.is_catalog
                     ? '<button class="btn" onclick="setCatalog(\'' + a.id + '\',false)" title="Вернуть в пул воспроизведения">Из каталога</button>'
                     : '<button class="btn" onclick="setCatalog(\'' + a.id + '\',true)" title="Использовать только для метаданных">В каталог</button>';
-                html += '<div class="account-card" data-search="' + esc((label + ' ' + uid + ' ' + a.client_id).toLowerCase()) + '">' +
+                groupCards[group] += '<div class="account-card role-' + group + '" data-search="' + esc((label + ' ' + uid + ' ' + a.client_id).toLowerCase()) + '">' +
                     '<div class="card-header">' +
-                        '<div class="left"><span class="acc-num">' + (i + 1) + '</span><span class="' + statusClass + '"></span><span class="label">' + esc(label) + '</span><span class="status-label ' + readiness.tone + '">' + statusText + '</span>' + (a.heal_next_retry > Date.now() / 1000 ? '<span class="status-label status-warn" data-no-i18n>' + tr('Пауза обновления') + '</span>' : '') + catalogBadge + premiumBadge + '</div>' +
+                        '<div class="left"><span class="acc-num">' + number + '</span><span class="' + statusClass + '"></span><span class="label">' + esc(label) + '</span><span class="status-label ' + readiness.tone + '">' + statusText + '</span>' + (a.heal_next_retry > Date.now() / 1000 ? '<span class="status-label status-warn" data-no-i18n>' + tr('Пауза обновления') + '</span>' : '') + catalogBadge + premiumBadge + '</div>' +
                         '<div class="card-actions">' +
                             '<button class="btn" onclick="refreshAccount(\'' + a.id + '\')">Обновить токен</button>' +
                             '<button class="btn" onclick="checkPremium(\'' + a.id + '\')" title="Проверка FULL/PREVIEW отправляет до четырёх запросов к Tidal">Проверить FULL</button>' +
@@ -1658,8 +1728,11 @@ async function fetchData() {
                     '</div>' +
                 '</div>';
             }
+            html = accountGroup('playback', 'Воспроизведение · FULL', 'Отдают треки целиком; FREE-подписка переводит аккаунт в каталог', groupCards.playback, groupSize.playback) +
+                accountGroup('catalog', 'Каталог', 'Только метаданные: поиск, альбомы, обложки; треки не воспроизводят', groupCards.catalog, groupSize.catalog);
         }
         document.getElementById('accounts-container').innerHTML = html;
+        document.getElementById('subscriptionSummary').innerHTML = subscriptionSummary(accounts.accounts);
         document.getElementById('readyHistory').innerHTML = readyHistoryCard(accounts.accounts);
         var liveAccounts = Number(stats.live_accounts || 0);
         var totalAccounts = Number(stats.total_accounts || accounts.accounts.length || 0);
@@ -1670,6 +1743,12 @@ async function fetchData() {
     } catch(e) {
         document.getElementById('error').textContent = 'Failed: ' + e.message;
     }
+}
+
+function accountGroup(role, title, hint, cards, count) {
+    if (!count) return '';
+    return '<div class="account-group" data-group="' + role + '"><div class="account-group-head"><span class="group-mark"></span><h3>' + title + '</h3><span class="group-count">' + metricNumber(count) + '</span><p>' + hint + '</p></div>' +
+        '<div class="account-group-list">' + cards + '</div></div>';
 }
 
 function esc(s) {
@@ -1720,7 +1799,8 @@ async function checkSubscription(id) {
         var res = await fetch('/admin/accounts/' + id + '/subscription', { method: 'POST', headers: headers() });
         var data = await res.json();
         if (!res.ok) throw new Error(data.detail || 'HTTP ' + res.status);
-        _subscriptions[id] = data;
+        delete _subscriptions[id];
+        if (data.is_catalog && subscriptionPlan(data.subscription).toUpperCase() === 'FREE') document.getElementById('success').textContent = tr('Подписка FREE: аккаунт переведён в каталог');
     } catch(e) {
         _subscriptions[id] = { error: e.message, checked_at: Date.now() / 1000 };
         document.getElementById('error').textContent = tr('Проверка подписки:') + ' ' + e.message;

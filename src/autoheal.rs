@@ -18,6 +18,10 @@ const FULL_CHECK_REPEAT_SPREAD_SECS: i64 = 15 * 60;
 const SUBSCRIPTION_CHECK_INTERVAL_SECS: i64 = 24 * 60 * 60;
 const SUBSCRIPTION_INITIAL_SPREAD_SECS: i64 = 10 * 60;
 const SUBSCRIPTION_REPEAT_SPREAD_SECS: i64 = 60 * 60;
+/// A failed check is retried after this long instead of a full day.
+const SUBSCRIPTION_RETRY_SECS: i64 = 60 * 60;
+/// A fresh token also checks the subscription, unless it was checked this recently.
+const SUBSCRIPTION_AFTER_REFRESH_SECS: i64 = 60 * 60;
 /// Warn this long before a subscription ends.
 const SUBSCRIPTION_WARN_SECS: i64 = 3 * 24 * 60 * 60;
 
@@ -63,7 +67,10 @@ fn subscription_check_due(
         return false;
     }
     let checked_at = account.subscription_checked_at.load(Ordering::Relaxed);
-    let due_at = if checked_at > 0 {
+    let failed_at = account.subscription_error_at.load(Ordering::Relaxed);
+    let due_at = if failed_at > 0 {
+        failed_at + SUBSCRIPTION_RETRY_SECS
+    } else if checked_at > 0 {
         checked_at
             + SUBSCRIPTION_CHECK_INTERVAL_SECS
             + account_spread_secs(&account.id, SUBSCRIPTION_REPEAT_SPREAD_SECS)
@@ -97,6 +104,65 @@ pub(crate) fn subscription_problem(subscription: &serde_json::Value, now: i64) -
         ))
     } else {
         None
+    }
+}
+
+/// True when Tidal reports the FREE plan, which cannot play full tracks.
+pub(crate) fn subscription_is_free(subscription: &serde_json::Value) -> bool {
+    subscription["subscription"]["type"]
+        .as_str()
+        .or_else(|| subscription["type"].as_str())
+        .is_some_and(|plan| plan.eq_ignore_ascii_case("FREE"))
+}
+
+/// Store a subscription answer, move a FREE account to catalog-only and
+/// alert the owner about a plan that needs attention. Shared by the
+/// automatic and the manual check.
+pub(crate) async fn apply_subscription(
+    account_manager: &AccountManager,
+    notifier: &Notifier,
+    account: &crate::account_manager::AccountState,
+    subscription: serde_json::Value,
+    now: i64,
+) {
+    account.store_subscription(subscription.clone(), now).await;
+    if subscription_is_free(&subscription) {
+        if account.is_catalog.load(Ordering::Relaxed) {
+            return;
+        }
+        match account_manager.set_account_catalog(&account.id, true).await {
+            Ok(()) => {
+                tracing::warn!(account = %account.label, "Account moved to catalog-only: Tidal plan is FREE");
+                notifier.alert_free_plan(&account.label).await;
+            }
+            Err(e) => tracing::warn!("Could not move {} to catalog-only: {}", account.label, e),
+        }
+        return;
+    }
+    if let Some(problem) = subscription_problem(&subscription, now) {
+        tracing::warn!(account = %account.label, problem, "Subscription needs attention");
+        notifier.alert_subscription(&account.label, &problem).await;
+    }
+}
+
+/// Automatic subscription check: daily, after a token refresh, or an hour
+/// after a failed attempt. A failure is kept next to the last good answer.
+pub(crate) async fn check_subscription_now(
+    tidal: &TidalClient,
+    account_manager: &AccountManager,
+    notifier: &Notifier,
+    account: &Arc<crate::account_manager::AccountState>,
+) {
+    let now = Utc::now().timestamp();
+    match tidal.account_subscription(account).await {
+        Ok(result) => {
+            apply_subscription(account_manager, notifier, account, result["subscription"].clone(), now)
+                .await;
+        }
+        Err(e) => {
+            tracing::warn!(account = %account.label, error = %e, "Automatic subscription check failed");
+            account.store_subscription_error(e.to_string(), now).await;
+        }
     }
 }
 
@@ -163,7 +229,7 @@ pub async fn start_autoheal_loop(
                         let check_full = !cooling_down
                             && !rate_limited
                             && full_check_due(&account, now, loop_started_at);
-                        let check_subscription = !cooling_down
+                        let mut check_subscription = !cooling_down
                             && !rate_limited
                             && subscription_check_due(&account, now, loop_started_at);
                         if !refresh_due && !check_full && !check_subscription {
@@ -176,20 +242,29 @@ pub async fn start_autoheal_loop(
                             // inside its deadline; this fallback cannot bypass proxies.
                             let result = tm.refresh_token(&account, &pm.client()).await;
                             match result {
-                                Ok(_) => match am.set_system_disabled(&account, false).await {
-                                    Ok(true) => {
-                                        tracing::info!(
-                                            "Auto-heal: account {} recovered",
-                                            account.label
-                                        );
-                                        let (healthy, total) = am.healthy_count().await;
-                                        notifier.alert_healed(&account.label, healthy, total).await;
+                                Ok(_) => {
+                                    let last_attempt = account
+                                        .subscription_checked_at
+                                        .load(Ordering::Relaxed)
+                                        .max(account.subscription_error_at.load(Ordering::Relaxed));
+                                    check_subscription |= now - last_attempt
+                                        >= SUBSCRIPTION_AFTER_REFRESH_SECS
+                                        && !account.is_catalog.load(Ordering::Relaxed);
+                                    match am.set_system_disabled(&account, false).await {
+                                        Ok(true) => {
+                                            tracing::info!(
+                                                "Auto-heal: account {} recovered",
+                                                account.label
+                                            );
+                                            let (healthy, total) = am.healthy_count().await;
+                                            notifier.alert_healed(&account.label, healthy, total).await;
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!("Could not persist recovery: {}", e)
+                                        }
+                                        _ => {}
                                     }
-                                    Err(e) => {
-                                        tracing::warn!("Could not persist recovery: {}", e)
-                                    }
-                                    _ => {}
-                                },
+                                }
                                 Err(e) => {
                                     tracing::debug!("Auto-heal for {}: {}", account.label, e);
                                     return;
@@ -239,21 +314,7 @@ pub async fn start_autoheal_loop(
                             }
                         }
                         if check_subscription && account.is_active.load(Ordering::Relaxed) {
-                            match tidal.account_subscription(&account).await {
-                                Ok(result) => {
-                                    let subscription = result["subscription"].clone();
-                                    account.store_subscription(subscription.clone(), now).await;
-                                    if let Some(problem) = subscription_problem(&subscription, now) {
-                                        tracing::warn!(account = %account.label, problem, "Subscription needs attention");
-                                        notifier.alert_subscription(&account.label, &problem).await;
-                                    }
-                                }
-                                // Try again on the next daily round rather than every loop.
-                                Err(e) => {
-                                    account.subscription_checked_at.store(now, Ordering::Relaxed);
-                                    tracing::debug!("Subscription check for {}: {}", account.label, e);
-                                }
-                            }
+                            check_subscription_now(tidal, am, notifier, &account).await;
                         }
                     }
                 })
@@ -311,6 +372,30 @@ mod tests {
         ));
         account.is_catalog.store(true, Ordering::Relaxed);
         assert!(!subscription_check_due(&account, i64::MAX / 2, started));
+    }
+
+    #[tokio::test]
+    async fn failed_subscription_check_keeps_the_answer_and_retries_in_an_hour() {
+        let account = account("account-c");
+        let answer = serde_json::json!({"status": "ACTIVE"});
+        account.store_subscription(answer.clone(), 10_000).await;
+        account.store_subscription_error("Tidal HTTP 500".into(), 20_000).await;
+        assert_eq!(account.subscription(), Some(answer.clone()));
+        assert_eq!(account.subscription_checked_at.load(Ordering::Relaxed), 10_000);
+        assert!(!subscription_check_due(&account, 20_000 + SUBSCRIPTION_RETRY_SECS - 1, 0));
+        assert!(subscription_check_due(&account, 20_000 + SUBSCRIPTION_RETRY_SECS, 0));
+        account.store_subscription(answer, 30_000).await;
+        assert_eq!(account.subscription_error(), None);
+        assert!(!subscription_check_due(&account, 30_000 + SUBSCRIPTION_RETRY_SECS, 0));
+    }
+
+    #[test]
+    fn free_plan_is_recognised_in_either_shape() {
+        use serde_json::json;
+        assert!(subscription_is_free(&json!({"subscription": {"type": "FREE"}, "status": "ACTIVE"})));
+        assert!(subscription_is_free(&json!({"type": "free"})));
+        assert!(!subscription_is_free(&json!({"subscription": {"type": "HIFI"}, "status": "ACTIVE"})));
+        assert!(!subscription_is_free(&json!({"status": "ACTIVE"})));
     }
 
     #[test]
