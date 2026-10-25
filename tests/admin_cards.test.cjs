@@ -505,8 +505,14 @@ test('FREE catalog accounts get their own group; filters and sorts pick the righ
     const keys = vm.runInContext('accounts.map(accountFilterKeys)', ctx);
     assert.deepEqual(keys, ['all playback', 'all playback expiring', 'all free', 'all catalog expiring', 'all catalog']);
     ctx.accountFilter = 'expiring';
-    assert.match(vm.runInContext('accountFilterTabs(accounts)', ctx), /aria-selected="true" onclick="setAccountFilter\('expiring'\)">Ending soon<span class="tab-count">2</);
-    assert.match(vm.runInContext('subscriptionSummary(accounts)', ctx), /clickable" onclick="setAccountFilter\('free'\)"/);
+    const tabs = vm.runInContext('accountFilterTabs(accounts)', ctx);
+    assert.match(tabs, /aria-selected="true" onclick="setAccountFilter\('expiring'\)" title="Plan ended or ends within 3 days">Needs renewal<span class="tab-count warn">2</);
+    assert.match(tabs, />Catalog<span class="tab-count">2</);
+    // The tabs count FREE and ending plans; above them only unchecked playback accounts are counted.
+    assert.equal(vm.runInContext('subscriptionSummary(accounts)', ctx), '');
+    ctx.accounts.push({ id: 'f', label: 'f-new', is_active: true, availability: { state: 'ready' } });
+    assert.match(vm.runInContext('subscriptionSummary(accounts)', ctx), /title="f-new"><span>Plan not checked<\/span><strong>1</);
+    ctx.accounts.pop();
     const order = sort => { ctx.accountSort = sort; return vm.runInContext('accounts.slice().sort(compareAccounts).map(function(a) { return a.id; }).join("")', ctx); };
     assert.equal(order('added'), 'abcde');
     assert.equal(order('name'), 'bacde');
@@ -526,10 +532,22 @@ for (const language of ['en', 'ru']) {
         assert.match(row, /<span class="acc-num">3<\/span>/);
         assert.match(row, /&lt;b&gt;main&lt;\/b&gt;/);
         assert.match(row, /access-full"[^>]*><strong>FULL<\/strong>/);
-        assert.ok(row.includes(language === 'en' ? 'PREMIUM · 23 d' : 'PREMIUM · 23 дн.'));
+        assert.ok(row.includes(language === 'en' ? 'PREMIUM · <span class="row-muted">23 d</span>' : 'PREMIUM · <span class="row-muted">23 дн.</span>'));
+        assert.match(row, language === 'en' ? /title="until \d/ : /title="до \d/);
+        assert.match(row, language === 'en' ? /c-token">\d+ hr \d+ min left</ : /c-token">ещё \d+ ч \d+ мин</);
+        assert.match(row, /c-errors">/);
+        assert.doesNotMatch(row, /row-status-detail/);
         assert.ok(row.includes('\u{1F1E9}\u{1F1EA} DE'));
         assert.match(row, language === 'en' ? /12.5%|13%/ : /12,5%|13%/);
         assert.match(row, /aria-expanded="false"/);
+        // A pause shows when it ends on the status line; a high error rate is coloured.
+        const paused = Object.assign({}, ctx.account, { availability: { state: 'no_token', token: 'expired' }, heal_next_retry: Date.now() / 1000 + 1500, recent_error_rate: 0.97 });
+        ctx.paused = paused;
+        const pausedRow = localized(ctx, vm.runInContext('accountRow(paused, 1, false)', ctx));
+        assert.match(pausedRow, language === 'en' ? /Token expired<span class="row-status-detail" data-no-i18n> · retry in 2\d min</ : /Токен истёк<span class="row-status-detail" data-no-i18n> · повтор через 2\d мин</);
+        assert.match(pausedRow, /c-errors tone-status-err">97%/);
+        ctx.paused = Object.assign({}, paused, { availability: { state: 'rate_limited', token: 'valid' }, rate_limited_until: Date.now() / 1000 + 200 });
+        assert.match(localized(ctx, vm.runInContext('accountRow(paused, 1, false)', ctx)), language === 'en' ? / · 3 min left</ : / · ещё 3 мин</);
         const menu = vm.runInContext('accountMenu(account, true)', ctx);
         for (const action of ['refreshAccount', 'checkPremium', 'checkSubscription', 'openEdit', 'duplicateAccount', "setCatalog('abc',true)", "toggleAccount('abc',false)", 'removeAccount']) assert.ok(menu.includes(action), action);
         const cardMenu = vm.runInContext('accountMenu(account, false)', ctx);
@@ -553,15 +571,4 @@ test('premiumAccess keeps a FREE trial out of the FREE group and flags a paid pl
     assert.deepEqual(vm.runInContext('accounts.map(accountGroupOf)', ctx), ['catalog', 'playback']);
     assert.match(localized(ctx, vm.runInContext('subscriptionShort(accounts[1])', ctx)), /no premium access/);
     assert.match(localized(ctx, vm.runInContext('subscriptionRow(accounts[0])', ctx)), /premium access granted/);
-});
-
-test('accounts off the preferred client can be moved to it from the menu', () => {
-    const { ctx } = context('en');
-    ctx.window._accounts = [{ id: 'a', client_id: 'fX2JxdmntZWK0ixT' }, { id: 'b', client_id: 'lw3vR6GE1vtNBsjv' }];
-    const menu = id => localized(ctx, vm.runInContext('accountMenu(window._accounts.find(function(a) { return a.id === "' + id + '"; }), true)', ctx));
-    assert.match(menu('a'), /onclick="switchClient\('a','lw3vR6GE1vtNBsjv'\)"[^>]*>Move to lw3v…</);
-    assert.doesNotMatch(menu('b'), /switchClient/);
-    // Without the preferred client in the pool there is nothing to move to.
-    ctx.window._accounts = [{ id: 'a', client_id: 'fX2JxdmntZWK0ixT' }];
-    assert.doesNotMatch(menu('a'), /switchClient/);
 });

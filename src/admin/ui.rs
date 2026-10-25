@@ -435,26 +435,32 @@ button:focus-visible,input:focus-visible,select:focus-visible { outline:2px soli
 .account-card.role-free { border-left:3px solid #d99a3f; }
 .account-group > summary { list-style:none; cursor:pointer; user-select:none; }
 .account-group > summary::-webkit-details-marker { display:none; }
-.account-group-head .group-chevron { margin-left:auto; color:var(--muted); font-size:12px; transition:transform .15s; }
+.account-group-head .group-chevron { order:-1; color:var(--muted); font-size:12px; transition:transform .15s; }
 .account-group:not([open]) .group-chevron { transform:rotate(-90deg); }
 .account-filters { display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:10px; margin:-4px 0 18px; }
 .account-filters .mode-tabs { margin:0; flex-wrap:wrap; }
 .account-filters .tab-count { margin-left:7px; color:var(--muted); font-weight:500; font-variant-numeric:tabular-nums; }
+.account-filters .tab-count.warn { color:var(--amber); font-weight:650; }
 .account-sort { display:inline-flex; align-items:center; gap:8px; color:var(--muted); font-size:12px; }
 .account-sort .select { min-height:36px; padding:0 10px; font-size:12px; }
 .account-summary.clickable { cursor:pointer; }
 .account-summary.clickable:hover { border-color:#35404d; color:var(--text); }
 .account-view-controls { display:flex; flex-wrap:wrap; align-items:center; gap:10px; }
-.account-row { display:grid; grid-template-columns:28px minmax(150px,1.7fr) 92px minmax(120px,1.2fr) 56px 60px 56px minmax(90px,.9fr) 38px 14px; align-items:center; gap:10px; padding:6px 12px 6px 14px; color:var(--text); font-size:12px; cursor:pointer; }
+.account-row { display:grid; grid-template-columns:24px minmax(170px,1.8fr) 64px minmax(120px,1.2fr) 64px 60px 60px minmax(100px,.9fr) 30px 12px; align-items:center; gap:12px; padding:9px 12px 9px 14px; color:var(--text); font-size:12px; cursor:pointer; }
 .account-row > * { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .account-row:hover { background:var(--panel-2); }
 .account-row:focus-visible { outline:2px solid var(--accent); outline-offset:-2px; }
-.account-row-head { padding-top:0; padding-bottom:0; color:var(--muted); font-size:10px; font-weight:650; letter-spacing:.5px; text-transform:uppercase; cursor:default; }
+.account-row-head { padding-top:9px; padding-bottom:9px; color:var(--muted); font-size:10px; font-weight:650; letter-spacing:.5px; text-transform:uppercase; cursor:default; }
+.account-row .c-errors,.account-row .c-hour { text-align:right; font-variant-numeric:tabular-nums; }
+.account-row .acc-num { min-width:0; height:auto; padding:0; border:0; background:none; font-weight:500; font-variant-numeric:tabular-nums; }
+.account-row .account-menu > summary { width:30px; min-height:30px; border-color:transparent; background:transparent; color:var(--muted); }
+.account-row:hover .account-menu > summary,.account-row .account-menu[open] > summary { border-color:var(--line); color:var(--text); }
 .account-row-head:hover { background:none; }
 .row-name { display:flex; align-items:center; gap:9px; }
 .row-name-text { display:flex; flex-direction:column; min-width:0; line-height:1.35; }
 .row-label { overflow:hidden; text-overflow:ellipsis; color:#f0f6fc; font-weight:650; }
 .row-status { overflow:hidden; text-overflow:ellipsis; font-size:11px; }
+.row-status-detail { color:var(--muted); }
 .tone-status-ok { color:var(--green); }
 .tone-status-warn { color:#d29922; }
 .tone-status-err { color:#f85149; }
@@ -463,7 +469,11 @@ button:focus-visible,input:focus-visible,select:focus-visible { outline:2px soli
 .playback-access.row-access strong { font-size:11px; }
 .row-chevron { color:var(--muted); transition:transform .15s; }
 .account-card.expanded .row-chevron { transform:rotate(180deg); }
-.view-list .account-group-list { gap:6px; }
+.view-list .account-group-list { gap:0; border:1px solid var(--line); border-radius:12px; background:var(--panel); overflow:hidden; }
+.view-list .account-card,.view-list .account-card:hover { border:0; border-top:1px solid var(--line); border-radius:0; background:transparent; box-shadow:none; }
+.view-list .account-card.expanded { background:var(--panel); }
+.view-list .account-row-head { background:#0e1319; }
+.view-list .account-group-head { border-bottom:0; padding-bottom:2px; }
 .view-list .account-card > .card-header,
 .view-list .account-card:not(.expanded) > :not(.account-row) { display:none; }
 .view-list .account-card.expanded > .account-row { background:var(--panel-2); border-bottom:1px solid var(--line); }
@@ -1225,18 +1235,20 @@ function subscriptionShort(account) {
     var days = subscriptionDaysLeft(body);
     if (isNaN(days)) return plan;
     if (state === 'soon') return plan + ' · <span class="sub-bad">' + esc(uptimeDuration(days * 86400)) + '</span>';
-    return plan + ' · ' + esc(metricNumber(Math.floor(days)) + ' ' + tr('дн.'));
+    return plan + ' · <span class="row-muted">' + esc(metricNumber(Math.floor(days)) + ' ' + tr('дн.')) + '</span>';
+}
+
+// The plan's last day as a date, or '' when Tidal gave none.
+function subscriptionEndDate(body) {
+    var daysLeft = subscriptionDaysLeft(body);
+    return isNaN(daysLeft) ? '' : new Date(Date.now() + daysLeft * 86400000).toLocaleDateString(adminLanguage === 'ru' ? 'ru-RU' : 'en-GB', {day:'numeric', month:'short', year:'numeric'});
 }
 
 // The server's built-in sign-in client (crate::setup::AUTH_CLIENT_ID).
 var BUILTIN_CLIENT_ID = 'fX2JxdmntZWK0ixT';
 // Accounts on this client play hundreds of tracks an hour where the built-in
-// one gets 429 after a few, so new and moved accounts go to it when the pool has it.
+// one gets 429 after a few, so new accounts go to it when the pool has it.
 var PREFERRED_CLIENT_ID = 'lw3vR6GE1vtNBsjv';
-
-function poolHasClient(clientId) {
-    return (window._accounts || []).some(function(a) { return a.client_id === clientId; });
-}
 
 // Everyday actions stay on the card; the rest, and in the list all of them, sit in the ⋯ menu.
 function accountMenu(account, everyday) {
@@ -1252,9 +1264,6 @@ function accountMenu(account, everyday) {
         (account.is_catalog
             ? item('setCatalog(' + id + ',false)', 'Из каталога', 'Вернуть в пул воспроизведения')
             : item('setCatalog(' + id + ',true)', 'В каталог', 'Использовать только для метаданных')) +
-        (account.client_id !== PREFERRED_CLIENT_ID && poolHasClient(PREFERRED_CLIENT_ID)
-            ? item('switchClient(' + id + ',\'' + PREFERRED_CLIENT_ID + '\')', 'Перевести на ' + PREFERRED_CLIENT_ID.slice(0, 4) + '…', 'Обновляет токен клиентом ' + PREFERRED_CLIENT_ID + ' и сохраняет аккаунт под ним; входить заново не нужно')
-            : '') +
         (everyday ? item('toggleAccount(' + id + ',' + (!account.is_active) + ')', account.is_active ? 'Отключить' : 'Включить') : '') +
         '<div class="menu-sep"></div>' + item('removeAccount(' + id + ')', 'Удалить', '', 'danger');
     return '<details class="account-menu" data-menu="' + (everyday ? 'row' : 'card') + '-' + esc(account.id) + '" ontoggle="placeAccountMenu(this)">' +
@@ -1262,27 +1271,45 @@ function accountMenu(account, everyday) {
         '<div class="account-menu-list" onclick="closeAccountMenus()">' + items + '</div></details>';
 }
 
-var ACCOUNT_ROW_HEAD = '<div class="account-row account-row-head"><span></span><span>Аккаунт</span><span class="c-access">Треки</span><span>Подписка</span>' +
-    '<span class="c-country">Страна</span><span class="c-errors">Ошибки</span><span class="c-hour">За час</span><span class="c-token">Токен</span><span></span><span class="row-chevron"></span></div>';
+var ACCOUNT_ROW_HEAD = '<div class="account-row account-row-head"><span></span><span>Аккаунт</span><span class="c-access" title="Доступ к трекам">Треки</span><span>Подписка</span>' +
+    '<span class="c-country">Страна</span><span class="c-errors" title="Доля ошибок с учётом примерно последних 15 минут. Чем она выше, тем позже аккаунт получает следующий запрос.">Ошибки</span>' +
+    '<span class="c-hour" title="Запросы, начатые этим аккаунтом за последний час; лимит задаётся в настройках">За час</span><span class="c-token">Токен</span><span></span><span class="row-chevron"></span></div>';
+
+// When a pause ends, next to the status it explains: a 429 cooldown or the
+// wait before the next token refresh attempt.
+function accountStatusDetail(account) {
+    var now = Date.now() / 1000;
+    if (account.rate_limited_until > now) return tr('ещё ' + uptimeDuration(account.rate_limited_until - now));
+    if (account.heal_next_retry > now) return tr('повтор через') + ' ' + uptimeDuration(account.heal_next_retry - now);
+    return '';
+}
+
+function errorRateTone(rate) {
+    return rate >= 0.5 ? ' tone-status-err' : (rate >= 0.15 ? ' tone-status-warn' : '');
+}
 
 // One line per account in the list view; a click opens the full card under it.
 function accountRow(account, number, expanded) {
     var readiness = accountStatus(account);
     var access = playbackAccess(account);
     var accessCell = account.is_catalog ? '<span class="row-muted">—</span>'
-        : '<span class="playback-access row-access ' + access.className + '" title="' + esc(access.description) + '"><strong>' + (access.className === 'access-full' || access.className === 'access-preview' ? access.label : (account.premium_status === 'premium' ? 'FULL?' : '—')) + '</strong></span>';
-    var healing = account.heal_next_retry > Date.now() / 1000;
+        : (access.className === 'access-full' || access.className === 'access-preview' || account.premium_status === 'premium'
+            ? '<span class="playback-access row-access ' + access.className + '" title="' + esc(access.description) + '"><strong>' + (access.className === 'access-unknown' ? 'FULL?' : access.label) + '</strong></span>'
+            : '<span class="row-muted" title="' + esc(access.description) + '">—</span>');
+    var detail = accountStatusDetail(account);
+    var tokenValid = (account.availability || {}).token === 'valid';
     var token = tokenDescription(account);
+    var endDate = subscriptionEndDate(account.subscription);
     return '<div class="account-row" role="button" tabindex="0" aria-expanded="' + expanded + '" onclick="toggleAccountDetails(this.parentNode, event)" onkeydown="if((event.key===\'Enter\'||event.key===\' \')&&!event.target.closest(\'.account-menu\')){event.preventDefault();toggleAccountDetails(this.parentNode, event)}">' +
         '<span class="acc-num">' + number + '</span>' +
         '<span class="row-name"><span class="status-dot ' + readiness.tone + '"></span><span class="row-name-text"><span class="row-label" data-no-i18n>' + esc(account.label || account.id.slice(0, 8)) + '</span>' +
-            '<span class="row-status tone-' + readiness.tone + '">' + readiness.text + '</span>' + (healing ? '<span class="row-status tone-status-warn">Пауза обновления</span>' : '') + '</span></span>' +
+            '<span class="row-status tone-' + readiness.tone + '">' + readiness.text + (detail ? '<span class="row-status-detail" data-no-i18n> · ' + esc(detail) + '</span>' : '') + '</span></span></span>' +
         '<span class="c-access">' + accessCell + '</span>' +
-        '<span data-no-i18n>' + subscriptionShort(account) + '</span>' +
+        '<span data-no-i18n' + (endDate ? ' title="' + esc(tr('до') + ' ' + endDate) + '"' : '') + '>' + subscriptionShort(account) + '</span>' +
         '<span class="c-country" data-no-i18n>' + (countryFlag(account) || '<span class="row-muted">—</span>') + '</span>' +
-        '<span class="c-errors">' + metricNumber((account.recent_error_rate || 0) * 100) + '%</span>' +
+        '<span class="c-errors' + errorRateTone(account.recent_error_rate || 0) + '">' + metricNumber((account.recent_error_rate || 0) * 100) + '%</span>' +
         '<span class="c-hour">' + metricNumber(account.requests_last_hour) + '</span>' +
-        '<span class="c-token' + ((account.availability || {}).token === 'valid' ? '' : ' row-muted') + '" title="' + esc(token) + '">' + token + '</span>' +
+        '<span class="c-token' + (tokenValid ? '' : ' row-muted') + '">' + (tokenValid ? 'ещё ' : '') + token + '</span>' +
         accountMenu(account, true) +
         '<span class="row-chevron" aria-hidden="true">▾</span></div>';
 }
@@ -1326,8 +1353,7 @@ function subscriptionRow(account) {
         if (body.status) parts.push('<span class="' + (body.status === 'ACTIVE' ? 'sub-ok' : 'sub-checked') + '"' + (body.status === 'ACTIVE' ? '' : ' title="' + esc(tr('Подписка не продлится, но работает до указанной даты')) + '"') + '>' + esc(body.status) + '</span>');
         var daysLeft = subscriptionDaysLeft(body);
         if (!isNaN(daysLeft)) {
-            var date = new Date(Date.now() + daysLeft * 86400000).toLocaleDateString(adminLanguage === 'ru' ? 'ru-RU' : 'en-GB', {day:'numeric', month:'short', year:'numeric'});
-            parts.push('<span class="' + (daysLeft < SUBSCRIPTION_SOON_DAYS ? 'sub-bad' : '') + '">' + esc(tr('до')) + ' ' + esc(date) + '</span>');
+            parts.push('<span class="' + (daysLeft < SUBSCRIPTION_SOON_DAYS ? 'sub-bad' : '') + '">' + esc(tr('до')) + ' ' + esc(subscriptionEndDate(body)) + '</span>');
             if (daysLeft > 0 && daysLeft < SUBSCRIPTION_SOON_DAYS) parts.push('<span class="sub-bad">' + esc(tr('заканчивается через')) + ' ' + esc(uptimeDuration(daysLeft * 86400)) + '</span>');
         }
         if (body.highestSoundQuality) parts.push(esc(body.highestSoundQuality));
@@ -1345,8 +1371,6 @@ function subscriptionRow(account) {
     return '<div class="cred-row" data-no-i18n><span class="cred-key">' + esc(tr('Подписка')) + '</span><span class="cred-value">' + html + '</span></div>';
 }
 
-// Counters above the account list: FREE plans, plans ending soon, plans that
-// ended or are overdue, and playback accounts without any answer yet.
 // A FREE plan counts as free unless Tidal grants premiumAccess (a trial or
 // promotion), the same rule the server uses to move accounts to the catalog.
 function subscriptionIsFree(body) {
@@ -1366,25 +1390,13 @@ function subscriptionState(account) {
     return daysLeft < SUBSCRIPTION_SOON_DAYS ? 'soon' : 'ok';
 }
 
+// The one subscription counter the filter tabs do not show: playback
+// accounts Tidal has not answered for yet.
 function subscriptionSummary(accounts) {
-    var groups = { free: [], soon: [], ended: [], unknown: [] };
-    accounts.forEach(function(a) {
-        var label = a.label || a.id.slice(0, 8);
-        var state = subscriptionState(a);
-        if (state === 'unknown') {
-            if (!a.is_catalog && a.is_active) groups.unknown.push(label);
-        } else if (groups[state]) groups[state].push(label);
-    });
-    // A chip with accounts behind it opens the matching filter tab.
-    function chip(names, text, always, filter) {
-        if (!names.length && !always) return '';
-        var open = names.length && filter ? ' clickable" onclick="setAccountFilter(\'' + filter + '\')' : '';
-        return '<div class="account-summary' + (names.length ? ' warn' : ' calm') + open + '"' + (names.length ? ' title="' + esc(names.join(', ')) + '"' : '') + '><span>' + esc(tr(text)) + '</span><strong>' + metricNumber(names.length) + '</strong></div>';
-    }
-    return chip(groups.free, 'FREE-подписка', true, 'free') +
-        chip(groups.soon, 'Подписка кончается за ' + SUBSCRIPTION_SOON_DAYS + ' дн.', true, 'expiring') +
-        chip(groups.ended, 'Подписка закончилась', false, 'expiring') +
-        chip(groups.unknown, 'Подписка не проверена', false);
+    var names = accounts.filter(function(a) { return !a.is_catalog && a.is_active && subscriptionState(a) === 'unknown'; })
+        .map(function(a) { return a.label || a.id.slice(0, 8); });
+    if (!names.length) return '';
+    return '<div class="account-summary warn" title="' + esc(names.join(', ')) + '"><span>' + esc(tr('Подписка не проверена')) + '</span><strong>' + metricNumber(names.length) + '</strong></div>';
 }
 
 // Catalog accounts on a FREE plan get a group of their own, apart from paid catalog ones.
@@ -1393,7 +1405,9 @@ function accountGroupOf(account) {
     return subscriptionState(account) === 'free' ? 'free' : 'catalog';
 }
 
-var ACCOUNT_FILTERS = [['all', 'Все'], ['playback', 'FULL'], ['catalog', 'Каталог'], ['free', 'FREE'], ['expiring', 'Скоро закончатся']];
+var ACCOUNT_FILTERS = [['all', 'Все'], ['playback', 'FULL'], ['catalog', 'Каталог'], ['free', 'FREE'], ['expiring', 'Нужно продлить']];
+// Tabs whose accounts need attention; a non-zero count is highlighted.
+var ACCOUNT_FILTER_HINTS = { free: 'FREE-подписка: аккаунт работает только как каталог', expiring: 'Подписка закончилась или кончается за 3 дн.' };
 
 function accountMatchesFilter(account, filter) {
     if (filter === 'playback' || filter === 'catalog') return accountGroupOf(account) === filter;
@@ -1409,8 +1423,9 @@ function accountFilterKeys(account) {
 function accountFilterTabs(accounts) {
     return ACCOUNT_FILTERS.map(function(f) {
         var count = accounts.filter(function(a) { return accountMatchesFilter(a, f[0]); }).length;
-        return '<button type="button" role="tab" aria-selected="' + (accountFilter === f[0]) + '" onclick="setAccountFilter(\'' + f[0] + '\')">' +
-            esc(tr(f[1])) + '<span class="tab-count">' + metricNumber(count) + '</span></button>';
+        var hint = ACCOUNT_FILTER_HINTS[f[0]];
+        return '<button type="button" role="tab" aria-selected="' + (accountFilter === f[0]) + '" onclick="setAccountFilter(\'' + f[0] + '\')"' + (hint ? ' title="' + esc(tr(hint)) + '"' : '') + '>' +
+            esc(tr(f[1])) + '<span class="tab-count' + (hint && count ? ' warn' : '') + '">' + metricNumber(count) + '</span></button>';
     }).join('');
 }
 
@@ -2139,18 +2154,6 @@ async function setCatalog(id, catalog) {
         });
         if (res.ok) fetchData();
         else { var d = await res.json(); document.getElementById('error').textContent = d.detail || 'Error'; }
-    } catch(e) {
-        document.getElementById('error').textContent = e.message;
-    }
-}
-
-async function switchClient(id, clientId) {
-    try {
-        var res = await fetch('/admin/accounts/' + id + '/client', {
-            method: 'POST', headers: headers(), body: JSON.stringify({ client_id: clientId })
-        });
-        if (res.ok) { document.getElementById('success').textContent = tr('Аккаунт переведён на клиент') + ' ' + clientId; fetchData(); }
-        else { var d = await res.json().catch(function() { return {}; }); document.getElementById('error').textContent = d.detail || ('HTTP ' + res.status); }
     } catch(e) {
         document.getElementById('error').textContent = e.message;
     }

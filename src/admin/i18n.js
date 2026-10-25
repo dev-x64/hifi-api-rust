@@ -426,9 +426,8 @@ var ruToEn = {
     'Проверка подписки:': 'Subscription check:',
     'Не удалось проверить:': 'Check failed:',
     'последняя проверка не удалась': 'last check failed',
-    'FREE-подписка': 'FREE plan',
-    'Подписка кончается за 3 дн.': 'Plan ends within 3 days',
-    'Подписка закончилась': 'Plan ended',
+    'FREE-подписка: аккаунт работает только как каталог': 'FREE plan: the account serves the catalog only',
+    'Подписка закончилась или кончается за 3 дн.': 'Plan ended or ends within 3 days',
     'Подписка не проверена': 'Plan not checked',
     'Подписка FREE: аккаунт переведён в каталог': 'FREE plan: account moved to catalog',
     'Воспроизведение · FULL': 'Playback · FULL',
@@ -437,7 +436,7 @@ var ruToEn = {
     'Каталог · FREE': 'Catalog · FREE',
     'FREE-подписка: только метаданные; после продления верните аккаунт из каталога': 'FREE plan: metadata only; once the plan is renewed, take the account out of the catalog',
     'Все': 'All',
-    'Скоро закончатся': 'Ending soon',
+    'Нужно продлить': 'Needs renewal',
     'Сортировка': 'Sort',
     'Порядок добавления': 'Order added',
     'По названию': 'Name',
@@ -463,9 +462,6 @@ var ruToEn = {
     'Вход идёт через встроенный клиент, а аккаунт сохраняется под выбранным: сервер сразу обновляет токен этим клиентом и сообщит, если Tidal не позволит. Secret берётся у аккаунтов пула на сервере.': 'Sign-in uses the built-in client and the account is stored under the chosen one: the server refreshes the token with it right away and reports if Tidal refuses. The secret is taken from pool accounts on the server.',
     'встроенный': 'built-in',
     'аккаунтов:': 'accounts:',
-    'Перевести на lw3v…': 'Move to lw3v…',
-    'Обновляет токен клиентом lw3vR6GE1vtNBsjv и сохраняет аккаунт под ним; входить заново не нужно': 'Refreshes the token with client lw3vR6GE1vtNBsjv and stores the account under it; no new sign-in needed',
-    'Аккаунт переведён на клиент': 'Account moved to client',
     'проверено в': 'checked at',
     'Проверка FULL/PREVIEW отправляет до четырёх запросов к Tidal': 'FULL/PREVIEW check sends up to four Tidal requests',
     'Доступ к трекам': 'Track access',
@@ -492,6 +488,7 @@ var ruToEn = {
     'Запросов': 'Requests',
     'Автовосстановление': 'Auto recovery',
     'повтор': 'retrying',
+    'повтор через': 'retry in',
     'Токен': 'Token',
     'Проверка': 'Test',
     'Ключей пока нет': 'No keys yet',
@@ -582,6 +579,8 @@ function localizedCore(source) {
         if (match) return 'expired ' + match[1] + ' min ago';
         match = source.match(/^истёк (\d+) ч назад$/);
         if (match) return 'expired ' + match[1] + ' hr ago';
+        match = source.match(/^ещё (\d.*)$/);
+        if (match) return localizedCore(match[1]) + ' left';
         match = source.match(/^(\d+) мин$/);
         if (match) return match[1] + ' min';
         match = source.match(/^(\d+) ч (\d+) мин$/);
