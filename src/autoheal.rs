@@ -81,11 +81,14 @@ fn subscription_check_due(
 }
 
 /// What, if anything, the owner must hear about a subscription answer from
-/// Tidal: overdue payment, a plan that is no longer active, or one ending
-/// within three days. Pure function, unit tested.
+/// Tidal: overdue payment, no premium access on a paid plan, a plan that is
+/// no longer active, or one ending within three days. Pure function, unit tested.
 pub(crate) fn subscription_problem(subscription: &serde_json::Value, now: i64) -> Option<String> {
     if subscription["paymentOverdue"].as_bool() == Some(true) {
         return Some("Payment is overdue.".into());
+    }
+    if subscription["premiumAccess"].as_bool() == Some(false) {
+        return Some("Tidal reports no premium access.".into());
     }
     if let Some(status) = subscription["status"].as_str().filter(|s| *s != "ACTIVE") {
         return Some(format!("Subscription status is {status}."));
@@ -108,11 +111,14 @@ pub(crate) fn subscription_problem(subscription: &serde_json::Value, now: i64) -
 }
 
 /// True when Tidal reports the FREE plan, which cannot play full tracks.
+/// `premiumAccess: true` wins over the plan name: Tidal grants it to FREE
+/// accounts on a trial or promotion.
 pub(crate) fn subscription_is_free(subscription: &serde_json::Value) -> bool {
-    subscription["subscription"]["type"]
-        .as_str()
-        .or_else(|| subscription["type"].as_str())
-        .is_some_and(|plan| plan.eq_ignore_ascii_case("FREE"))
+    subscription["premiumAccess"].as_bool() != Some(true)
+        && subscription["subscription"]["type"]
+            .as_str()
+            .or_else(|| subscription["type"].as_str())
+            .is_some_and(|plan| plan.eq_ignore_ascii_case("FREE"))
 }
 
 /// Store a subscription answer, move a FREE account to catalog-only and
@@ -356,6 +362,10 @@ mod tests {
         assert_eq!(subscription_problem(&overdue, 0).as_deref(), Some("Payment is overdue."));
         let cancelled = json!({"status": "CANCELLED"});
         assert_eq!(subscription_problem(&cancelled, 0).as_deref(), Some("Subscription status is CANCELLED."));
+        let no_access = json!({"status": "ACTIVE", "premiumAccess": false, "subscription": {"type": "HIFI"}});
+        assert_eq!(subscription_problem(&no_access, 0).as_deref(), Some("Tidal reports no premium access."));
+        let access = json!({"status": "ACTIVE", "premiumAccess": true, "validUntil": "2099-01-01T00:00:00.000+0000"});
+        assert_eq!(subscription_problem(&access, 0), None);
     }
 
     #[test]
@@ -396,6 +406,10 @@ mod tests {
         assert!(subscription_is_free(&json!({"type": "free"})));
         assert!(!subscription_is_free(&json!({"subscription": {"type": "HIFI"}, "status": "ACTIVE"})));
         assert!(!subscription_is_free(&json!({"status": "ACTIVE"})));
+        // premiumAccess overrides the plan name only towards premium.
+        assert!(!subscription_is_free(&json!({"subscription": {"type": "FREE"}, "premiumAccess": true})));
+        assert!(subscription_is_free(&json!({"subscription": {"type": "FREE"}, "premiumAccess": false})));
+        assert!(!subscription_is_free(&json!({"subscription": {"type": "HIFI"}, "premiumAccess": false})));
     }
 
     #[test]

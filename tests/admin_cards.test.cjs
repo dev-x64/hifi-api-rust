@@ -486,3 +486,68 @@ test('v1 method loads, saves and stays localized', async () => {
         } else assert.match(html, /postpaywall \(по умолчанию\)/);
     }
 });
+
+test('FREE catalog accounts get their own group; filters and sorts pick the right accounts', () => {
+    const { ctx } = context('en');
+    const day = 86400000;
+    const until = days => new Date(Date.now() + days * day).toISOString();
+    ctx.accounts = [
+        { id: 'a', label: 'b-full', subscription: { type: 'PREMIUM', status: 'ACTIVE', validUntil: until(30) }, recent_error_rate: 0.1, requests_last_hour: 5, availability: { state: 'ready' } },
+        { id: 'b', label: 'a-soon', subscription: { type: 'PREMIUM', status: 'ACTIVE', validUntil: until(1) }, recent_error_rate: 0.5, requests_last_hour: 1, availability: { state: 'disabled' } },
+        { id: 'c', label: 'c-free', is_catalog: true, subscription: { type: 'FREE', status: 'ACTIVE' }, availability: { state: 'ready' } },
+        { id: 'd', label: 'd-cat', is_catalog: true, subscription: { type: 'PREMIUM', status: 'ACTIVE', validUntil: until(-2) }, availability: { state: 'no_token' } },
+        { id: 'e', label: 'e-cat', is_catalog: true, availability: { state: 'ready' } },
+    ];
+    assert.deepEqual(vm.runInContext('accounts.map(accountGroupOf)', ctx), ['playback', 'playback', 'free', 'catalog', 'catalog']);
+    const keys = vm.runInContext('accounts.map(accountFilterKeys)', ctx);
+    assert.deepEqual(keys, ['all playback', 'all playback expiring', 'all free', 'all catalog expiring', 'all catalog']);
+    ctx.accountFilter = 'expiring';
+    assert.match(vm.runInContext('accountFilterTabs(accounts)', ctx), /aria-selected="true" onclick="setAccountFilter\('expiring'\)">Ending soon<span class="tab-count">2</);
+    assert.match(vm.runInContext('subscriptionSummary(accounts)', ctx), /clickable" onclick="setAccountFilter\('free'\)"/);
+    const order = sort => { ctx.accountSort = sort; return vm.runInContext('accounts.slice().sort(compareAccounts).map(function(a) { return a.id; }).join("")', ctx); };
+    assert.equal(order('added'), 'abcde');
+    assert.equal(order('name'), 'bacde');
+    assert.equal(order('expiry'), 'dbace');
+    assert.equal(order('problems'), 'bdace');
+    assert.equal(order('errors'), 'bacde');
+    assert.equal(order('load'), 'abcde');
+});
+
+for (const language of ['en', 'ru']) {
+    test(`list row sums up an account and keeps rare actions in the menu (${language})`, () => {
+        const { ctx } = context(language);
+        const until = days => new Date(Date.now() + days * 86400000).toISOString();
+        ctx.account = { id: 'abc', label: '<b>main</b>', country_code: 'de', premium_status: 'premium', availability: { state: 'ready', token: 'valid', full_check_fresh: true },
+            subscription: { type: 'PREMIUM', status: 'ACTIVE', validUntil: until(23.5) }, recent_error_rate: 0.125, requests_last_hour: 42, token_expires_at: Date.now() / 1000 + 7200, is_active: true };
+        const row = localized(ctx, vm.runInContext('accountRow(account, 3, false)', ctx));
+        assert.match(row, /<span class="acc-num">3<\/span>/);
+        assert.match(row, /&lt;b&gt;main&lt;\/b&gt;/);
+        assert.match(row, /access-full"[^>]*><strong>FULL<\/strong>/);
+        assert.ok(row.includes(language === 'en' ? 'PREMIUM · 23 d' : 'PREMIUM · 23 дн.'));
+        assert.ok(row.includes('\u{1F1E9}\u{1F1EA} DE'));
+        assert.match(row, language === 'en' ? /12.5%|13%/ : /12,5%|13%/);
+        assert.match(row, /aria-expanded="false"/);
+        const menu = vm.runInContext('accountMenu(account, true)', ctx);
+        for (const action of ['refreshAccount', 'checkPremium', 'checkSubscription', 'openEdit', 'duplicateAccount', "setCatalog('abc',true)", "toggleAccount('abc',false)", 'removeAccount']) assert.ok(menu.includes(action), action);
+        const cardMenu = vm.runInContext('accountMenu(account, false)', ctx);
+        assert.ok(!cardMenu.includes('refreshAccount') && !cardMenu.includes('toggleAccount'));
+        ctx.account.subscription = { type: 'FREE' };
+        assert.equal(vm.runInContext('subscriptionShort(account)', ctx), '<strong class="sub-bad">FREE</strong>');
+        ctx.account.subscription = { type: 'PREMIUM', status: 'ACTIVE', validUntil: until(1) };
+        assert.match(vm.runInContext('subscriptionShort(account)', ctx), /PREMIUM · <span class="sub-bad">(1 d|1 д)/);
+        delete ctx.account.subscription;
+        assert.match(localized(ctx, vm.runInContext('subscriptionShort(account)', ctx)), language === 'en' ? /not checked/ : /не проверена/);
+    });
+}
+
+test('premiumAccess keeps a FREE trial out of the FREE group and flags a paid plan without access', () => {
+    const { ctx } = context('en');
+    ctx.accounts = [
+        { id: 'a', is_catalog: true, subscription: { subscription: { type: 'FREE' }, status: 'ACTIVE', premiumAccess: true } },
+        { id: 'b', subscription: { subscription: { type: 'HIFI' }, status: 'ACTIVE', premiumAccess: false, validUntil: new Date(Date.now() + 30 * 86400000).toISOString() } },
+    ];
+    assert.deepEqual(vm.runInContext('accounts.map(subscriptionState)', ctx), ['ok', 'ended']);
+    assert.deepEqual(vm.runInContext('accounts.map(accountGroupOf)', ctx), ['catalog', 'playback']);
+    assert.match(localized(ctx, vm.runInContext('subscriptionShort(accounts[1])', ctx)), /no premium access/);
+    assert.match(localized(ctx, vm.runInContext('subscriptionRow(accounts[0])', ctx)), /premium access granted/);
+});

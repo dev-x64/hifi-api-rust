@@ -430,6 +430,55 @@ button:focus-visible,input:focus-visible,select:focus-visible { outline:2px soli
 .account-group-list { display:flex; flex-direction:column; gap:20px; }
 .account-card.role-playback { border-left:3px solid #2fa36b; }
 .account-card.role-catalog { border-left:3px solid #b78cf0; }
+.account-group[data-group="free"] .group-mark { background:#f4b860; }
+.account-group[data-group="free"] .group-count { color:#f4b860; background:rgba(244,184,96,.1); }
+.account-card.role-free { border-left:3px solid #d99a3f; }
+.account-group > summary { list-style:none; cursor:pointer; user-select:none; }
+.account-group > summary::-webkit-details-marker { display:none; }
+.account-group-head .group-chevron { margin-left:auto; color:var(--muted); font-size:12px; transition:transform .15s; }
+.account-group:not([open]) .group-chevron { transform:rotate(-90deg); }
+.account-filters { display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:10px; margin:-4px 0 18px; }
+.account-filters .mode-tabs { margin:0; flex-wrap:wrap; }
+.account-filters .tab-count { margin-left:7px; color:var(--muted); font-weight:500; font-variant-numeric:tabular-nums; }
+.account-sort { display:inline-flex; align-items:center; gap:8px; color:var(--muted); font-size:12px; }
+.account-sort .select { min-height:36px; padding:0 10px; font-size:12px; }
+.account-summary.clickable { cursor:pointer; }
+.account-summary.clickable:hover { border-color:#35404d; color:var(--text); }
+.account-view-controls { display:flex; flex-wrap:wrap; align-items:center; gap:10px; }
+.account-row { display:grid; grid-template-columns:28px minmax(150px,1.7fr) 92px minmax(120px,1.2fr) 56px 60px 56px minmax(90px,.9fr) 38px 14px; align-items:center; gap:10px; padding:6px 12px 6px 14px; color:var(--text); font-size:12px; cursor:pointer; }
+.account-row > * { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.account-row:hover { background:var(--panel-2); }
+.account-row:focus-visible { outline:2px solid var(--accent); outline-offset:-2px; }
+.account-row-head { padding-top:0; padding-bottom:0; color:var(--muted); font-size:10px; font-weight:650; letter-spacing:.5px; text-transform:uppercase; cursor:default; }
+.account-row-head:hover { background:none; }
+.row-name { display:flex; align-items:center; gap:9px; }
+.row-name-text { display:flex; flex-direction:column; min-width:0; line-height:1.35; }
+.row-label { overflow:hidden; text-overflow:ellipsis; color:#f0f6fc; font-weight:650; }
+.row-status { overflow:hidden; text-overflow:ellipsis; font-size:11px; }
+.tone-status-ok { color:var(--green); }
+.tone-status-warn { color:#d29922; }
+.tone-status-err { color:#f85149; }
+.tone-status-unknown,.row-muted { color:var(--muted); }
+.playback-access.row-access { min-height:0; margin:0; padding:3px 7px; border-radius:6px; }
+.playback-access.row-access strong { font-size:11px; }
+.row-chevron { color:var(--muted); transition:transform .15s; }
+.account-card.expanded .row-chevron { transform:rotate(180deg); }
+.view-list .account-group-list { gap:6px; }
+.view-list .account-card > .card-header,
+.view-list .account-card:not(.expanded) > :not(.account-row) { display:none; }
+.view-list .account-card.expanded > .account-row { background:var(--panel-2); border-bottom:1px solid var(--line); }
+.view-cards .account-row { display:none; }
+.account-menu > summary { list-style:none; font-size:17px; line-height:1; }
+.account-menu > summary::-webkit-details-marker { display:none; }
+.account-menu-list { position:fixed; z-index:60; display:flex; flex-direction:column; min-width:210px; padding:5px; border:1px solid var(--line); border-radius:10px; background:#121820; box-shadow:0 18px 50px rgba(0,0,0,.45); visibility:hidden; }
+.account-menu-list .menu-item { padding:8px 10px; border:0; border-radius:6px; background:none; color:var(--text); font-family:Inter,sans-serif; font-size:12px; text-align:left; white-space:nowrap; cursor:pointer; }
+.account-menu-list .menu-item:hover { background:#222a35; }
+.account-menu-list .menu-item.danger { color:#ff8585; }
+.account-menu-list .menu-sep { height:1px; margin:4px 2px; background:var(--line); }
+@media (max-width:760px) {
+  .account-row { grid-template-columns:24px minmax(0,1.3fr) minmax(0,1fr) 38px; gap:8px; padding-left:10px; }
+  .account-row .c-access,.account-row .c-country,.account-row .c-errors,.account-row .c-hour,.account-row .c-token,.account-row .row-chevron { display:none; }
+}
 .auth-error { min-height:20px; color:#ff8e8e; font-size:12px; margin-top:10px; }
 .mobile-bar,.sidebar-scrim { display:none; }
 .overlay { background:rgba(3,5,8,.75); }
@@ -529,7 +578,9 @@ button:focus-visible,input:focus-visible,select:focus-visible { outline:2px soli
     <div id="readyHistory" class="ready-history" data-no-i18n></div>
     <div class="section-head"><div><h2>Tidal-аккаунты</h2><p>Управляйте пулом воспроизведения, токенами и каталогом.</p></div><div class="section-actions"><button class="btn" onclick="testAll()" id="testAllBtn">Проверить все</button><button class="btn btn-primary" onclick="openAddAccount()">+ Добавить</button></div></div>
     <div class="toolbar"><div class="search-wrap"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg><input id="accountSearch" type="search" placeholder="Найти аккаунт..." oninput="filterAccounts(this.value)"></div><div class="toolbar-stats"><div class="account-summary" id="accountCount"><span class="status-dot status-ok"></span><span>Готовы сейчас</span><strong>— / —</strong></div><div class="toolbar-stats" id="subscriptionSummary" data-no-i18n></div></div></div>
+    <div class="account-filters" id="accountFiltersBar"><div class="mode-tabs" role="tablist" id="accountFilters" data-no-i18n></div><div class="account-view-controls"><label class="account-sort">Сортировка <select id="accountSort" class="select" onchange="setAccountSort(this.value)"><option value="added">Порядок добавления</option><option value="name">По названию</option><option value="expiry">По сроку подписки</option><option value="problems">Сначала проблемные</option><option value="errors">По свежим ошибкам</option><option value="load">По нагрузке за час</option></select></label><div class="mode-tabs" role="tablist" id="accountViewTabs"><button type="button" role="tab" data-view="list" onclick="setAccountView('list')">Списком</button><button type="button" role="tab" data-view="cards" onclick="setAccountView('cards')">Карточками</button></div></div></div>
     <div id="accounts-container" class="accounts-grid"></div>
+    <p class="helper" id="accountFilterEmpty" style="display:none">Ни один аккаунт не подходит под фильтр и поиск.</p>
     <div class="test-results-section" id="testResultsSection" style="display:none"><div class="test-results-header"><h3>Результаты проверки</h3><div class="test-summary" id="testSummary"></div></div><div class="test-results-body" id="testResultsList"></div></div>
   </section>
 
@@ -717,15 +768,96 @@ function openAddAccount(mode) {
 }
 function closeAddAccount() { document.getElementById('addAccountOverlay').classList.remove('open'); }
 
+// Account list view: the filter tab, the order, rows or cards and the collapsed
+// groups, kept per browser. Expanded rows last until the page reloads.
+var accountFilter = 'all', accountSort = 'added', accountView = 'list', collapsedGroups = {}, expandedAccounts = {};
+try {
+    accountFilter = localStorage.getItem('hifi_account_filter') || accountFilter;
+    accountSort = localStorage.getItem('hifi_account_sort') || accountSort;
+    accountView = localStorage.getItem('hifi_account_view') === 'cards' ? 'cards' : 'list';
+    collapsedGroups = JSON.parse(localStorage.getItem('hifi_account_collapsed') || '{}') || {};
+} catch (_) {}
+
+function setAccountView(view) {
+    accountView = view === 'cards' ? 'cards' : 'list';
+    try { localStorage.setItem('hifi_account_view', accountView); } catch (_) {}
+    applyAccountView();
+}
+
+function applyAccountView() {
+    var container = document.getElementById('accounts-container');
+    container.classList.toggle('view-list', accountView === 'list');
+    container.classList.toggle('view-cards', accountView !== 'list');
+    document.querySelectorAll('#accountViewTabs button').forEach(function(button) {
+        button.setAttribute('aria-selected', String(button.dataset.view === accountView));
+    });
+}
+
+// A row opens into the full card; clicks on its menu leave it as it is.
+function toggleAccountDetails(card, event) {
+    if (event.target.closest('.account-menu')) return;
+    var open = card.classList.toggle('expanded');
+    card.querySelector('.account-row').setAttribute('aria-expanded', String(open));
+    if (open) expandedAccounts[card.dataset.id] = true;
+    else delete expandedAccounts[card.dataset.id];
+}
+
+// The menu is fixed to the viewport so the card's rounded clipping cannot cut
+// it off; it opens upwards when there is no room below.
+function placeAccountMenu(menu) {
+    var list = menu.querySelector('.account-menu-list');
+    if (!menu.open) { list.style.visibility = ''; return; }
+    closeAccountMenus(menu);
+    var button = menu.querySelector('summary').getBoundingClientRect();
+    var below = button.bottom + 4 + list.offsetHeight <= window.innerHeight;
+    list.style.top = (below ? button.bottom + 4 : Math.max(8, button.top - 4 - list.offsetHeight)) + 'px';
+    list.style.left = Math.max(8, button.right - list.offsetWidth) + 'px';
+    list.style.visibility = 'visible';
+}
+
+function closeAccountMenus(except) {
+    document.querySelectorAll('.account-menu[open]').forEach(function(menu) { if (menu !== except) menu.open = false; });
+}
+
+document.addEventListener('click', function(event) { if (!event.target.closest('.account-menu')) closeAccountMenus(); });
+document.addEventListener('keydown', function(event) { if (event.key === 'Escape') closeAccountMenus(); });
+window.addEventListener('scroll', function() { closeAccountMenus(); }, true);
+
 function filterAccounts(query) {
     var q = (query || '').trim().toLowerCase();
+    var shown = 0;
     document.querySelectorAll('#accounts-container .account-card').forEach(function(card) {
-        card.style.display = !q || (card.dataset.search || '').indexOf(q) !== -1 ? '' : 'none';
+        var match = (!q || (card.dataset.search || '').indexOf(q) !== -1) &&
+            (' ' + (card.dataset.filters || '') + ' ').indexOf(' ' + accountFilter + ' ') !== -1;
+        card.style.display = match ? '' : 'none';
+        if (match) shown++;
     });
     document.querySelectorAll('#accounts-container .account-group').forEach(function(group) {
-        var visible = Array.prototype.some.call(group.querySelectorAll('.account-card'), function(card) { return card.style.display !== 'none'; });
+        var cards = group.querySelectorAll('.account-card');
+        var visible = Array.prototype.filter.call(cards, function(card) { return card.style.display !== 'none'; }).length;
         group.style.display = visible ? '' : 'none';
+        group.querySelector('.group-count').textContent = visible === cards.length ? metricNumber(visible) : metricNumber(visible) + ' / ' + metricNumber(cards.length);
     });
+    document.getElementById('accountFilterEmpty').style.display = !shown && (window._accounts || []).length ? '' : 'none';
+}
+
+function setAccountFilter(filter) {
+    accountFilter = filter;
+    try { localStorage.setItem('hifi_account_filter', filter); } catch (_) {}
+    document.getElementById('accountFilters').innerHTML = accountFilterTabs(window._accounts || []);
+    filterAccounts(document.getElementById('accountSearch').value);
+}
+
+function setAccountSort(sort) {
+    accountSort = sort;
+    try { localStorage.setItem('hifi_account_sort', sort); } catch (_) {}
+    renderAccounts(window._accounts || []);
+}
+
+function toggleAccountGroup(group) {
+    if (group.open) delete collapsedGroups[group.dataset.group];
+    else collapsedGroups[group.dataset.group] = true;
+    try { localStorage.setItem('hifi_account_collapsed', JSON.stringify(collapsedGroups)); } catch (_) {}
 }
 
 function plural(n, one, few, many) {
@@ -1041,12 +1173,89 @@ function tokenDescription(account) {
 }
 
 // Two-letter country with its flag; Tidal reports it on sign-in and token refresh.
-function countryRow(account) {
+function countryFlag(account) {
     var code = String(account.country_code || '').toUpperCase();
-    var value = /^[A-Z]{2}$/.test(code)
+    return /^[A-Z]{2}$/.test(code)
         ? String.fromCodePoint.apply(null, code.split('').map(function(c) { return 0x1F1E6 + c.charCodeAt(0) - 65; })) + ' ' + esc(code)
-        : '<span class="sub-checked">' + esc(tr('появится после обновления токена или проверки подписки')) + '</span>';
+        : '';
+}
+
+function countryRow(account) {
+    var value = countryFlag(account) || '<span class="sub-checked">' + esc(tr('появится после обновления токена или проверки подписки')) + '</span>';
     return '<div class="cred-row" data-no-i18n><span class="cred-key">' + esc(tr('Страна')) + '</span><span class="cred-value">' + value + '</span></div>';
+}
+
+// What the last FULL/PREVIEW check says about playing tracks.
+function playbackAccess(account) {
+    if (account.is_catalog) return { label:'НЕ ПРИМЕНЯЕТСЯ', className:'access-catalog', description:'Аккаунт используется только для каталога' };
+    if (account.premium_status === 'premium') {
+        var fresh = account.availability && account.availability.full_check_fresh;
+        return fresh
+            ? { label:'FULL', className:'access-full', description:'Полное воспроизведение подтверждено' }
+            : { label:'FULL · УСТАРЕЛО', className:'access-unknown', description:'FULL подтверждался ранее; нужна новая проверка' };
+    }
+    if (account.premium_status === 'preview-only') return { label:'PREVIEW', className:'access-preview', description:'Доступны только фрагменты' };
+    if (account.premium_checked_at) return { label:'НЕ ОПРЕДЕЛЕНО', className:'access-unknown', description:'Последняя проверка не дала точного результата' };
+    return { label:'НЕ ПРОВЕРЕНО', className:'access-unknown', description:'Автоматическая проверка ещё не выполнялась' };
+}
+
+// The plan in a few words for the list row: the plan and the days left.
+function subscriptionShort(account) {
+    var state = subscriptionState(account), body = account.subscription;
+    if (state === 'unknown') return '<span class="row-muted">' + esc(tr(account.subscription_error ? 'ошибка проверки' : 'не проверена')) + '</span>';
+    var plan = esc(subscriptionPlan(body) || '?');
+    if (state === 'free') return '<strong class="sub-bad">' + plan + '</strong>';
+    if (state === 'ended') return plan + ' · <span class="sub-bad">' + esc(tr(body.paymentOverdue ? 'оплата просрочена' : (body.premiumAccess === false ? 'нет premium-доступа' : 'закончилась'))) + '</span>';
+    var days = subscriptionDaysLeft(body);
+    if (isNaN(days)) return plan;
+    if (state === 'soon') return plan + ' · <span class="sub-bad">' + esc(uptimeDuration(days * 86400)) + '</span>';
+    return plan + ' · ' + esc(metricNumber(Math.floor(days)) + ' ' + tr('дн.'));
+}
+
+// Everyday actions stay on the card; the rest, and in the list all of them, sit in the ⋯ menu.
+function accountMenu(account, everyday) {
+    var id = '\'' + account.id + '\'';
+    function item(onclick, text, title, className) {
+        return '<button type="button" class="menu-item' + (className ? ' ' + className : '') + '" onclick="' + onclick + '"' + (title ? ' title="' + title + '"' : '') + '>' + text + '</button>';
+    }
+    var items = (everyday ? item('refreshAccount(' + id + ')', 'Обновить токен') : '') +
+        item('checkPremium(' + id + ')', 'Проверить FULL', 'Проверка FULL/PREVIEW отправляет до четырёх запросов к Tidal') +
+        item('checkSubscription(' + id + ')', 'Проверить подписку', 'Запрашивает у Tidal тариф и срок подписки') +
+        item('openEdit(' + id + ')', 'Изменить') +
+        item('duplicateAccount(' + id + ')', 'Дублировать') +
+        (account.is_catalog
+            ? item('setCatalog(' + id + ',false)', 'Из каталога', 'Вернуть в пул воспроизведения')
+            : item('setCatalog(' + id + ',true)', 'В каталог', 'Использовать только для метаданных')) +
+        (everyday ? item('toggleAccount(' + id + ',' + (!account.is_active) + ')', account.is_active ? 'Отключить' : 'Включить') : '') +
+        '<div class="menu-sep"></div>' + item('removeAccount(' + id + ')', 'Удалить', '', 'danger');
+    return '<details class="account-menu" data-menu="' + (everyday ? 'row' : 'card') + '-' + esc(account.id) + '" ontoggle="placeAccountMenu(this)">' +
+        '<summary class="btn icon-btn btn-quiet" title="Ещё действия" aria-label="Ещё действия">⋯</summary>' +
+        '<div class="account-menu-list" onclick="closeAccountMenus()">' + items + '</div></details>';
+}
+
+var ACCOUNT_ROW_HEAD = '<div class="account-row account-row-head"><span></span><span>Аккаунт</span><span class="c-access">Треки</span><span>Подписка</span>' +
+    '<span class="c-country">Страна</span><span class="c-errors">Ошибки</span><span class="c-hour">За час</span><span class="c-token">Токен</span><span></span><span class="row-chevron"></span></div>';
+
+// One line per account in the list view; a click opens the full card under it.
+function accountRow(account, number, expanded) {
+    var readiness = accountStatus(account);
+    var access = playbackAccess(account);
+    var accessCell = account.is_catalog ? '<span class="row-muted">—</span>'
+        : '<span class="playback-access row-access ' + access.className + '" title="' + esc(access.description) + '"><strong>' + (access.className === 'access-full' || access.className === 'access-preview' ? access.label : (account.premium_status === 'premium' ? 'FULL?' : '—')) + '</strong></span>';
+    var healing = account.heal_next_retry > Date.now() / 1000;
+    var token = tokenDescription(account);
+    return '<div class="account-row" role="button" tabindex="0" aria-expanded="' + expanded + '" onclick="toggleAccountDetails(this.parentNode, event)" onkeydown="if((event.key===\'Enter\'||event.key===\' \')&&!event.target.closest(\'.account-menu\')){event.preventDefault();toggleAccountDetails(this.parentNode, event)}">' +
+        '<span class="acc-num">' + number + '</span>' +
+        '<span class="row-name"><span class="status-dot ' + readiness.tone + '"></span><span class="row-name-text"><span class="row-label" data-no-i18n>' + esc(account.label || account.id.slice(0, 8)) + '</span>' +
+            '<span class="row-status tone-' + readiness.tone + '">' + readiness.text + '</span>' + (healing ? '<span class="row-status tone-status-warn">Пауза обновления</span>' : '') + '</span></span>' +
+        '<span class="c-access">' + accessCell + '</span>' +
+        '<span data-no-i18n>' + subscriptionShort(account) + '</span>' +
+        '<span class="c-country" data-no-i18n>' + (countryFlag(account) || '<span class="row-muted">—</span>') + '</span>' +
+        '<span class="c-errors">' + metricNumber((account.recent_error_rate || 0) * 100) + '%</span>' +
+        '<span class="c-hour">' + metricNumber(account.requests_last_hour) + '</span>' +
+        '<span class="c-token' + ((account.availability || {}).token === 'valid' ? '' : ' row-muted') + '" title="' + esc(token) + '">' + token + '</span>' +
+        accountMenu(account, true) +
+        '<span class="row-chevron" aria-hidden="true">▾</span></div>';
 }
 
 // Failed manual lookups, kept until the page reloads; answers are stored on the server.
@@ -1084,7 +1293,7 @@ function subscriptionRow(account) {
     if (body) {
         var plan = subscriptionPlan(body);
         var parts = [];
-        if (plan) parts.push('<strong class="' + (plan.toUpperCase() === 'FREE' ? 'sub-bad' : '') + '">' + esc(plan) + '</strong>');
+        if (plan) parts.push('<strong class="' + (subscriptionIsFree(body) ? 'sub-bad' : '') + '">' + esc(plan) + '</strong>');
         if (body.status) parts.push('<span class="' + (body.status === 'ACTIVE' ? 'sub-ok' : 'sub-bad') + '">' + esc(body.status) + '</span>');
         var daysLeft = subscriptionDaysLeft(body);
         if (!isNaN(daysLeft)) {
@@ -1094,6 +1303,8 @@ function subscriptionRow(account) {
         }
         if (body.highestSoundQuality) parts.push(esc(body.highestSoundQuality));
         if (body.paymentOverdue) parts.push('<span class="sub-bad">' + esc(tr('оплата просрочена')) + '</span>');
+        if (body.premiumAccess === false && !subscriptionIsFree(body)) parts.push('<span class="sub-bad">' + esc(tr('нет premium-доступа')) + '</span>');
+        if (body.premiumAccess === true && plan.toUpperCase() === 'FREE') parts.push('<span class="sub-ok">' + esc(tr('есть premium-доступ')) + '</span>');
         if (!parts.length) parts.push('<code>' + esc(JSON.stringify(body).slice(0, 200)) + '</code>');
         html = parts.join(' · ') + ' <span class="sub-checked">· ' + esc(tr('проверено в')) + ' ' + esc(subscriptionTime(checkedAt || Date.now() / 1000)) + '</span>';
     }
@@ -1107,28 +1318,93 @@ function subscriptionRow(account) {
 
 // Counters above the account list: FREE plans, plans ending soon, plans that
 // ended or are overdue, and playback accounts without any answer yet.
+// A FREE plan counts as free unless Tidal grants premiumAccess (a trial or
+// promotion), the same rule the server uses to move accounts to the catalog.
+function subscriptionIsFree(body) {
+    return subscriptionPlan(body).toUpperCase() === 'FREE' && (body || {}).premiumAccess !== true;
+}
+
+// Where a plan stands: free, ended (also overdue, not ACTIVE or without
+// premium access), soon (ends within SUBSCRIPTION_SOON_DAYS), ok, or unknown
+// while Tidal has not answered.
+function subscriptionState(account) {
+    var body = account.subscription;
+    if (!body) return 'unknown';
+    if (subscriptionIsFree(body)) return 'free';
+    var daysLeft = subscriptionDaysLeft(body);
+    if (body.paymentOverdue || body.premiumAccess === false || (body.status && body.status !== 'ACTIVE') || daysLeft <= 0) return 'ended';
+    return daysLeft < SUBSCRIPTION_SOON_DAYS ? 'soon' : 'ok';
+}
+
 function subscriptionSummary(accounts) {
     var groups = { free: [], soon: [], ended: [], unknown: [] };
     accounts.forEach(function(a) {
         var label = a.label || a.id.slice(0, 8);
-        var body = a.subscription;
-        if (!body) {
+        var state = subscriptionState(a);
+        if (state === 'unknown') {
             if (!a.is_catalog && a.is_active) groups.unknown.push(label);
-            return;
-        }
-        var daysLeft = subscriptionDaysLeft(body);
-        if (subscriptionPlan(body).toUpperCase() === 'FREE') groups.free.push(label);
-        else if (body.paymentOverdue || (body.status && body.status !== 'ACTIVE') || daysLeft <= 0) groups.ended.push(label);
-        else if (daysLeft < SUBSCRIPTION_SOON_DAYS) groups.soon.push(label);
+        } else if (groups[state]) groups[state].push(label);
     });
-    function chip(names, text, always) {
+    // A chip with accounts behind it opens the matching filter tab.
+    function chip(names, text, always, filter) {
         if (!names.length && !always) return '';
-        return '<div class="account-summary' + (names.length ? ' warn' : ' calm') + '"' + (names.length ? ' title="' + esc(names.join(', ')) + '"' : '') + '><span>' + esc(tr(text)) + '</span><strong>' + metricNumber(names.length) + '</strong></div>';
+        var open = names.length && filter ? ' clickable" onclick="setAccountFilter(\'' + filter + '\')' : '';
+        return '<div class="account-summary' + (names.length ? ' warn' : ' calm') + open + '"' + (names.length ? ' title="' + esc(names.join(', ')) + '"' : '') + '><span>' + esc(tr(text)) + '</span><strong>' + metricNumber(names.length) + '</strong></div>';
     }
-    return chip(groups.free, 'FREE-подписка', true) +
-        chip(groups.soon, 'Подписка кончается за ' + SUBSCRIPTION_SOON_DAYS + ' дн.', true) +
-        chip(groups.ended, 'Подписка закончилась', false) +
+    return chip(groups.free, 'FREE-подписка', true, 'free') +
+        chip(groups.soon, 'Подписка кончается за ' + SUBSCRIPTION_SOON_DAYS + ' дн.', true, 'expiring') +
+        chip(groups.ended, 'Подписка закончилась', false, 'expiring') +
         chip(groups.unknown, 'Подписка не проверена', false);
+}
+
+// Catalog accounts on a FREE plan get a group of their own, apart from paid catalog ones.
+function accountGroupOf(account) {
+    if (!account.is_catalog) return 'playback';
+    return subscriptionState(account) === 'free' ? 'free' : 'catalog';
+}
+
+var ACCOUNT_FILTERS = [['all', 'Все'], ['playback', 'FULL'], ['catalog', 'Каталог'], ['free', 'FREE'], ['expiring', 'Скоро закончатся']];
+
+function accountMatchesFilter(account, filter) {
+    if (filter === 'playback' || filter === 'catalog') return accountGroupOf(account) === filter;
+    if (filter === 'free') return subscriptionState(account) === 'free';
+    if (filter === 'expiring') return ['soon', 'ended'].indexOf(subscriptionState(account)) !== -1;
+    return true;
+}
+
+function accountFilterKeys(account) {
+    return ACCOUNT_FILTERS.map(function(f) { return f[0]; }).filter(function(key) { return accountMatchesFilter(account, key); }).join(' ');
+}
+
+function accountFilterTabs(accounts) {
+    return ACCOUNT_FILTERS.map(function(f) {
+        var count = accounts.filter(function(a) { return accountMatchesFilter(a, f[0]); }).length;
+        return '<button type="button" role="tab" aria-selected="' + (accountFilter === f[0]) + '" onclick="setAccountFilter(\'' + f[0] + '\')">' +
+            esc(tr(f[1])) + '<span class="tab-count">' + metricNumber(count) + '</span></button>';
+    }).join('');
+}
+
+// Days until the plan ends for the expiry order: ended plans first, FREE and
+// unchecked ones last.
+function subscriptionSortDays(account) {
+    var state = subscriptionState(account);
+    if (state === 'free' || state === 'unknown') return Infinity;
+    var days = subscriptionDaysLeft(account.subscription);
+    if (state === 'ended') return isNaN(days) ? -Infinity : Math.min(days, 0);
+    return isNaN(days) ? Infinity : days;
+}
+
+var STATUS_RANK = { 'status-err': 0, 'status-warn': 1, 'status-unknown': 2, 'status-ok': 3 };
+
+// Ties keep the order the accounts were added in.
+function compareAccounts(a, b) {
+    function diff(x, y) { return x === y ? 0 : (x < y ? -1 : 1); }
+    if (accountSort === 'name') return String(a.label || a.id).localeCompare(String(b.label || b.id), undefined, { numeric: true, sensitivity: 'base' });
+    if (accountSort === 'expiry') return diff(subscriptionSortDays(a), subscriptionSortDays(b));
+    if (accountSort === 'problems') return diff(STATUS_RANK[accountStatus(a).tone], STATUS_RANK[accountStatus(b).tone]);
+    if (accountSort === 'errors') return diff(b.recent_error_rate || 0, a.recent_error_rate || 0);
+    if (accountSort === 'load') return diff(b.requests_last_hour || 0, a.requests_last_hour || 0);
+    return 0;
 }
 
 // How long Tidal has answered 403 to token refreshes, and when (or that)
@@ -1631,124 +1907,118 @@ async function fetchData() {
 
         window._stats = stats;
         renderOverview(stats);
-
-        var html = '';
-        var groupCards = { playback: '', catalog: '' };
-        var groupSize = { playback: 0, catalog: 0 };
-        if (accounts.accounts.length === 0) {
-            html = '<div class="empty-state"><p>Аккаунтов пока нет</p><p class="hint">Подключите первый через OAuth — это займёт меньше минуты.</p><button class="btn btn-primary" style="margin-top:16px" onclick="openAddAccount()">Добавить аккаунт</button></div>';
-        } else {
-            for (var i = 0; i < accounts.accounts.length; i++) {
-                var a = accounts.accounts[i];
-                var group = a.is_catalog ? 'catalog' : 'playback';
-                var number = ++groupSize[group];
-                var label = a.label || a.id.slice(0, 8);
-                var readiness = accountStatus(a);
-                var statusClass = 'status-dot ' + readiness.tone;
-                var statusText = readiness.text;
-                var activeCls = a.is_active ? ' btn-active' : '';
-                var toggleText = a.is_active ? 'Включён' : 'Включить';
-                var tokenStr = tokenDescription(a);
-                var disabledAt = !a.is_active && Number(a.disabled_at) > 0 ? Number(a.disabled_at) : 0;
-                var disabledSince = disabledAt
-                    ? new Date(disabledAt * 1000).toLocaleString(adminLanguage === 'ru' ? 'ru-RU' : 'en-GB', { day:'2-digit', month:'2-digit', year:'numeric', hour:'2-digit', minute:'2-digit' })
-                    : 'время неизвестно';
-                var uid = a.user_id || '-';
-                var catalogBadge = a.is_catalog ? '<span class="status-label" style="color:#d2a8ff;background:rgba(210,168,255,0.1)">Каталог</span>' : '';
-                var premiumLabel, premiumClass, premiumDescription;
-                if (a.is_catalog) {
-                    premiumLabel = 'НЕ ПРИМЕНЯЕТСЯ';
-                    premiumClass = 'access-catalog';
-                    premiumDescription = 'Аккаунт используется только для каталога';
-                } else if (a.premium_status === 'premium') {
-                    var freshFull = a.availability && a.availability.full_check_fresh;
-                    premiumLabel = freshFull ? 'FULL' : 'FULL · УСТАРЕЛО';
-                    premiumClass = freshFull ? 'access-full' : 'access-unknown';
-                    premiumDescription = freshFull ? 'Полное воспроизведение подтверждено' : 'FULL подтверждался ранее; нужна новая проверка';
-                } else if (a.premium_status === 'preview-only') {
-                    premiumLabel = 'PREVIEW';
-                    premiumClass = 'access-preview';
-                    premiumDescription = 'Доступны только фрагменты';
-                } else if (a.premium_checked_at) {
-                    premiumLabel = 'НЕ ОПРЕДЕЛЕНО';
-                    premiumClass = 'access-unknown';
-                    premiumDescription = 'Последняя проверка не дала точного результата';
-                } else {
-                    premiumLabel = 'НЕ ПРОВЕРЕНО';
-                    premiumClass = 'access-unknown';
-                    premiumDescription = 'Автоматическая проверка ещё не выполнялась';
-                }
-                var premiumBadge = '<span class="playback-access ' + premiumClass + '" title="' + esc(premiumDescription) + '"><span class="access-caption">Доступ к трекам</span><strong>' + premiumLabel + '</strong></span>';
-                var premiumCheckStat = a.is_catalog
-                    ? '<span class="card-stat access-check-time">FULL/PREVIEW <strong>для каталога не проверяется</strong></span>'
-                    : (a.premium_checked_at
-                        ? '<span class="card-stat access-check-time">Последняя FULL/PREVIEW проверка <strong>' + new Date(a.premium_checked_at * 1000).toLocaleString(adminLanguage === 'ru' ? 'ru-RU' : 'en-GB') + '</strong></span>'
-                        : '<span class="card-stat access-check-time">Автопроверка FULL/PREVIEW <strong>' +
-                            ((a.availability || {}).state === 'no_token' ? 'ожидает токен' : (!a.is_active ? 'аккаунт отключён' : 'ожидает выполнения')) + '</strong></span>');
-                if (!a.is_catalog && a.preview_streak > 0) premiumCheckStat += '<span class="card-stat" title="Автоматические проверки PREVIEW подряд. При достижении лимита аккаунт переводится только в каталог; результат FULL обнуляет счётчик.">PREVIEW подряд <strong>' +
-                    metricNumber(a.preview_streak) + ' / ' + metricNumber(a.preview_streak_limit) + '</strong></span>';
-                var catalogBtn = a.is_catalog
-                    ? '<button class="btn" onclick="setCatalog(\'' + a.id + '\',false)" title="Вернуть в пул воспроизведения">Из каталога</button>'
-                    : '<button class="btn" onclick="setCatalog(\'' + a.id + '\',true)" title="Использовать только для метаданных">В каталог</button>';
-                groupCards[group] += '<div class="account-card role-' + group + '" data-search="' + esc((label + ' ' + uid + ' ' + a.client_id).toLowerCase()) + '">' +
-                    '<div class="card-header">' +
-                        '<div class="left"><span class="acc-num">' + number + '</span><span class="' + statusClass + '"></span><span class="label">' + esc(label) + '</span><span class="status-label ' + readiness.tone + '">' + statusText + '</span>' + (a.heal_next_retry > Date.now() / 1000 ? '<span class="status-label status-warn" data-no-i18n>' + tr('Пауза обновления') + '</span>' : '') + catalogBadge + premiumBadge + '</div>' +
-                        '<div class="card-actions">' +
-                            '<button class="btn" onclick="refreshAccount(\'' + a.id + '\')">Обновить токен</button>' +
-                            '<button class="btn" onclick="checkPremium(\'' + a.id + '\')" title="Проверка FULL/PREVIEW отправляет до четырёх запросов к Tidal">Проверить FULL</button>' +
-                            '<button class="btn" onclick="checkSubscription(\'' + a.id + '\')" title="Запрашивает у Tidal тариф и срок подписки">Подписка</button>' +
-                            '<button class="btn" onclick="openEdit(\'' + a.id + '\')">Изменить</button>' +
-                            '<button class="btn" onclick="duplicateAccount(\'' + a.id + '\')">Дублировать</button>' +
-                            catalogBtn +
-                            '<button class="btn' + activeCls + '" onclick="toggleAccount(\'' + a.id + '\',' + (!a.is_active) + ')">' + toggleText + '</button>' +
-                            '<button class="btn btn-danger" onclick="removeAccount(\'' + a.id + '\')">Удалить</button>' +
-                        '</div>' +
-                    '</div>' +
-                    '<div class="card-body">' +
-                        '<div class="cred-row"><span class="cred-key">CLIENT_ID</span><span class="cred-value">' + esc(a.client_id) + '</span></div>' +
-                        '<div class="cred-row"><span class="cred-key">USER_ID</span><span class="cred-value">' + esc(uid) + '</span></div>' +
-                        countryRow(a) +
-                        '<div class="cred-row"><span class="cred-key">Роль</span><span class="cred-value">' + (a.is_catalog ? 'Только каталог' : 'Воспроизведение') + '</span></div>' + subscriptionRow(a) + tokenRefreshDetails(a) +
-                    '</div>' +
-                    '<div class="account-uptime" data-no-i18n id="uptime-' + esc(a.id) + '">' + uptimeCard(a.uptime, a.id) + '</div>' +
-                    '<div class="card-footer">' +
-                        '<div class="card-stats">' +
-                            '<span class="card-stat" title="Обращения к этому аккаунту с запуска сервера, включая повторы для одного API-запроса">Обращений с запуска <strong>' + metricNumber(a.request_count) + '</strong></span>' +
-                            '<span class="card-stat" title="Ошибки запросов и обновления токена этого аккаунта с запуска сервера">Ошибок с запуска <strong>' + metricNumber(a.error_count) + '</strong></span>' +
-                            '<span class="card-stat" title="Доля ошибок с учётом примерно последних 15 минут. Чем она выше, тем позже аккаунт получает следующий запрос.">Свежие ошибки <strong>' + metricNumber((a.recent_error_rate || 0) * 100) + '%</strong></span>' +
-                            '<span class="card-stat" title="Запросы, начатые этим аккаунтом за последний час; лимит задаётся в настройках">За час <strong>' + metricNumber(a.requests_last_hour) + '</strong></span>' +
-                            (a.heal_next_retry > Date.now() / 1000 ? '<span class="card-stat">Повтор обновления через <strong>' + esc(uptimeDuration(a.heal_next_retry - Date.now() / 1000)) + '</strong></span>' : (a.auto_disabled ? '<span class="card-stat">Восстановление <strong>ожидает попытки</strong></span>' : '')) +
-                            (a.rate_limited_until > Date.now() / 1000 ? '<span class="card-stat">Пауза 429 ещё <strong>' + esc(uptimeDuration(a.rate_limited_until - Date.now() / 1000)) + '</strong></span>' : '') +
-                            (!a.is_active ? '<span class="card-stat">' + (a.auto_disabled ? 'Автоотключён с' : 'Отключён с') + ' <strong>' + disabledSince + '</strong></span>' +
-                                '<span class="card-stat">Без работы <strong>' + (disabledAt ? sleepDuration(disabledAt) : '—') + '</strong></span>' : '') +
-                            '<span class="card-stat">' + ((a.availability || {}).token === 'valid' ? 'Токен действует ещё' : 'Токен') + ' <strong>' + tokenStr + '</strong></span>' +
-                            premiumCheckStat +
-                            '<span class="card-stat test-badge" id="test-' + a.id + '" onclick="showTestDetails(\'' + a.id + '\')">Последний тест <strong>не запускался</strong></span>' +
-                        '</div>' +
-                    '</div>' +
-                '</div>';
-            }
-            html = accountGroup('playback', 'Воспроизведение · FULL', 'Отдают треки целиком; FREE-подписка переводит аккаунт в каталог', groupCards.playback, groupSize.playback) +
-                accountGroup('catalog', 'Каталог', 'Только метаданные: поиск, альбомы, обложки; треки не воспроизводят', groupCards.catalog, groupSize.catalog);
-        }
-        document.getElementById('accounts-container').innerHTML = html;
-        document.getElementById('subscriptionSummary').innerHTML = subscriptionSummary(accounts.accounts);
+        renderAccounts(accounts.accounts);
         document.getElementById('readyHistory').innerHTML = readyHistoryCard(accounts.accounts);
         var liveAccounts = Number(stats.live_accounts || 0);
         var totalAccounts = Number(stats.total_accounts || accounts.accounts.length || 0);
         document.getElementById('accountCount').innerHTML = '<span class="status-dot ' + (liveAccounts > 0 ? 'status-ok' : (totalAccounts > 0 ? 'status-warn' : 'status-unknown')) + '"></span><span>Готовы сейчас</span><strong>' + metricNumber(liveAccounts) + ' <span>из</span> ' + metricNumber(totalAccounts) + '</strong>';
-        filterAccounts(document.getElementById('accountSearch').value);
-        renderTestResults(_testResults);
         return true;
     } catch(e) {
         document.getElementById('error').textContent = 'Failed: ' + e.message;
     }
 }
 
+function renderAccounts(list) {
+    var html = '';
+    var groupCards = { playback: '', catalog: '', free: '' };
+    var groupSize = { playback: 0, catalog: 0, free: 0 };
+    // Numbers follow the order the accounts were added in, so they stay put whatever the sort.
+    var entries = list.map(function(a) {
+        var group = accountGroupOf(a);
+        return { account: a, group: group, number: ++groupSize[group] };
+    });
+    entries.sort(function(x, y) { return compareAccounts(x.account, y.account); });
+    var sortSelect = document.getElementById('accountSort');
+    sortSelect.value = accountSort;
+    if (!sortSelect.value) sortSelect.value = accountSort = 'added';
+    if (!ACCOUNT_FILTERS.some(function(f) { return f[0] === accountFilter; })) accountFilter = 'all';
+    document.getElementById('accountFiltersBar').style.display = list.length ? '' : 'none';
+    document.getElementById('accountFilters').innerHTML = accountFilterTabs(list);
+    if (list.length === 0) {
+        html = '<div class="empty-state"><p>Аккаунтов пока нет</p><p class="hint">Подключите первый через OAuth — это займёт меньше минуты.</p><button class="btn btn-primary" style="margin-top:16px" onclick="openAddAccount()">Добавить аккаунт</button></div>';
+    } else {
+        for (var i = 0; i < entries.length; i++) {
+            var a = entries[i].account;
+            var group = entries[i].group;
+            var number = entries[i].number;
+            var label = a.label || a.id.slice(0, 8);
+            var readiness = accountStatus(a);
+            var statusClass = 'status-dot ' + readiness.tone;
+            var statusText = readiness.text;
+            var activeCls = a.is_active ? ' btn-active' : '';
+            var toggleText = a.is_active ? 'Включён' : 'Включить';
+            var tokenStr = tokenDescription(a);
+            var disabledAt = !a.is_active && Number(a.disabled_at) > 0 ? Number(a.disabled_at) : 0;
+            var disabledSince = disabledAt
+                ? new Date(disabledAt * 1000).toLocaleString(adminLanguage === 'ru' ? 'ru-RU' : 'en-GB', { day:'2-digit', month:'2-digit', year:'numeric', hour:'2-digit', minute:'2-digit' })
+                : 'время неизвестно';
+            var uid = a.user_id || '-';
+            var catalogBadge = a.is_catalog ? '<span class="status-label" style="color:#d2a8ff;background:rgba(210,168,255,0.1)">Каталог</span>' : '';
+            var access = playbackAccess(a);
+            var premiumBadge = '<span class="playback-access ' + access.className + '" title="' + esc(access.description) + '"><span class="access-caption">Доступ к трекам</span><strong>' + access.label + '</strong></span>';
+            var premiumCheckStat = a.is_catalog
+                ? '<span class="card-stat access-check-time">FULL/PREVIEW <strong>для каталога не проверяется</strong></span>'
+                : (a.premium_checked_at
+                    ? '<span class="card-stat access-check-time">Последняя FULL/PREVIEW проверка <strong>' + new Date(a.premium_checked_at * 1000).toLocaleString(adminLanguage === 'ru' ? 'ru-RU' : 'en-GB') + '</strong></span>'
+                    : '<span class="card-stat access-check-time">Автопроверка FULL/PREVIEW <strong>' +
+                        ((a.availability || {}).state === 'no_token' ? 'ожидает токен' : (!a.is_active ? 'аккаунт отключён' : 'ожидает выполнения')) + '</strong></span>');
+            if (!a.is_catalog && a.preview_streak > 0) premiumCheckStat += '<span class="card-stat" title="Автоматические проверки PREVIEW подряд. При достижении лимита аккаунт переводится только в каталог; результат FULL обнуляет счётчик.">PREVIEW подряд <strong>' +
+                metricNumber(a.preview_streak) + ' / ' + metricNumber(a.preview_streak_limit) + '</strong></span>';
+            groupCards[group] += '<div class="account-card role-' + group + (expandedAccounts[a.id] ? ' expanded' : '') + '" data-id="' + esc(a.id) + '" data-filters="' + accountFilterKeys(a) + '" data-search="' + esc((label + ' ' + uid + ' ' + a.client_id).toLowerCase()) + '">' +
+                accountRow(a, number, !!expandedAccounts[a.id]) +
+                '<div class="card-header">' +
+                    '<div class="left"><span class="acc-num">' + number + '</span><span class="' + statusClass + '"></span><span class="label">' + esc(label) + '</span><span class="status-label ' + readiness.tone + '">' + statusText + '</span>' + (a.heal_next_retry > Date.now() / 1000 ? '<span class="status-label status-warn" data-no-i18n>' + tr('Пауза обновления') + '</span>' : '') + catalogBadge + premiumBadge + '</div>' +
+                    '<div class="card-actions">' +
+                        '<button class="btn" onclick="refreshAccount(\'' + a.id + '\')">Обновить токен</button>' +
+                        '<button class="btn' + activeCls + '" onclick="toggleAccount(\'' + a.id + '\',' + (!a.is_active) + ')">' + toggleText + '</button>' +
+                        accountMenu(a, false) +
+                    '</div>' +
+                '</div>' +
+                '<div class="card-body">' +
+                    '<div class="cred-row"><span class="cred-key">CLIENT_ID</span><span class="cred-value">' + esc(a.client_id) + '</span></div>' +
+                    '<div class="cred-row"><span class="cred-key">USER_ID</span><span class="cred-value">' + esc(uid) + '</span></div>' +
+                    countryRow(a) +
+                    '<div class="cred-row"><span class="cred-key">Роль</span><span class="cred-value">' + (a.is_catalog ? 'Только каталог' : 'Воспроизведение') + '</span></div>' + subscriptionRow(a) + tokenRefreshDetails(a) +
+                '</div>' +
+                '<div class="account-uptime" data-no-i18n id="uptime-' + esc(a.id) + '">' + uptimeCard(a.uptime, a.id) + '</div>' +
+                '<div class="card-footer">' +
+                    '<div class="card-stats">' +
+                        '<span class="card-stat" title="Обращения к этому аккаунту с запуска сервера, включая повторы для одного API-запроса">Обращений с запуска <strong>' + metricNumber(a.request_count) + '</strong></span>' +
+                        '<span class="card-stat" title="Ошибки запросов и обновления токена этого аккаунта с запуска сервера">Ошибок с запуска <strong>' + metricNumber(a.error_count) + '</strong></span>' +
+                        '<span class="card-stat" title="Доля ошибок с учётом примерно последних 15 минут. Чем она выше, тем позже аккаунт получает следующий запрос.">Свежие ошибки <strong>' + metricNumber((a.recent_error_rate || 0) * 100) + '%</strong></span>' +
+                        '<span class="card-stat" title="Запросы, начатые этим аккаунтом за последний час; лимит задаётся в настройках">За час <strong>' + metricNumber(a.requests_last_hour) + '</strong></span>' +
+                        (a.heal_next_retry > Date.now() / 1000 ? '<span class="card-stat">Повтор обновления через <strong>' + esc(uptimeDuration(a.heal_next_retry - Date.now() / 1000)) + '</strong></span>' : (a.auto_disabled ? '<span class="card-stat">Восстановление <strong>ожидает попытки</strong></span>' : '')) +
+                        (a.rate_limited_until > Date.now() / 1000 ? '<span class="card-stat">Пауза 429 ещё <strong>' + esc(uptimeDuration(a.rate_limited_until - Date.now() / 1000)) + '</strong></span>' : '') +
+                        (!a.is_active ? '<span class="card-stat">' + (a.auto_disabled ? 'Автоотключён с' : 'Отключён с') + ' <strong>' + disabledSince + '</strong></span>' +
+                            '<span class="card-stat">Без работы <strong>' + (disabledAt ? sleepDuration(disabledAt) : '—') + '</strong></span>' : '') +
+                        '<span class="card-stat">' + ((a.availability || {}).token === 'valid' ? 'Токен действует ещё' : 'Токен') + ' <strong>' + tokenStr + '</strong></span>' +
+                        premiumCheckStat +
+                        '<span class="card-stat test-badge" id="test-' + a.id + '" onclick="showTestDetails(\'' + a.id + '\')">Последний тест <strong>не запускался</strong></span>' +
+                    '</div>' +
+                '</div>' +
+            '</div>';
+        }
+        html = accountGroup('playback', 'Воспроизведение · FULL', 'Отдают треки целиком; FREE-подписка переводит аккаунт в каталог', groupCards.playback, groupSize.playback) +
+            accountGroup('catalog', 'Каталог', 'Только метаданные: поиск, альбомы, обложки; треки не воспроизводят', groupCards.catalog, groupSize.catalog) +
+            accountGroup('free', 'Каталог · FREE', 'FREE-подписка: только метаданные; после продления верните аккаунт из каталога', groupCards.free, groupSize.free);
+    }
+    // The list refreshes every 15 s; an open menu is opened again in the new markup.
+    var openMenu = document.querySelector('#accounts-container .account-menu[open]');
+    document.getElementById('accounts-container').innerHTML = html;
+    applyAccountView();
+    var reopened = openMenu && document.querySelector('#accounts-container .account-menu[data-menu="' + openMenu.dataset.menu + '"]');
+    if (reopened) reopened.open = true;
+    document.getElementById('subscriptionSummary').innerHTML = subscriptionSummary(list);
+    filterAccounts(document.getElementById('accountSearch').value);
+    renderTestResults(_testResults);
+}
+
+// A group folds away by clicking its head; the choice is remembered.
 function accountGroup(role, title, hint, cards, count) {
     if (!count) return '';
-    return '<div class="account-group" data-group="' + role + '"><div class="account-group-head"><span class="group-mark"></span><h3>' + title + '</h3><span class="group-count">' + metricNumber(count) + '</span><p>' + hint + '</p></div>' +
-        '<div class="account-group-list">' + cards + '</div></div>';
+    return '<details class="account-group" data-group="' + role + '"' + (collapsedGroups[role] ? '' : ' open') + ' ontoggle="toggleAccountGroup(this)">' +
+        '<summary class="account-group-head"><span class="group-mark"></span><h3>' + title + '</h3><span class="group-count">' + metricNumber(count) + '</span><span class="group-chevron" aria-hidden="true">▾</span><p>' + hint + '</p></summary>' +
+        '<div class="account-group-list">' + ACCOUNT_ROW_HEAD + cards + '</div></details>';
 }
 
 function esc(s) {
@@ -1800,7 +2070,7 @@ async function checkSubscription(id) {
         var data = await res.json();
         if (!res.ok) throw new Error(data.detail || 'HTTP ' + res.status);
         delete _subscriptions[id];
-        if (data.is_catalog && subscriptionPlan(data.subscription).toUpperCase() === 'FREE') document.getElementById('success').textContent = tr('Подписка FREE: аккаунт переведён в каталог');
+        if (data.is_catalog && subscriptionIsFree(data.subscription)) document.getElementById('success').textContent = tr('Подписка FREE: аккаунт переведён в каталог');
     } catch(e) {
         _subscriptions[id] = { error: e.message, checked_at: Date.now() / 1000 };
         document.getElementById('error').textContent = tr('Проверка подписки:') + ' ' + e.message;
