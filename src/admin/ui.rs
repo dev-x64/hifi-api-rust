@@ -761,8 +761,6 @@ function submitAddAccount() {
     if (document.getElementById('addAccountOverlay').dataset.mode === 'manual') addAccount();
     else startOAuth();
 }
-// The server's built-in sign-in client (crate::setup::AUTH_CLIENT_ID).
-var BUILTIN_CLIENT_ID = 'fX2JxdmntZWK0ixT';
 
 // Clients a sign-in can be issued for: the built-in one and every client the pool already uses.
 function fillOAuthClients() {
@@ -770,7 +768,7 @@ function fillOAuthClients() {
     counts[BUILTIN_CLIENT_ID] = 0;
     (window._accounts || []).forEach(function(a) { if (a.client_id) counts[a.client_id] = (counts[a.client_id] || 0) + 1; });
     var select = document.getElementById('new-oauth-client');
-    var current = select.value || BUILTIN_CLIENT_ID;
+    var current = select.value || (counts[PREFERRED_CLIENT_ID] ? PREFERRED_CLIENT_ID : BUILTIN_CLIENT_ID);
     select.innerHTML = Object.keys(counts).map(function(id) {
         return '<option value="' + esc(id) + '">' + esc(id) + (id === BUILTIN_CLIENT_ID ? ' · ' + esc(tr('встроенный')) : '') +
             ' · ' + esc(tr('аккаунтов:')) + ' ' + counts[id] + '</option>';
@@ -1230,6 +1228,16 @@ function subscriptionShort(account) {
     return plan + ' · ' + esc(metricNumber(Math.floor(days)) + ' ' + tr('дн.'));
 }
 
+// The server's built-in sign-in client (crate::setup::AUTH_CLIENT_ID).
+var BUILTIN_CLIENT_ID = 'fX2JxdmntZWK0ixT';
+// Accounts on this client play hundreds of tracks an hour where the built-in
+// one gets 429 after a few, so new and moved accounts go to it when the pool has it.
+var PREFERRED_CLIENT_ID = 'lw3vR6GE1vtNBsjv';
+
+function poolHasClient(clientId) {
+    return (window._accounts || []).some(function(a) { return a.client_id === clientId; });
+}
+
 // Everyday actions stay on the card; the rest, and in the list all of them, sit in the ⋯ menu.
 function accountMenu(account, everyday) {
     var id = '\'' + account.id + '\'';
@@ -1244,6 +1252,9 @@ function accountMenu(account, everyday) {
         (account.is_catalog
             ? item('setCatalog(' + id + ',false)', 'Из каталога', 'Вернуть в пул воспроизведения')
             : item('setCatalog(' + id + ',true)', 'В каталог', 'Использовать только для метаданных')) +
+        (account.client_id !== PREFERRED_CLIENT_ID && poolHasClient(PREFERRED_CLIENT_ID)
+            ? item('switchClient(' + id + ',\'' + PREFERRED_CLIENT_ID + '\')', 'Перевести на ' + PREFERRED_CLIENT_ID.slice(0, 4) + '…', 'Обновляет токен клиентом ' + PREFERRED_CLIENT_ID + ' и сохраняет аккаунт под ним; входить заново не нужно')
+            : '') +
         (everyday ? item('toggleAccount(' + id + ',' + (!account.is_active) + ')', account.is_active ? 'Отключить' : 'Включить') : '') +
         '<div class="menu-sep"></div>' + item('removeAccount(' + id + ')', 'Удалить', '', 'danger');
     return '<details class="account-menu" data-menu="' + (everyday ? 'row' : 'card') + '-' + esc(account.id) + '" ontoggle="placeAccountMenu(this)">' +
@@ -2128,6 +2139,18 @@ async function setCatalog(id, catalog) {
         });
         if (res.ok) fetchData();
         else { var d = await res.json(); document.getElementById('error').textContent = d.detail || 'Error'; }
+    } catch(e) {
+        document.getElementById('error').textContent = e.message;
+    }
+}
+
+async function switchClient(id, clientId) {
+    try {
+        var res = await fetch('/admin/accounts/' + id + '/client', {
+            method: 'POST', headers: headers(), body: JSON.stringify({ client_id: clientId })
+        });
+        if (res.ok) { document.getElementById('success').textContent = tr('Аккаунт переведён на клиент') + ' ' + clientId; fetchData(); }
+        else { var d = await res.json().catch(function() { return {}; }); document.getElementById('error').textContent = d.detail || ('HTTP ' + res.status); }
     } catch(e) {
         document.getElementById('error').textContent = e.message;
     }

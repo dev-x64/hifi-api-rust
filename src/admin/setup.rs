@@ -111,7 +111,7 @@ pub struct StartSetupRequest {
 
 /// The client a new account is stored under. Another pool client reuses the
 /// secret stored with its accounts, so the secret never reaches the browser.
-async fn setup_client(state: &AppState, requested: Option<&str>) -> Result<(String, String), AppError> {
+pub(crate) async fn setup_client(state: &AppState, requested: Option<&str>) -> Result<(String, String), AppError> {
     let Some(id) = requested.map(str::trim).filter(|id| !id.is_empty() && *id != AUTH_CLIENT_ID) else {
         return Ok((AUTH_CLIENT_ID.to_string(), AUTH_CLIENT_SECRET.to_string()));
     };
@@ -359,7 +359,7 @@ pub async fn start_setup(
 /// One refresh with another client's credentials, form body first as the
 /// token manager does. Returns the access token, a rotated refresh token if
 /// Tidal sent one, and the lifetime.
-async fn refresh_with_client(
+pub(crate) async fn refresh_with_client(
     http: &reqwest::Client,
     client_id: &str,
     client_secret: &str,

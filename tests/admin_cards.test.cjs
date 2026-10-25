@@ -554,3 +554,14 @@ test('premiumAccess keeps a FREE trial out of the FREE group and flags a paid pl
     assert.match(localized(ctx, vm.runInContext('subscriptionShort(accounts[1])', ctx)), /no premium access/);
     assert.match(localized(ctx, vm.runInContext('subscriptionRow(accounts[0])', ctx)), /premium access granted/);
 });
+
+test('accounts off the preferred client can be moved to it from the menu', () => {
+    const { ctx } = context('en');
+    ctx.window._accounts = [{ id: 'a', client_id: 'fX2JxdmntZWK0ixT' }, { id: 'b', client_id: 'lw3vR6GE1vtNBsjv' }];
+    const menu = id => localized(ctx, vm.runInContext('accountMenu(window._accounts.find(function(a) { return a.id === "' + id + '"; }), true)', ctx));
+    assert.match(menu('a'), /onclick="switchClient\('a','lw3vR6GE1vtNBsjv'\)"[^>]*>Move to lw3v…</);
+    assert.doesNotMatch(menu('b'), /switchClient/);
+    // Without the preferred client in the pool there is nothing to move to.
+    ctx.window._accounts = [{ id: 'a', client_id: 'fX2JxdmntZWK0ixT' }];
+    assert.doesNotMatch(menu('a'), /switchClient/);
+});

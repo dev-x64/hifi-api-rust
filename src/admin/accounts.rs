@@ -156,6 +156,61 @@ pub async fn set_account_catalog(
     ))
 }
 
+#[derive(Deserialize)]
+pub struct SwitchClientRequest {
+    pub client_id: String,
+}
+
+/// Move an account to another pool client without signing in again: its
+/// current refresh token is refreshed once with that client's credentials,
+/// the way setup stores new accounts. Nothing changes if Tidal refuses.
+pub async fn switch_account_client(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<SwitchClientRequest>,
+) -> Result<Json<Value>, AppError> {
+    let account = state
+        .account_manager
+        .get_account_by_id(&id)
+        .await
+        .ok_or_else(|| AppError::NotFound(format!("Account {} not found", id)))?;
+    let (client_id, client_secret) =
+        crate::admin::setup::setup_client(&state, Some(&body.client_id)).await?;
+    if client_id == account.client_id {
+        return Err(AppError::BadRequest(format!("Account already uses client {client_id}")));
+    }
+    let old_refresh = account.refresh_token();
+    // The account's own auth route, as for its regular refreshes.
+    let http = state.proxy_manager.working_auth_client_for(&account.id).await?;
+    let (access_token, rotated, expires_in) =
+        crate::admin::setup::refresh_with_client(&http, &client_id, &client_secret, &old_refresh)
+            .await
+            .map_err(|e| {
+                AppError::UpstreamError(
+                    StatusCode::BAD_GATEWAY,
+                    format!("Client {client_id} could not refresh this account's token: {e}"),
+                )
+            })?;
+    let refresh_token = rotated.unwrap_or(old_refresh);
+    state
+        .account_manager
+        .update_account(&id, None, Some(client_id.clone()), Some(client_secret), Some(refresh_token.clone()), None)
+        .await?;
+    if let Some(updated) = state.account_manager.get_account_by_id(&id).await {
+        let expires_at = crate::setup::issued_token_expires_at(expires_in);
+        if let Err(e) = state
+            .account_manager
+            .store_refreshed_credentials(&updated, &refresh_token, None, &access_token, expires_at)
+            .await
+        {
+            // The new pairing is stored; the next refresh mints a token.
+            tracing::warn!(account = %id, "Could not cache the access token after a client switch: {e}");
+        }
+    }
+    tracing::info!(account = %account.label, client = %client_id, "Account moved to another client");
+    Ok(Json(json!({ "message": format!("Account {} now uses client {}", id, client_id) })))
+}
+
 pub async fn remove_account(
     State(state): State<AppState>,
     Path(id): Path<String>,
