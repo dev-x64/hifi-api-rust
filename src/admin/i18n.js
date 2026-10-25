@@ -460,7 +460,7 @@ var ruToEn = {
     'есть premium-доступ': 'premium access granted',
     'Подписка не продлится, но работает до указанной даты': 'The plan will not renew but works until the date shown',
     'Клиент Tidal': 'Tidal client',
-    'Токен выдаётся под выбранный клиент. Можно выбрать клиент, который уже используют аккаунты пула: его secret берётся из них на сервере.': 'The token is issued for the chosen client. A client already used by pool accounts can be chosen: its secret is taken from them on the server.',
+    'Вход идёт через встроенный клиент, а аккаунт сохраняется под выбранным: сервер сразу обновляет токен этим клиентом и сообщит, если Tidal не позволит. Secret берётся у аккаунтов пула на сервере.': 'Sign-in uses the built-in client and the account is stored under the chosen one: the server refreshes the token with it right away and reports if Tidal refuses. The secret is taken from pool accounts on the server.',
     'встроенный': 'built-in',
     'аккаунтов:': 'accounts:',
     'проверено в': 'checked at',
