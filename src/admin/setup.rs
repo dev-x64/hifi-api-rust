@@ -103,6 +103,26 @@ pub struct StartSetupRequest {
     /// When true, the new account serves metadata only.
     #[serde(default)]
     pub catalog: bool,
+    /// Client to sign in with: one already used by an account in the pool.
+    /// None or the built-in client means the built-in TV client.
+    #[serde(default)]
+    pub client_id: Option<String>,
+}
+
+/// The client a new sign-in is issued for. Another pool client reuses the
+/// secret stored with its accounts, so the secret never reaches the browser.
+async fn setup_client(state: &AppState, requested: Option<&str>) -> Result<(String, String), AppError> {
+    let Some(id) = requested.map(str::trim).filter(|id| !id.is_empty() && *id != AUTH_CLIENT_ID) else {
+        return Ok((AUTH_CLIENT_ID.to_string(), AUTH_CLIENT_SECRET.to_string()));
+    };
+    state
+        .account_manager
+        .list_accounts()
+        .await
+        .into_iter()
+        .find(|account| account.client_id == id)
+        .map(|account| (account.client_id.clone(), account.client_secret.clone()))
+        .ok_or_else(|| AppError::BadRequest(format!("No account in the pool uses client {id}")))
 }
 
 pub async fn start_setup(
@@ -110,18 +130,30 @@ pub async fn start_setup(
     body: Option<Json<StartSetupRequest>>,
 ) -> Result<Json<Value>, AppError> {
     let catalog = body.as_ref().is_some_and(|b| b.catalog);
+    let (client_id, client_secret) =
+        setup_client(&state, body.as_ref().and_then(|b| b.client_id.as_deref())).await?;
     let custom_label = body
         .and_then(|b| b.label.clone())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
     let http_client = state.proxy_manager.working_auth_client().await?;
 
-    let auth_resp: DeviceAuthorization = http_client
+    let auth_resp = http_client
         .post("https://auth.tidal.com/v1/oauth2/device_authorization")
-        .form(&[("client_id", AUTH_CLIENT_ID), ("scope", "r_usr+w_usr+w_sub")])
+        .form(&[("client_id", client_id.as_str()), ("scope", "r_usr+w_usr+w_sub")])
         .send()
         .await
-        .map_err(|e| AppError::ServiceUnavailable(format!("Device auth request failed: {}", e)))?
+        .map_err(|e| AppError::ServiceUnavailable(format!("Device auth request failed: {}", e)))?;
+    // Not every client may sign in by code; Tidal's answer says why.
+    if !auth_resp.status().is_success() {
+        let status = auth_resp.status();
+        let body = auth_resp.text().await.unwrap_or_default();
+        return Err(AppError::BadRequest(format!(
+            "Tidal refused sign-in by code for client {client_id}: HTTP {status} {}",
+            body.chars().take(200).collect::<String>()
+        )));
+    }
+    let auth_resp: DeviceAuthorization = auth_resp
         .json()
         .await
         .map_err(|e| AppError::ServiceUnavailable(format!("Device auth parse failed: {}", e)))?;
@@ -168,14 +200,14 @@ pub async fn start_setup(
             let res = match hc
                 .post("https://auth.tidal.com/v1/oauth2/token")
                 .form(&[
-                    ("client_id", AUTH_CLIENT_ID),
+                    ("client_id", client_id.as_str()),
                     ("scope", "r_usr+w_usr+w_sub"),
                     ("device_code", &device_code),
                     ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
                 ])
                 .basic_auth(
-                    crate::token_manager::oauth_basic_component(AUTH_CLIENT_ID),
-                    Some(crate::token_manager::oauth_basic_component(AUTH_CLIENT_SECRET)),
+                    crate::token_manager::oauth_basic_component(&client_id),
+                    Some(crate::token_manager::oauth_basic_component(&client_secret)),
                 )
                 .send()
                 .await
@@ -190,8 +222,22 @@ pub async fn start_setup(
                 }
             };
 
+            // 400 is authorization_pending or slow_down; anything else
+            // other than a 429 means this client will not get a token.
             if !res.status().is_success() {
-                continue;
+                let status = res.status();
+                if status.as_u16() == 400 || status.as_u16() == 429 {
+                    continue;
+                }
+                let body = res.text().await.unwrap_or_default();
+                let mut sessions = sessions.write().await;
+                if let Some(session) = sessions.get_mut(&sid) {
+                    session.status = SetupStatus::Error(format!(
+                        "Tidal refused the token for client {client_id}: HTTP {status} {}",
+                        body.chars().take(200).collect::<String>()
+                    ));
+                }
+                break;
             }
 
             let token_resp: TokenResponse = match res.text().await {
@@ -236,8 +282,8 @@ pub async fn start_setup(
             match am
                 .add_account(
                     label.clone(),
-                    AUTH_CLIENT_ID.to_string(),
-                    AUTH_CLIENT_SECRET.to_string(),
+                    client_id.clone(),
+                    client_secret.clone(),
                     refresh_token.clone(),
                     Some(user_id.clone()),
                 )

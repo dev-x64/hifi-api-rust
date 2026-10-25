@@ -344,7 +344,10 @@ for (const language of ['en', 'ru']) {
         const soon = new Date(Date.now() + 2 * 86400000 - 30 * 60000).toISOString().replace('Z', '+0000');
         assert.match(row({ id: 'a', subscription: { status: 'ACTIVE', validUntil: soon } }), language === 'en' ? /sub-bad">ends in 1 d 23 hr/ : /sub-bad">заканчивается через 1 д 23 ч/);
         const cancelled = row({ id: 'a', subscription: { status: 'CANCELLED', validUntil: '2001-01-01T00:00:00.000+0000', paymentOverdue: true } });
-        assert.match(cancelled, /sub-bad">CANCELLED<[^]*sub-bad">[^<]*2001[^<]*</);
+        // CANCELLED or STOPPED only means no renewal: grey, while the past date is what is flagged.
+        assert.match(cancelled, /sub-checked" title="[^"]+">CANCELLED<[^]*sub-bad">[^<]*2001[^<]*</);
+        const stopped = { id: 'a', subscription: { status: 'STOPPED', validUntil: '2099-11-21T00:00:00.000+0000', subscription: { type: 'PREMIUM' } } };
+        assert.equal(vm.runInContext('subscriptionState(' + JSON.stringify(stopped) + ')', ctx), 'ok');
         assert.match(cancelled, language === 'en' ? /sub-bad">payment overdue</ : /sub-bad">оплата просрочена</);
         // A newer failed manual check is shown over the stored answer.
         vm.runInContext('_subscriptions.a = { error: "Tidal HTTP 403: <b>x</b>", checked_at: 1800000000 }', ctx);

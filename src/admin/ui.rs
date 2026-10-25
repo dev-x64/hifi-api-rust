@@ -610,7 +610,7 @@ button:focus-visible,input:focus-visible,select:focus-visible { outline:2px soli
 </div></main>
 </div>
 
-<div id="addAccountOverlay" class="overlay" data-mode="oauth" onclick="if(event.target===this)closeAddAccount()"><form class="modal add-account" style="width:560px" onsubmit="event.preventDefault();submitAddAccount()"><div class="section-head"><div><div class="page-kicker">Новый аккаунт</div><h3 style="margin:0">Подключить Tidal</h3></div><button type="button" class="btn icon-btn btn-quiet" onclick="closeAddAccount()" aria-label="Закрыть">×</button></div><div class="mode-tabs" role="tablist"><button type="button" role="tab" id="addModeOauth" aria-selected="true" onclick="setAddAccountMode('oauth')">OAuth</button><button type="button" role="tab" id="addModeManual" aria-selected="false" onclick="setAddAccountMode('manual')">Вручную</button></div><p class="form-copy oauth-only">Откроется ссылка Tidal: войдите и подтвердите доступ — аккаунт добавится сам.</p><p class="form-copy manual-only">Для уже готовых credentials: Client ID, Client Secret и Refresh Token.</p><div class="form-row"><div class="form-group"><label for="new-label">Название · необязательно</label><input type="text" id="new-label" placeholder="Основной аккаунт"></div><div class="form-group manual-only"><label for="new-user-id">User ID · необязательно</label><input type="text" id="new-user-id" placeholder="208921067"></div></div><div class="manual-only"><div class="form-group" style="margin:0 0 14px"><label for="new-client-id">Client ID</label><input type="text" id="new-client-id" placeholder="client_id"></div><div class="form-row"><div class="form-group"><label for="new-client-secret">Client Secret</label><div class="pw-wrap"><input type="password" id="new-client-secret" placeholder="client_secret"><button type="button" class="pw-toggle" onclick="togglePw('new-client-secret', this)">&#128065;</button></div></div><div class="form-group"><label for="new-refresh-token">Refresh Token</label><div class="pw-wrap"><input type="password" id="new-refresh-token" placeholder="refresh_token"><button type="button" class="pw-toggle" onclick="togglePw('new-refresh-token', this)">&#128065;</button></div></div></div></div><label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted);margin:16px 0"><input type="checkbox" id="new-catalog"> Только каталог — без воспроизведения</label><div class="modal-actions"><button type="submit" class="btn btn-primary oauth-only" id="oauthBtn">Подключить через OAuth</button><button type="submit" class="btn btn-primary manual-only">Добавить аккаунт</button><button type="button" class="btn" onclick="closeAddAccount()">Отмена</button></div></form></div>
+<div id="addAccountOverlay" class="overlay" data-mode="oauth" onclick="if(event.target===this)closeAddAccount()"><form class="modal add-account" style="width:560px" onsubmit="event.preventDefault();submitAddAccount()"><div class="section-head"><div><div class="page-kicker">Новый аккаунт</div><h3 style="margin:0">Подключить Tidal</h3></div><button type="button" class="btn icon-btn btn-quiet" onclick="closeAddAccount()" aria-label="Закрыть">×</button></div><div class="mode-tabs" role="tablist"><button type="button" role="tab" id="addModeOauth" aria-selected="true" onclick="setAddAccountMode('oauth')">OAuth</button><button type="button" role="tab" id="addModeManual" aria-selected="false" onclick="setAddAccountMode('manual')">Вручную</button></div><p class="form-copy oauth-only">Откроется ссылка Tidal: войдите и подтвердите доступ — аккаунт добавится сам.</p><p class="form-copy manual-only">Для уже готовых credentials: Client ID, Client Secret и Refresh Token.</p><div class="form-group oauth-only" style="margin:0 0 14px"><label for="new-oauth-client">Клиент Tidal</label><select id="new-oauth-client" class="select" style="width:100%;padding:10px 12px" data-no-i18n></select><p class="form-copy" style="margin:6px 0 0">Токен выдаётся под выбранный клиент. Можно выбрать клиент, который уже используют аккаунты пула: его secret берётся из них на сервере.</p></div><div class="form-row"><div class="form-group"><label for="new-label">Название · необязательно</label><input type="text" id="new-label" placeholder="Основной аккаунт"></div><div class="form-group manual-only"><label for="new-user-id">User ID · необязательно</label><input type="text" id="new-user-id" placeholder="208921067"></div></div><div class="manual-only"><div class="form-group" style="margin:0 0 14px"><label for="new-client-id">Client ID</label><input type="text" id="new-client-id" placeholder="client_id"></div><div class="form-row"><div class="form-group"><label for="new-client-secret">Client Secret</label><div class="pw-wrap"><input type="password" id="new-client-secret" placeholder="client_secret"><button type="button" class="pw-toggle" onclick="togglePw('new-client-secret', this)">&#128065;</button></div></div><div class="form-group"><label for="new-refresh-token">Refresh Token</label><div class="pw-wrap"><input type="password" id="new-refresh-token" placeholder="refresh_token"><button type="button" class="pw-toggle" onclick="togglePw('new-refresh-token', this)">&#128065;</button></div></div></div></div><label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted);margin:16px 0"><input type="checkbox" id="new-catalog"> Только каталог — без воспроизведения</label><div class="modal-actions"><button type="submit" class="btn btn-primary oauth-only" id="oauthBtn">Подключить через OAuth</button><button type="submit" class="btn btn-primary manual-only">Добавить аккаунт</button><button type="button" class="btn" onclick="closeAddAccount()">Отмена</button></div></form></div>
 <div id="oauthOverlay" class="overlay" onclick="if(event.target===this)closeOAuth()">
 <div class="modal">
 <h3>Авторизация через Tidal</h3>
@@ -761,7 +761,25 @@ function submitAddAccount() {
     if (document.getElementById('addAccountOverlay').dataset.mode === 'manual') addAccount();
     else startOAuth();
 }
+// The server's built-in sign-in client (crate::setup::AUTH_CLIENT_ID).
+var BUILTIN_CLIENT_ID = 'fX2JxdmntZWK0ixT';
+
+// Clients a sign-in can be issued for: the built-in one and every client the pool already uses.
+function fillOAuthClients() {
+    var counts = {};
+    counts[BUILTIN_CLIENT_ID] = 0;
+    (window._accounts || []).forEach(function(a) { if (a.client_id) counts[a.client_id] = (counts[a.client_id] || 0) + 1; });
+    var select = document.getElementById('new-oauth-client');
+    var current = select.value || BUILTIN_CLIENT_ID;
+    select.innerHTML = Object.keys(counts).map(function(id) {
+        return '<option value="' + esc(id) + '">' + esc(id) + (id === BUILTIN_CLIENT_ID ? ' · ' + esc(tr('встроенный')) : '') +
+            ' · ' + esc(tr('аккаунтов:')) + ' ' + counts[id] + '</option>';
+    }).join('');
+    select.value = counts[current] !== undefined ? current : BUILTIN_CLIENT_ID;
+}
+
 function openAddAccount(mode) {
+    fillOAuthClients();
     setAddAccountMode(mode);
     document.getElementById('addAccountOverlay').classList.add('open');
     setTimeout(function(){ document.getElementById(mode === 'manual' ? 'new-client-id' : 'new-label').focus(); }, 100);
@@ -1293,8 +1311,8 @@ function subscriptionRow(account) {
     if (body) {
         var plan = subscriptionPlan(body);
         var parts = [];
-        if (plan) parts.push('<strong class="' + (subscriptionIsFree(body) ? 'sub-bad' : '') + '">' + esc(plan) + '</strong>');
-        if (body.status) parts.push('<span class="' + (body.status === 'ACTIVE' ? 'sub-ok' : 'sub-bad') + '">' + esc(body.status) + '</span>');
+        if (plan) parts.push('<strong' + (subscriptionIsFree(body) ? ' class="sub-bad"' : '') + '>' + esc(plan) + '</strong>');
+        if (body.status) parts.push('<span class="' + (body.status === 'ACTIVE' ? 'sub-ok' : 'sub-checked') + '"' + (body.status === 'ACTIVE' ? '' : ' title="' + esc(tr('Подписка не продлится, но работает до указанной даты')) + '"') + '>' + esc(body.status) + '</span>');
         var daysLeft = subscriptionDaysLeft(body);
         if (!isNaN(daysLeft)) {
             var date = new Date(Date.now() + daysLeft * 86400000).toLocaleDateString(adminLanguage === 'ru' ? 'ru-RU' : 'en-GB', {day:'numeric', month:'short', year:'numeric'});
@@ -1324,15 +1342,16 @@ function subscriptionIsFree(body) {
     return subscriptionPlan(body).toUpperCase() === 'FREE' && (body || {}).premiumAccess !== true;
 }
 
-// Where a plan stands: free, ended (also overdue, not ACTIVE or without
-// premium access), soon (ends within SUBSCRIPTION_SOON_DAYS), ok, or unknown
-// while Tidal has not answered.
+// Where a plan stands: free, ended (also overdue or without premium access),
+// soon (ends within SUBSCRIPTION_SOON_DAYS), ok, or unknown while Tidal has
+// not answered. The status is ignored: STOPPED only means no renewal, the
+// plan plays until validUntil.
 function subscriptionState(account) {
     var body = account.subscription;
     if (!body) return 'unknown';
     if (subscriptionIsFree(body)) return 'free';
     var daysLeft = subscriptionDaysLeft(body);
-    if (body.paymentOverdue || body.premiumAccess === false || (body.status && body.status !== 'ACTIVE') || daysLeft <= 0) return 'ended';
+    if (body.paymentOverdue || body.premiumAccess === false || daysLeft <= 0) return 'ended';
     return daysLeft < SUBSCRIPTION_SOON_DAYS ? 'soon' : 'ok';
 }
 
@@ -2176,9 +2195,10 @@ function startOAuth() {
     document.getElementById('oauthOverlay').classList.add('open');
     var lbl = (document.getElementById('new-label').value || '').trim();
     var catalog = document.getElementById('new-catalog').checked;
-    fetch('/admin/setup', { method: 'POST', headers: headers(), body: JSON.stringify({ label: lbl || null, catalog: catalog }) })
-        .then(function(r) {
-            if (!r.ok) throw new Error('HTTP ' + r.status);
+    var clientId = document.getElementById('new-oauth-client').value || null;
+    fetch('/admin/setup', { method: 'POST', headers: headers(), body: JSON.stringify({ label: lbl || null, catalog: catalog, client_id: clientId }) })
+        .then(async function(r) {
+            if (!r.ok) throw new Error('HTTP ' + r.status + ' ' + (await r.text()).slice(0, 300));
             return r.json();
         })
         .then(function(data) {
