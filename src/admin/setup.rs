@@ -136,14 +136,23 @@ pub async fn start_setup(
         .and_then(|b| b.label.clone())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
-    let http_client = state.proxy_manager.working_auth_client().await?;
-
-    let auth_resp = http_client
-        .post("https://auth.tidal.com/v1/oauth2/device_authorization")
-        .form(&[("client_id", AUTH_CLIENT_ID), ("scope", "r_usr+w_usr+w_sub")])
-        .send()
-        .await
-        .map_err(|e| AppError::ServiceUnavailable(format!("Device auth request failed: {}", e)))?;
+    let mut http_client = state.proxy_manager.working_auth_client().await?;
+    let request_code = |client: &reqwest::Client| {
+        client
+            .post("https://auth.tidal.com/v1/oauth2/device_authorization")
+            .form(&[("client_id", AUTH_CLIENT_ID), ("scope", "r_usr+w_usr+w_sub")])
+            .send()
+    };
+    // A proxy that cannot connect gets one replacement before giving up.
+    let auth_resp = match request_code(&http_client).await {
+        Err(e) if e.is_connect() || e.is_timeout() => {
+            tracing::warn!("Device auth request failed: {}", error_chain(&e));
+            http_client = state.proxy_manager.replace_auth_client().await?;
+            request_code(&http_client).await
+        }
+        other => other,
+    }
+    .map_err(|e| AppError::ServiceUnavailable(format!("Device auth request failed: {}", error_chain(&e))))?;
     if !auth_resp.status().is_success() {
         let status = auth_resp.status();
         let body = auth_resp.text().await.unwrap_or_default();
@@ -215,7 +224,7 @@ pub async fn start_setup(
                 Err(e) => {
                     let mut sessions = sessions.write().await;
                     if let Some(session) = sessions.get_mut(&sid) {
-                        session.status = SetupStatus::Error(format!("Poll failed: {}", e));
+                        session.status = SetupStatus::Error(format!("Poll failed: {}", error_chain(&e)));
                     }
                     break;
                 }
@@ -354,6 +363,19 @@ pub async fn start_setup(
         "session_id": session_id,
         "verification_uri": url
     })))
+}
+
+/// reqwest's own message stops at "error sending request"; the cause
+/// (DNS, refused connection, proxy handshake, TLS) is in its sources.
+fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    message
 }
 
 /// One refresh with another client's credentials, form body first as the

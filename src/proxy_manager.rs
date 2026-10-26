@@ -588,6 +588,30 @@ impl ProxyManager {
         Err(AppError::ServiceUnavailable("No auth proxy available".into()))
     }
 
+    /// The current proxy could not reach Tidal's auth server. Only catalog
+    /// traffic reports on that proxy, so a dead one would otherwise stay
+    /// current: switch to a tested spare and return its auth client.
+    pub async fn replace_auth_client(&self) -> Result<Client, AppError> {
+        if !self.proxies_enabled() {
+            return Ok(self.direct_auth_client.clone());
+        }
+        let generation = self.generation.load(Ordering::Acquire);
+        let failed = self.current.read().await.clone();
+        if let Some(failed) = &failed {
+            tracing::warn!("Auth through proxy {} failed — switching", mask_proxy(failed));
+        }
+        self.ready.store(false, Ordering::Relaxed);
+        if let Some(proxy) = self.get_working_proxy(failed.as_deref()).await {
+            if self.swap_to(Some(proxy), generation).await {
+                return self.working_auth_client().await;
+            }
+        }
+        if self.config.fallback_to_direct {
+            return Ok(self.direct_auth_client.clone());
+        }
+        Err(AppError::ServiceUnavailable("No other working proxy for Tidal sign-in".into()))
+    }
+
     /// Auth uses HTTP/1.1 but exactly the same account-to-proxy binding as API traffic.
     pub async fn working_auth_client_for(&self, account_id: &str) -> Result<Client, AppError> {
         self.working_client_for(account_id).await?;
