@@ -81,7 +81,15 @@ for (const language of ['en', 'ru']) {
         assert.ok(html.includes((language === 'en' ? 'Metadata per account' : 'Метаданные на один аккаунт') + '</span><strong>' + n('0.63') + unit));
         assert.match(html, language === 'en' ? /status-warn"><\/span><span>429 responses in 60 s<\/span><strong>3</ : /status-warn"><\/span><span>Ответов 429 за 60 с<\/span><strong>3</);
         assert.match(html, language === 'en' ? /No valid token<\/span><strong>6</ : /Без токена<\/span><strong>6</);
-        assert.match(html, language === 'en' ? /FULL ready<\/span><strong>5</ : /Готовы к FULL<\/span><strong>5</);
+        // Headline: FULL playback accounts; without catalog accounts there is no catalog count.
+        const accounts = localized(ctx, vm.runInContext('accountsCard(stats)', ctx));
+        assert.match(accounts, /<div class="value">5 <span class="metric-unit">FULL<\/span><\/div>/);
+        assert.doesNotMatch(accounts, /catalog only|только каталог/);
+        ctx.stats = { ...snapshot, catalog_readiness: { ...empty, total: 6, ready: 4 } };
+        assert.match(localized(ctx, vm.runInContext('accountsCard(stats)', ctx)),
+            language === 'en' ? /5 <span class="metric-unit">FULL<\/span> <span class="metric-unit">·<\/span> 4 <span class="metric-unit">catalog only<\/span>/
+                : /5 <span class="metric-unit">FULL<\/span> <span class="metric-unit">·<\/span> 4 <span class="metric-unit">только каталог<\/span>/);
+        ctx.stats = snapshot;
         // The limit follows accounts that can serve now, so the gap to enabled ones is spelled out.
         assert.match(html, /class="stat-note">[^]*<strong>7<\/strong>[^]*<strong>13<\/strong>/);
         // The accounts card is a plain list of counts, without a chart.
@@ -422,18 +430,19 @@ test('every error cause is recognised from the server message or, failing that, 
     const cause = (status, error) => { ctx.q = { status, error }; return ctx.tr(vm.runInContext('errorCause(q)[0]', ctx)); };
     for (const [status, error, expected] of [
         [409, 'Tidal returned manifest for track unknown for requested 5: refusing to serve a different track', 'Track substituted'],
-        [503, 'Preview only (FULL_REQUIRES_SUBSCRIPTION): track 5 not available as FULL', 'Preview only'],
-        [503, 'Tidal did not return HIGH audio', 'No HIGH quality'],
-        [503, 'Playback queue full (40/40); retry shortly', 'Queue full'],
-        [503, 'Catalog accounts are at their concurrent request limit', 'Catalog busy'],
+        [403, 'Preview only (FULL_REQUIRES_SUBSCRIPTION): track 5 not available as FULL', 'Preview only'],
+        [502, 'Tidal did not return HIGH audio', 'No HIGH quality'],
+        [429, 'Playback queue full (40/40); retry shortly', 'Queue full'],
+        [429, 'Catalog accounts are at their concurrent request limit', 'Catalog busy'],
         [429, 'All playback accounts are busy: each serves at most 1 request(s) to Tidal at a time, and none freed up within 20 s. Retry shortly.', 'All accounts busy'],
         [503, 'All accounts are waiting for a token refresh', 'No working accounts'],
         [503, 'All accounts are inactive or have expired tokens', 'No working accounts'],
         [503, 'All accounts failed after fallback', 'No working accounts'],
         [500, 'No Tidal credentials available; add an account via the admin panel', 'No working accounts'],
         [503, 'No working proxy available and direct fallback is disabled', 'Proxy unavailable'],
-        [503, 'Connection error to Tidal', 'Tidal unreachable'],
-        [429, 'Upstream timeout', 'Timeout'],
+        [502, 'Connection error to Tidal', 'Tidal unreachable'],
+        [502, 'Network error reaching Tidal: connection reset', 'Tidal unreachable'],
+        [504, 'Upstream timeout', 'Timeout'],
         [410, 'Playback request was cancelled', 'Request cancelled'],
         [429, 'Tidal rate limited the account', 'Tidal rate limit'],
         [404, 'Resource not found', 'Not found'],

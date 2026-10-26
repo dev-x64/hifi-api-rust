@@ -201,7 +201,7 @@ impl SecondCounts {
             throttled: u64::from(
                 traffic != Traffic::Service
                     && entry.status == 429
-                    && !entry.error.starts_with(crate::error::ACCOUNTS_BUSY),
+                    && !crate::error::is_accounts_busy(&entry.error),
             ),
         }
     }
@@ -799,7 +799,18 @@ mod tests {
         record("/search", "", 429, false, true);
         // Answered without picking an account: bad parameters, a full queue.
         record("/search", "SKIP", 400, false, false);
-        record("/track/:id", "", 503, false, false);
+        // Our own "no free slot" 429s are not Tidal throttling either.
+        for detail in [
+            "Playback queue full (4/4); retry shortly",
+            "Catalog accounts are at their concurrent request limit",
+            "All playback accounts are busy: retry shortly",
+        ] {
+            let mut item = entry(now - 1, 1);
+            item.path = "/track/:id".into();
+            item.status = 429;
+            item.error = detail.into();
+            log.record(item);
+        }
         // Every account paused: nothing is sent, yet the client still sees Tidal's limit.
         record("/album", "SKIP", 429, false, false);
         // A queued playback job reaches Tidal once a slot frees up; only playback queues.

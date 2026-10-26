@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use chrono::Utc;
@@ -152,6 +152,9 @@ pub struct AccountState {
     /// Temporary upstream 429 pause. Kept separate from account health so
     /// rate limiting never disables a valid credential.
     pub rate_limited_until: AtomicI64,
+    /// 429 pauses in a row, each starting within `RATE_LIMIT_FORGIVE_SECS`
+    /// of the previous one's end. Every strike doubles the next pause.
+    pub rate_limit_strikes: AtomicU32,
     /// Result of the latest automatic or manual FULL/PREVIEW probe; informational only.
     pub premium_status: RwLock<String>,
     pub premium_checked_at: AtomicI64,
@@ -218,6 +221,7 @@ impl AccountState {
             recent: std::sync::Mutex::new(RecentOutcomes::default()),
             hour_picks: std::sync::Mutex::new(std::collections::VecDeque::new()),
             rate_limited_until: AtomicI64::new(0),
+            rate_limit_strikes: AtomicU32::new(0),
             premium_status: RwLock::new("unknown".to_string()),
             premium_checked_at: AtomicI64::new(0),
             preview_streak: AtomicI64::new(0),
@@ -249,6 +253,10 @@ impl AccountState {
         }
         new.rate_limited_until.store(
             old.rate_limited_until.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        new.rate_limit_strikes.store(
+            old.rate_limit_strikes.load(Ordering::Relaxed),
             Ordering::Relaxed,
         );
         new.created_at.store(
@@ -721,7 +729,12 @@ pub struct AccountManager {
 }
 
 impl AccountManager {
+    /// First pause when Tidal sends no Retry-After, which it usually does not.
     const DEFAULT_RATE_LIMIT_SECS: u64 = 30;
+    /// Longest pause that repeated strikes build up to.
+    const RATE_LIMIT_MAX_SECS: u64 = 15 * 60;
+    /// A 429 this long after the previous pause ended starts again at strike 1.
+    const RATE_LIMIT_FORGIVE_SECS: i64 = 30 * 60;
 
     /// Retry-After may be seconds or an HTTP date. An absent/malformed value
     /// still gets a conservative pause rather than another immediate request.
@@ -745,9 +758,41 @@ impl AccountManager {
         (remaining > 0).then_some(remaining as u64)
     }
 
+    /// Pause for the given strike: Retry-After (or the default) doubled for
+    /// every earlier strike, up to `RATE_LIMIT_MAX_SECS` unless Tidal asked
+    /// for longer. Pure function, unit tested.
+    pub(crate) fn rate_limit_pause_secs(retry_after: Option<&str>, strike: u32) -> u64 {
+        let base = Self::retry_after_secs(retry_after);
+        let doubled = base.saturating_mul(1u64 << strike.saturating_sub(1).min(16));
+        doubled.min(Self::RATE_LIMIT_MAX_SECS.max(base))
+    }
+
+    /// Strikes against an account that is resting after recent 429s; 0 once
+    /// it has gone `RATE_LIMIT_FORGIVE_SECS` without one. Selection puts
+    /// such accounts after the others, so their pause is not followed by
+    /// another burst straight away.
+    pub(crate) fn rate_limit_heat(account: &AccountState, now: i64) -> u32 {
+        let until = account.rate_limited_until.load(Ordering::Relaxed);
+        if until <= 0 || now - until > Self::RATE_LIMIT_FORGIVE_SECS {
+            return 0;
+        }
+        account.rate_limit_strikes.load(Ordering::Relaxed)
+    }
+
     pub(crate) async fn pause_account(account: &AccountState, retry_after: Option<&str>) -> u64 {
         let now = Utc::now().timestamp();
-        let seconds = Self::retry_after_secs(retry_after);
+        let previous_until = account.rate_limited_until.load(Ordering::Relaxed);
+        let strike = if now < previous_until {
+            // Requests already in flight when the pause began are the same
+            // burst, not a new strike.
+            account.rate_limit_strikes.load(Ordering::Relaxed).max(1)
+        } else if previous_until > 0 && now - previous_until <= Self::RATE_LIMIT_FORGIVE_SECS {
+            account.rate_limit_strikes.fetch_add(1, Ordering::Relaxed) + 1
+        } else {
+            account.rate_limit_strikes.store(1, Ordering::Relaxed);
+            1
+        };
+        let seconds = Self::rate_limit_pause_secs(retry_after, strike);
         let until = now.saturating_add(i64::try_from(seconds).unwrap_or(i64::MAX));
         account.rate_limited_until.fetch_max(until, Ordering::Relaxed);
         // The deadline is absolute, so a restart keeps the remaining pause
@@ -1209,9 +1254,10 @@ impl AccountManager {
         }
 
         // Order: confirmed FULL first for playback (unchecked next, recent
-        // PREVIEW last), then fewest requests in flight, then the least
-        // recently used once recent errors are counted in.
-        let mut scored: Vec<(u8, usize, i64, usize)> = Vec::with_capacity(eligible.len());
+        // PREVIEW last), then fewest requests in flight, then accounts
+        // without recent 429s, then the least recently used once recent
+        // errors are counted in.
+        let mut scored: Vec<(u8, usize, u32, i64, usize)> = Vec::with_capacity(eligible.len());
         for i in eligible {
             let account = &accounts[i];
             let tier = match kind {
@@ -1223,15 +1269,15 @@ impl AccountManager {
                 account.last_pick_ms.load(Ordering::Relaxed),
                 account.recent_error_rate(),
             );
-            scored.push((tier, account.pool_inflight(), last_use, i));
+            scored.push((tier, account.pool_inflight(), Self::rate_limit_heat(account, now), last_use, i));
         }
         // Rotate before the stable sort so exact ties take turns instead of
         // always starting at creation index 0.
         let seq = self.rr_seq.fetch_add(1, Ordering::Relaxed);
         let rot = (seq as usize) % scored.len();
         scored.rotate_left(rot);
-        scored.sort_by_key(|&(tier, busy, last_use, _)| (tier, busy, last_use));
-        Ok(Some(Self::lease_kind(&accounts[scored[0].3], kind, rest_ms)))
+        scored.sort_by_key(|&(tier, busy, heat, last_use, _)| (tier, busy, heat, last_use));
+        Ok(Some(Self::lease_kind(&accounts[scored[0].4], kind, rest_ms)))
     }
 
     pub async fn select_account_excluding(
@@ -1341,8 +1387,10 @@ impl AccountManager {
             return CatalogClaim::Unavailable;
         }
         let start = (self.catalog_rr.fetch_add(1, Ordering::Relaxed) % catalog.len() as u64) as usize;
-        for offset in 0..catalog.len() {
-            let account = catalog[(start + offset) % catalog.len()];
+        catalog.rotate_left(start);
+        // Round-robin among the accounts without recent 429s first.
+        catalog.sort_by_key(|account| Self::rate_limit_heat(account, now));
+        for account in catalog {
             if account.try_claim_catalog_slot(limit) {
                 Self::note_selection(account);
                 return CatalogClaim::Slot(CatalogSlot(account.clone()));
@@ -3037,6 +3085,75 @@ mod tests {
         let third = am.lease_account_for(&[], LeaseKind::Playback, rules(1, 300)).await.unwrap();
         assert_eq!(third.account().id, rested);
         assert!(started.elapsed() >= std::time::Duration::from_millis(150));
+    }
+
+    #[test]
+    fn repeated_rate_limits_double_the_pause_up_to_the_cap() {
+        assert_eq!(AccountManager::rate_limit_pause_secs(None, 1), 30);
+        assert_eq!(AccountManager::rate_limit_pause_secs(None, 2), 60);
+        assert_eq!(AccountManager::rate_limit_pause_secs(None, 4), 240);
+        assert_eq!(AccountManager::rate_limit_pause_secs(None, 9), 900);
+        assert_eq!(AccountManager::rate_limit_pause_secs(Some("10"), 3), 40);
+        // A longer Retry-After than the cap is still honoured.
+        assert_eq!(AccountManager::rate_limit_pause_secs(Some("3600"), 2), 3600);
+    }
+
+    #[tokio::test]
+    async fn strikes_grow_while_hot_and_reset_after_a_quiet_spell() {
+        use chrono::Utc;
+        let am = AccountManager::new(None, SwitchingWeights::default());
+        let account = am
+            .add_account("a".into(), "c".into(), "s".into(), "rt".into(), None)
+            .await
+            .unwrap();
+        let now = Utc::now().timestamp();
+        assert!(AccountManager::pause_account(&account, None).await >= 29);
+        // Another 429 from the same burst, while paused, is not a new strike.
+        AccountManager::pause_account(&account, None).await;
+        assert_eq!(account.rate_limit_strikes.load(Ordering::Relaxed), 1);
+
+        // The pause ended a minute ago: the next 429 doubles it.
+        account.rate_limited_until.store(now - 60, Ordering::Relaxed);
+        assert!(AccountManager::pause_account(&account, None).await >= 59);
+        assert_eq!(account.rate_limit_strikes.load(Ordering::Relaxed), 2);
+
+        // Quiet for longer than the forgive window: back to strike 1.
+        account
+            .rate_limited_until
+            .store(now - AccountManager::RATE_LIMIT_FORGIVE_SECS - 1, Ordering::Relaxed);
+        assert_eq!(AccountManager::rate_limit_heat(&account, now), 0);
+        let seconds = AccountManager::pause_account(&account, None).await;
+        assert!((29..=30).contains(&seconds), "got {seconds}s");
+        assert_eq!(account.rate_limit_strikes.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn accounts_with_recent_429s_go_after_the_others() {
+        use super::LeaseKind;
+        use chrono::Utc;
+        let am = AccountManager::new(None, SwitchingWeights::default());
+        let hot = am
+            .add_account("hot".into(), "c".into(), "s".into(), "rt-hot".into(), None)
+            .await
+            .unwrap();
+        let cool = am
+            .add_account("cool".into(), "c".into(), "s".into(), "rt-cool".into(), None)
+            .await
+            .unwrap();
+        // The hot account's pause is over and it is the least recently used.
+        AccountManager::pause_account(&hot, None).await;
+        hot.rate_limited_until
+            .store(Utc::now().timestamp() - 1, Ordering::Relaxed);
+        cool.last_pick_ms
+            .store(Utc::now().timestamp_millis(), Ordering::Relaxed);
+        for _ in 0..3 {
+            assert_eq!(am.select_account().await.unwrap().id, cool.id);
+        }
+        // With the cool account busy, the hot one still serves.
+        let busy = am.lease_account_for(&[], LeaseKind::Playback, rules(1, 0)).await.unwrap();
+        assert_eq!(busy.account().id, cool.id);
+        let overflow = am.lease_account_for(&[], LeaseKind::Playback, rules(1, 0)).await.unwrap();
+        assert_eq!(overflow.account().id, hot.id);
     }
 
     #[tokio::test]

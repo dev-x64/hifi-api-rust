@@ -25,23 +25,43 @@ pub struct TidalClient {
     catalog_rate_limited_until: AtomicI64,
 }
 
-/// A 429 may use one other account. A second 429 is returned to the caller
-/// instead of walking the whole pool.
-fn schedule_rate_limit_fallback(
-    account_try: usize,
-    account_id: &str,
-    error: AppError,
-    first_rate_limit_try: &mut Option<usize>,
-    failed_ids: &mut Vec<String>,
-    last_error: &mut Option<AppError>,
-) -> Result<(), AppError> {
-    if first_rate_limit_try.is_some() {
-        return Err(error);
+/// Other accounts one request may try after Tidal rate limits it. One more
+/// 429 is returned to the caller instead of walking the whole pool.
+pub(crate) const RATE_LIMIT_FALLBACKS: usize = 2;
+
+/// The 429s one request has met while failing over.
+#[derive(Default)]
+pub(crate) struct RateLimitFallback {
+    first_try: Option<usize>,
+    hits: usize,
+}
+
+impl RateLimitFallback {
+    /// Record a 429 from `account_id` and schedule another account, or
+    /// return the error once the fallbacks are used up.
+    pub(crate) fn schedule(
+        &mut self,
+        account_try: usize,
+        account_id: &str,
+        error: AppError,
+        failed_ids: &mut Vec<String>,
+        last_error: &mut Option<AppError>,
+    ) -> Result<(), AppError> {
+        self.hits += 1;
+        if self.hits > RATE_LIMIT_FALLBACKS {
+            return Err(error);
+        }
+        self.first_try.get_or_insert(account_try);
+        failed_ids.push(account_id.to_string());
+        *last_error = Some(error);
+        Ok(())
     }
-    *first_rate_limit_try = Some(account_try);
-    failed_ids.push(account_id.to_string());
-    *last_error = Some(error);
-    Ok(())
+
+    /// After the first 429 only `RATE_LIMIT_FALLBACKS` more accounts are
+    /// tried, whatever they answer.
+    pub(crate) fn exhausted(&self, account_try: usize) -> bool {
+        self.first_try.is_some_and(|first| account_try > first + RATE_LIMIT_FALLBACKS)
+    }
 }
 
 impl TidalClient {
@@ -165,12 +185,12 @@ impl TidalClient {
         let max_account_attempts = std::cmp::max(1, account_count)
             .min(account_limit.unwrap_or(usize::MAX));
         let mut last_account_error: Option<AppError> = None;
-        let mut first_rate_limit_try: Option<usize> = None;
+        let mut rate_limits = RateLimitFallback::default();
         let mut preferred_cooldown_consumed = false;
 
         for account_try in 0..max_account_attempts {
             if preferred_cooldown_consumed && account_try > 0
-                || first_rate_limit_try.is_some_and(|first| account_try > first + 1)
+                || rate_limits.exhausted(account_try)
             {
                 break;
             }
@@ -179,8 +199,13 @@ impl TidalClient {
                 match preferred_account.clone() {
                     Some(a) => {
                         if let Some(seconds) = AccountManager::rate_limit_remaining(&a) {
-                            failed_ids.push(a.id.clone());
-                            first_rate_limit_try = Some(account_try);
+                            rate_limits.schedule(
+                                account_try,
+                                &a.id,
+                                AppError::RateLimited(seconds),
+                                &mut failed_ids,
+                                &mut last_account_error,
+                            )?;
                             preferred_cooldown_consumed = true;
                             match self.lease_pool_account(&failed_ids, kind).await {
                                 Ok(alternative) => alternative,
@@ -224,11 +249,10 @@ impl TidalClient {
                 let token = match self.token_manager.get_token(&account, &http).await {
                     Ok(t) => t,
                     Err(e @ AppError::RateLimited(_)) => {
-                        schedule_rate_limit_fallback(
+                        rate_limits.schedule(
                             account_try,
                             &account.id,
                             e,
-                            &mut first_rate_limit_try,
                             &mut failed_ids,
                             &mut last_account_error,
                         )?;
@@ -252,11 +276,10 @@ impl TidalClient {
                 // A refresh may have moved this account when the optional
                 // rotate-on-refresh setting is enabled.
                 if let Some(seconds) = AccountManager::rate_limit_remaining(&account) {
-                    schedule_rate_limit_fallback(
+                    rate_limits.schedule(
                         account_try,
                         &account.id,
                         AppError::RateLimited(seconds),
-                        &mut first_rate_limit_try,
                         &mut failed_ids,
                         &mut last_account_error,
                     )?;
@@ -301,8 +324,8 @@ impl TidalClient {
                                 match self.token_manager.refresh_after_unauthorized(&account, &http, &token).await {
                                     Ok(_) => continue,
                                     Err(e @ AppError::RateLimited(_)) => {
-                                        schedule_rate_limit_fallback(
-                                            account_try, &account.id, e, &mut first_rate_limit_try,
+                                        rate_limits.schedule(
+                                            account_try, &account.id, e,
                                             &mut failed_ids, &mut last_account_error,
                                         )?;
                                         break;
@@ -336,11 +359,10 @@ impl TidalClient {
                             .mark_account_error(&account.id, "Tidal HTTP 429")
                             .await;
                         tracing::warn!(account = %account.label, seconds, "Tidal rate limit: pausing account");
-                        schedule_rate_limit_fallback(
+                        rate_limits.schedule(
                             account_try,
                             &account.id,
                             AppError::RateLimited(seconds),
-                            &mut first_rate_limit_try,
                             &mut failed_ids,
                             &mut last_account_error,
                         )?;
@@ -418,7 +440,7 @@ impl TidalClient {
                 if is_preview {
                     previewed.push(account.clone());
                     failed_ids.push(account.id.clone());
-                    last_account_error = Some(AppError::ServiceUnavailable(format!(
+                    last_account_error = Some(AppError::PreviewOnly(format!(
                         "Preview only for track: account {} cannot provide FULL (subscription required)",
                         account.id
                     )));
@@ -665,8 +687,8 @@ impl TidalClient {
         // Without a playback pool there is nowhere for the overflow to go:
         // shed it instead of reporting every account as down.
         if catalog_busy && self.account_manager.playback_count().await == 0 {
-            return Err(AppError::ServiceUnavailableRetry(
-                "Catalog accounts are at their concurrent request limit".into(),
+            return Err(AppError::AccountsBusy(
+                crate::error::CATALOG_BUSY.into(),
                 1,
             ));
         }
@@ -924,7 +946,7 @@ impl TidalClient {
                     if error.is_connect() || error.is_timeout() {
                         self.proxy_manager.note_failure_for(&account.id).await;
                     }
-                    return Err(AppError::ServiceUnavailable(format!("Network error reaching Tidal: {error}")));
+                    return Err(AppError::BadGateway(format!("Network error reaching Tidal: {error}")));
                 }
                 Err(_) => {
                     self.proxy_manager.note_failure_for(&account.id).await;
@@ -1540,7 +1562,7 @@ mod rate_limit_tests {
     }
 
     #[tokio::test]
-    async fn second_429_stops_before_third_account() {
+    async fn third_429_stops_before_fourth_account() {
         let hits = Arc::new(AtomicUsize::new(0));
         let calls = hits.clone();
         let app = Router::new().route(
@@ -1559,12 +1581,12 @@ mod rate_limit_tests {
         let url = format!("http://{}/track", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-        let (client, manager) = client_with_accounts(3).await;
+        let (client, manager) = client_with_accounts(4).await;
 
         let result = client.make_request(&url, None).await;
         server.abort();
         assert!(matches!(result, Err(AppError::RateLimited(1..=120))));
-        assert_eq!(hits.load(Ordering::Relaxed), 2);
+        assert_eq!(hits.load(Ordering::Relaxed), 3);
         assert_eq!(
             manager
                 .list_accounts()
@@ -1572,7 +1594,7 @@ mod rate_limit_tests {
                 .iter()
                 .filter(|a| AccountManager::rate_limit_remaining(a).is_some())
                 .count(),
-            2,
+            3,
         );
     }
 

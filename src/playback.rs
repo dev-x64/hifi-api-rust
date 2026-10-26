@@ -28,7 +28,7 @@ use crate::routes::track::TrackManifestsParams;
 const JOB_TTL_SECS: i64 = 300;
 
 /// Backpressure: cap queued (pending, unpolled-or-live) jobs at
-/// POOL × this. Beyond it dispatch returns 503 + Retry-After instead of
+/// POOL × this. Beyond it dispatch returns 429 + Retry-After instead of
 /// growing the queue. Factor 1 keeps the queue near-zero: every request
 /// either runs instantly on a free slot, waits at most ~one op behind,
 /// or is shed for immediate retry — never parked thousands deep.
@@ -313,7 +313,7 @@ impl PlaybackQueue {
     /// Run immediately when a slot is free, else enqueue as a pollable job.
     /// Immediate errors propagate as normal HTTP errors (upstream parity:
     /// only saturated-pool requests become 202 jobs). Past the queue cap
-    /// the request is shed with 503 + Retry-After instead of queueing
+    /// the request is shed with 429 + Retry-After instead of queueing
     /// forever behind a backlog nobody will wait out.
     pub async fn dispatch(&self, state: &AppState, op: PlaybackOp) -> Result<Response, AppError> {
         self.prune().await;
@@ -357,9 +357,10 @@ impl PlaybackQueue {
                 .filter(|j| j.state == JobState::Pending)
                 .count();
             if Self::over_capacity(pending, pool) {
-                return Err(AppError::ServiceUnavailableRetry(
+                return Err(AppError::AccountsBusy(
                     format!(
-                        "Playback queue full ({}/{}); retry shortly",
+                        "{} ({}/{}); retry shortly",
+                        crate::error::QUEUE_FULL,
                         pending,
                         pool.max(1).saturating_mul(MAX_QUEUE_FACTOR)
                     ),
@@ -598,18 +599,21 @@ impl Default for PlaybackQueue {
 }
 
 fn app_error_parts(e: &AppError) -> (u16, String) {
-    match e {
-        AppError::NotFound(d) => (404, d.clone()),
-        AppError::BadRequest(d) => (400, d.clone()),
-        AppError::Unauthorized(d) => (401, d.clone()),
-        AppError::UpstreamError(s, d) => (s.as_u16(), d.clone()),
-        AppError::RateLimited(_) => (429, "Tidal rate limited the account".into()),
-        AppError::Timeout => (429, "Upstream timeout".into()),
-        AppError::ServiceUnavailable(d) => (503, d.clone()),
-        AppError::ServiceUnavailableRetry(d, _) => (503, d.clone()),
-        AppError::AccountsBusy(d, _) => (429, d.clone()),
-        AppError::Internal(d) => (500, d.clone()),
-    }
+    let detail = match e {
+        AppError::RateLimited(_) => "Tidal rate limited the account".into(),
+        AppError::Timeout => "Upstream timeout".into(),
+        AppError::NotFound(d)
+        | AppError::BadRequest(d)
+        | AppError::Unauthorized(d)
+        | AppError::UpstreamError(_, d)
+        | AppError::BadGateway(d)
+        | AppError::PreviewOnly(d)
+        | AppError::ServiceUnavailable(d)
+        | AppError::ServiceUnavailableRetry(d, _)
+        | AppError::AccountsBusy(d, _)
+        | AppError::Internal(d) => d.clone(),
+    };
+    (e.status().as_u16(), detail)
 }
 
 fn job_result_response(result: &JobResult) -> Response {

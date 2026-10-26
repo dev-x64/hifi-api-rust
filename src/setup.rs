@@ -11,6 +11,13 @@ use crate::error::AppError;
 pub(crate) const AUTH_CLIENT_ID: &str = "fX2JxdmntZWK0ixT";
 pub(crate) const AUTH_CLIENT_SECRET: &str =
     "1Nm5AfDAjxrgJFJbKNWLeAyKGVGmINuXPPLHVXAvxAg=";
+/// Accounts signed in through the admin panel are stored under this client,
+/// as upstream hifi-api does: it plays hundreds of tracks an hour where the
+/// built-in client gets 429 after a few.
+pub(crate) const REQUEST_CLIENT_ID: &str = "lw3vR6GE1vtNBsjv";
+/// Used only while no pool account on REQUEST_CLIENT_ID has its own secret.
+pub(crate) const REQUEST_CLIENT_SECRET: &str =
+    "Y8tIpqKJxs9BEIwYr0I9bSbMWDsogXJx9LaN3mCHwD4=";
 
 pub(crate) fn issued_token_expires_at(expires_in: i64) -> i64 {
     let expires_in = expires_in.max(60);

@@ -168,7 +168,7 @@ pub(crate) async fn fetch_track_playback(
             .pointer("/data/previewReason")
             .and_then(|v| v.as_str())
             .unwrap_or("FULL_REQUIRES_SUBSCRIPTION");
-        return Err(AppError::ServiceUnavailable(format!(
+        return Err(AppError::PreviewOnly(format!(
             "Preview only ({}): track {} requires subscription or is not available as FULL in this region",
             reason, id
         )));
@@ -438,7 +438,7 @@ fn use_high_for_dash(atmos: Option<&str>, high_default: bool) -> bool {
 
 fn high_audio_uri(result: &Value) -> Result<String, AppError> {
     if result.pointer("/data/audioQuality").and_then(Value::as_str) != Some("HIGH") {
-        return Err(AppError::ServiceUnavailable(
+        return Err(AppError::BadGateway(
             "Tidal did not return HIGH audio".into(),
         ));
     }
@@ -541,7 +541,7 @@ pub(crate) async fn fetch_manifest_inner(
             .pointer("/data/data/attributes/previewReason")
             .and_then(|v| v.as_str())
             .unwrap_or("PREVIEW");
-        return Err(AppError::ServiceUnavailable(format!(
+        return Err(AppError::PreviewOnly(format!(
             "Preview only ({}): track {} not available as FULL",
             reason, track_id
         )));
@@ -896,7 +896,7 @@ pub(crate) async fn fetch_dash_uri(
             .pointer("/data/data/attributes/previewReason")
             .and_then(|v| v.as_str())
             .unwrap_or("PREVIEW");
-        return Err(AppError::ServiceUnavailable(format!(
+        return Err(AppError::PreviewOnly(format!(
             "Preview only ({}): track {} not available as FULL",
             reason, track_id
         )));

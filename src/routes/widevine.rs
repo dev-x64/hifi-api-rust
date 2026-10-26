@@ -41,12 +41,12 @@ pub(crate) async fn fetch_widevine_license(
     let pool = state.account_manager.playback_count().await.max(1);
     let mut failed_ids: Vec<String> = Vec::new();
     let mut last_err: Option<AppError> = None;
-    let mut first_rate_limit_try: Option<usize> = None;
+    let mut rate_limits = crate::tidal_client::RateLimitFallback::default();
     // Last retryable HTTP response, returned when every account fails over.
     let mut last_http: Option<(u16, String, Vec<u8>)> = None;
 
     for account_try in 0..pool {
-        if first_rate_limit_try.is_some_and(|first| account_try > first + 1) {
+        if rate_limits.exhausted(account_try) {
             break;
         }
         let lease = match state
@@ -70,12 +70,7 @@ pub(crate) async fn fetch_widevine_license(
         let token = match state.token_manager.get_token(&account, &hc).await {
             Ok(t) => t,
             Err(e @ AppError::RateLimited(_)) => {
-                if first_rate_limit_try.is_some() {
-                    return Err(e);
-                }
-                first_rate_limit_try = Some(account_try);
-                failed_ids.push(account.id.clone());
-                last_err = Some(e);
+                rate_limits.schedule(account_try, &account.id, e, &mut failed_ids, &mut last_err)?;
                 continue;
             }
             Err(e) => {
@@ -90,12 +85,7 @@ pub(crate) async fn fetch_widevine_license(
         };
         if let Some(seconds) = AccountManager::rate_limit_remaining(&account) {
             let e = AppError::RateLimited(seconds);
-            if first_rate_limit_try.is_some() {
-                return Err(e);
-            }
-            first_rate_limit_try = Some(account_try);
-            failed_ids.push(account.id.clone());
-            last_err = Some(e);
+            rate_limits.schedule(account_try, &account.id, e, &mut failed_ids, &mut last_err)?;
             continue;
         }
         hc = state.tidal_client.working_client_for(&account.id).await?;
@@ -158,12 +148,7 @@ pub(crate) async fn fetch_widevine_license(
                 }
                 Err(e) => {
                     if matches!(e, AppError::RateLimited(_)) {
-                        if first_rate_limit_try.is_some() {
-                            return Err(e);
-                        }
-                        first_rate_limit_try = Some(account_try);
-                        failed_ids.push(account.id.clone());
-                        last_err = Some(e);
+                        rate_limits.schedule(account_try, &account.id, e, &mut failed_ids, &mut last_err)?;
                         continue;
                     }
                     state
@@ -196,12 +181,7 @@ pub(crate) async fn fetch_widevine_license(
                 .mark_account_error(&account.id, "Tidal HTTP 429")
                 .await;
             let e = AppError::RateLimited(seconds);
-            if first_rate_limit_try.is_some() {
-                return Err(e);
-            }
-            first_rate_limit_try = Some(account_try);
-            failed_ids.push(account.id.clone());
-            last_err = Some(e);
+            rate_limits.schedule(account_try, &account.id, e, &mut failed_ids, &mut last_err)?;
             continue;
         }
         if state.config.dev_mode {

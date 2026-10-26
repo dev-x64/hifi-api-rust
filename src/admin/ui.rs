@@ -620,7 +620,7 @@ button:focus-visible,input:focus-visible,select:focus-visible { outline:2px soli
 </div></main>
 </div>
 
-<div id="addAccountOverlay" class="overlay" data-mode="oauth" onclick="if(event.target===this)closeAddAccount()"><form class="modal add-account" style="width:560px" onsubmit="event.preventDefault();submitAddAccount()"><div class="section-head"><div><div class="page-kicker">Новый аккаунт</div><h3 style="margin:0">Подключить Tidal</h3></div><button type="button" class="btn icon-btn btn-quiet" onclick="closeAddAccount()" aria-label="Закрыть">×</button></div><div class="mode-tabs" role="tablist"><button type="button" role="tab" id="addModeOauth" aria-selected="true" onclick="setAddAccountMode('oauth')">OAuth</button><button type="button" role="tab" id="addModeManual" aria-selected="false" onclick="setAddAccountMode('manual')">Вручную</button></div><p class="form-copy oauth-only">Откроется ссылка Tidal: войдите и подтвердите доступ — аккаунт добавится сам.</p><p class="form-copy manual-only">Для уже готовых credentials: Client ID, Client Secret и Refresh Token.</p><div class="form-group oauth-only" style="margin:0 0 14px"><label for="new-oauth-client">Клиент Tidal</label><select id="new-oauth-client" class="select" style="width:100%;padding:10px 12px" data-no-i18n></select><p class="form-copy" style="margin:6px 0 0">Вход идёт через встроенный клиент, а аккаунт сохраняется под выбранным: сервер сразу обновляет токен этим клиентом и сообщит, если Tidal не позволит. Secret берётся у аккаунтов пула на сервере.</p></div><div class="form-row"><div class="form-group"><label for="new-label">Название · необязательно</label><input type="text" id="new-label" placeholder="Основной аккаунт"></div><div class="form-group manual-only"><label for="new-user-id">User ID · необязательно</label><input type="text" id="new-user-id" placeholder="208921067"></div></div><div class="manual-only"><div class="form-group" style="margin:0 0 14px"><label for="new-client-id">Client ID</label><input type="text" id="new-client-id" placeholder="client_id"></div><div class="form-row"><div class="form-group"><label for="new-client-secret">Client Secret</label><div class="pw-wrap"><input type="password" id="new-client-secret" placeholder="client_secret"><button type="button" class="pw-toggle" onclick="togglePw('new-client-secret', this)">&#128065;</button></div></div><div class="form-group"><label for="new-refresh-token">Refresh Token</label><div class="pw-wrap"><input type="password" id="new-refresh-token" placeholder="refresh_token"><button type="button" class="pw-toggle" onclick="togglePw('new-refresh-token', this)">&#128065;</button></div></div></div></div><label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted);margin:16px 0"><input type="checkbox" id="new-catalog"> Только каталог — без воспроизведения</label><div class="modal-actions"><button type="submit" class="btn btn-primary oauth-only" id="oauthBtn">Подключить через OAuth</button><button type="submit" class="btn btn-primary manual-only">Добавить аккаунт</button><button type="button" class="btn" onclick="closeAddAccount()">Отмена</button></div></form></div>
+<div id="addAccountOverlay" class="overlay" data-mode="oauth" onclick="if(event.target===this)closeAddAccount()"><form class="modal add-account" style="width:560px" onsubmit="event.preventDefault();submitAddAccount()"><div class="section-head"><div><div class="page-kicker">Новый аккаунт</div><h3 style="margin:0">Подключить Tidal</h3></div><button type="button" class="btn icon-btn btn-quiet" onclick="closeAddAccount()" aria-label="Закрыть">×</button></div><div class="mode-tabs" role="tablist"><button type="button" role="tab" id="addModeOauth" aria-selected="true" onclick="setAddAccountMode('oauth')">OAuth</button><button type="button" role="tab" id="addModeManual" aria-selected="false" onclick="setAddAccountMode('manual')">Вручную</button></div><p class="form-copy oauth-only">Откроется ссылка Tidal: войдите и подтвердите доступ — аккаунт добавится сам.</p><p class="form-copy manual-only">Для уже готовых credentials: Client ID, Client Secret и Refresh Token.</p><div class="form-row"><div class="form-group"><label for="new-label">Название · необязательно</label><input type="text" id="new-label" placeholder="Основной аккаунт"></div><div class="form-group manual-only"><label for="new-user-id">User ID · необязательно</label><input type="text" id="new-user-id" placeholder="208921067"></div></div><div class="manual-only"><div class="form-group" style="margin:0 0 14px"><label for="new-client-id">Client ID</label><input type="text" id="new-client-id" placeholder="client_id"></div><div class="form-row"><div class="form-group"><label for="new-client-secret">Client Secret</label><div class="pw-wrap"><input type="password" id="new-client-secret" placeholder="client_secret"><button type="button" class="pw-toggle" onclick="togglePw('new-client-secret', this)">&#128065;</button></div></div><div class="form-group"><label for="new-refresh-token">Refresh Token</label><div class="pw-wrap"><input type="password" id="new-refresh-token" placeholder="refresh_token"><button type="button" class="pw-toggle" onclick="togglePw('new-refresh-token', this)">&#128065;</button></div></div></div></div><label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted);margin:16px 0"><input type="checkbox" id="new-catalog"> Только каталог — без воспроизведения</label><div class="modal-actions"><button type="submit" class="btn btn-primary oauth-only" id="oauthBtn">Подключить через OAuth</button><button type="submit" class="btn btn-primary manual-only">Добавить аккаунт</button><button type="button" class="btn" onclick="closeAddAccount()">Отмена</button></div></form></div>
 <div id="oauthOverlay" class="overlay" onclick="if(event.target===this)closeOAuth()">
 <div class="modal">
 <h3>Авторизация через Tidal</h3>
@@ -772,22 +772,7 @@ function submitAddAccount() {
     else startOAuth();
 }
 
-// Clients a sign-in can be issued for: the built-in one and every client the pool already uses.
-function fillOAuthClients() {
-    var counts = {};
-    counts[BUILTIN_CLIENT_ID] = 0;
-    (window._accounts || []).forEach(function(a) { if (a.client_id) counts[a.client_id] = (counts[a.client_id] || 0) + 1; });
-    var select = document.getElementById('new-oauth-client');
-    var current = select.value || (counts[PREFERRED_CLIENT_ID] ? PREFERRED_CLIENT_ID : BUILTIN_CLIENT_ID);
-    select.innerHTML = Object.keys(counts).map(function(id) {
-        return '<option value="' + esc(id) + '">' + esc(id) + (id === BUILTIN_CLIENT_ID ? ' · ' + esc(tr('встроенный')) : '') +
-            ' · ' + esc(tr('аккаунтов:')) + ' ' + counts[id] + '</option>';
-    }).join('');
-    select.value = counts[current] !== undefined ? current : BUILTIN_CLIENT_ID;
-}
-
 function openAddAccount(mode) {
-    fillOAuthClients();
     setAddAccountMode(mode);
     document.getElementById('addAccountOverlay').classList.add('open');
     setTimeout(function(){ document.getElementById(mode === 'manual' ? 'new-client-id' : 'new-label').focus(); }, 100);
@@ -1244,12 +1229,6 @@ function subscriptionEndDate(body) {
     return isNaN(daysLeft) ? '' : new Date(Date.now() + daysLeft * 86400000).toLocaleDateString(adminLanguage === 'ru' ? 'ru-RU' : 'en-GB', {day:'numeric', month:'short', year:'numeric'});
 }
 
-// The server's built-in sign-in client (crate::setup::AUTH_CLIENT_ID).
-var BUILTIN_CLIENT_ID = 'fX2JxdmntZWK0ixT';
-// Accounts on this client play hundreds of tracks an hour where the built-in
-// one gets 429 after a few, so new accounts go to it when the pool has it.
-var PREFERRED_CLIENT_ID = 'lw3vR6GE1vtNBsjv';
-
 // Everyday actions stay on the card; the rest, and in the list all of them, sit in the ⋯ menu.
 function accountMenu(account, everyday) {
     var id = '\'' + account.id + '\'';
@@ -1511,20 +1490,23 @@ function overviewGroup(title, columns, cards) {
     return '<section><h2 class="ov-title">' + esc(title) + '</h2><div class="ov-grid ov-' + columns + '">' + cards + '</div></section>';
 }
 
+// The headline is what the pool can do now: accounts that play FULL tracks and
+// catalog accounts that only serve search and metadata. Rows say why the rest are out.
 function accountsCard(stats) {
     var counts = stats.account_readiness || {};
     var playback = stats.playback_readiness || {}, catalog = stats.catalog_readiness || {};
-    var total = counts.total || 0, ready = counts.ready || 0, disabled = counts.disabled || 0;
-    var rows = [metricRow('Готовы к FULL', esc(metricNumber(playback.ready)), 'status-ok')];
-    if (catalog.total > 0) rows.push(metricRow('Готовы к каталогу', esc(metricNumber(catalog.ready)), 'status-ok'));
+    var total = counts.total || 0, disabled = counts.disabled || 0;
+    var value = esc(metricNumber(playback.ready)) + ' <span class="metric-unit">FULL</span>';
+    if (catalog.total > 0) value += ' <span class="metric-unit">·</span> ' + esc(metricNumber(catalog.ready)) + ' <span class="metric-unit">только каталог</span>';
+    var rows = [];
     [['no_token', 'Без токена'], ['needs_check', 'Нужна FULL-проверка'], ['preview_only', 'Только PREVIEW'], ['rate_limited', 'Пауза 429']].forEach(function(item) {
         if (counts[item[0]]) rows.push(metricRow(item[1], esc(metricNumber(counts[item[0]])), 'status-warn'));
     });
     if (disabled) rows.push(metricRow('Отключены', esc(metricNumber(disabled)), 'status-err'));
-    return metricCard('Готовые аккаунты', esc(metricNumber(ready)) + ' <span class="metric-unit"><span>из</span> ' + esc(metricNumber(total)) + '</span>',
+    return metricCard('Аккаунты в работе', value,
         total === 0 ? ['Добавьте аккаунт для доступа к Tidal.'] : [],
-        'Готовность: действующий токен и отсутствие паузы 429. Для воспроизведения нужна подтверждённая FULL-проверка не старше 8 часов.',
-        total > 0 ? metricRows(rows) : '');
+        'FULL — аккаунты воспроизведения с действующим токеном, без паузы 429 и с FULL-проверкой не старше 8 часов: играют треки и помогают с поиском. Только каталог — аккаунты для поиска и метаданных с действующим токеном. Ниже — почему остальные сейчас не работают.',
+        metricRows(rows));
 }
 
 function playbackCard(pb, readiness) {
@@ -2221,8 +2203,7 @@ function startOAuth() {
     document.getElementById('oauthOverlay').classList.add('open');
     var lbl = (document.getElementById('new-label').value || '').trim();
     var catalog = document.getElementById('new-catalog').checked;
-    var clientId = document.getElementById('new-oauth-client').value || null;
-    fetch('/admin/setup', { method: 'POST', headers: headers(), body: JSON.stringify({ label: lbl || null, catalog: catalog, client_id: clientId }) })
+    fetch('/admin/setup', { method: 'POST', headers: headers(), body: JSON.stringify({ label: lbl || null, catalog: catalog }) })
         .then(async function(r) {
             if (!r.ok) throw new Error('HTTP ' + r.status + ' ' + (await r.text()).slice(0, 300));
             return r.json();
@@ -2690,12 +2671,12 @@ function errorCause(q) {
     if (has('different track')) return ['Подмена трека', 'Tidal отдал аудио под другим id, и это другая запись: ISRC или длительность не совпали либо сравнить их не удалось — причина в скобках в тексте ответа. Замену с тем же ISRC и длительностью сервис отдаёт без ошибки.'];
     if (has('preview only')) return ['Только превью', 'Tidal отдал 30-секундный фрагмент: трек недоступен целиком в регионе аккаунтов или у них нет нужной подписки.'];
     if (has('did not return high')) return ['Нет качества HIGH', 'Tidal не отдал трек в AAC 320 kbps, выбранном как формат по умолчанию.'];
-    if (has('queue full')) return ['Очередь переполнена', 'Запросов воспроизведения больше, чем успевает обслужить пул аккаунтов. Клиенту стоит повторить через несколько секунд.'];
+    if (has('queue full')) return ['Очередь переполнена', 'Запросов воспроизведения больше, чем успевает обслужить пул аккаунтов. Клиент получил 429 с Retry-After и может повторить через несколько секунд.'];
     if (has('playback accounts are busy')) return ['Все аккаунты заняты', 'Каждый аккаунт воспроизведения уже отправлял в Tidal максимум одновременных запросов или отдыхал между запросами, и ни один не освободился за отведённое время. Клиент получил 429 с Retry-After и может повторить; если это повторяется, увеличьте лимит или паузу уменьшите, либо добавьте аккаунты.'];
-    if (has('concurrent request limit')) return ['Каталог занят', 'Все аккаунты каталога заняты, а пула воспроизведения для переноса нагрузки нет.'];
+    if (has('concurrent request limit')) return ['Каталог занят', 'Все аккаунты каталога заняты, а пула воспроизведения для переноса нагрузки нет. Клиент получил 429 с Retry-After.'];
     if (has('all accounts') || has('no tidal credentials')) return ['Нет рабочих аккаунтов', 'Ни один аккаунт не смог выполнить запрос: аккаунтов нет, токены истекли, аккаунты отключены или все попытки завершились ошибкой.'];
     if (has('proxy')) return ['Прокси недоступен', 'Нет рабочего прокси для запроса к Tidal, а прямое соединение отключено.'];
-    if (has('connection error')) return ['Нет связи с Tidal', 'Не удалось установить соединение с Tidal — проблема сети или прокси.'];
+    if (has('connection error') || has('network error')) return ['Нет связи с Tidal', 'Не удалось установить соединение с Tidal — проблема сети или прокси. Клиент получил 502.'];
     if (has('timeout')) return ['Таймаут', 'Запрос не уложился в отведённое время: Tidal или очередь отвечали слишком долго. Клиент может повторить.'];
     if (has('cancelled')) return ['Запрос отменён', 'Клиент отменил запрос воспроизведения до его завершения.'];
     if (q.status === 429) return ['Лимит Tidal', 'Tidal ограничил частоту запросов; аккаунт поставлен на паузу до конца ограничения.'];

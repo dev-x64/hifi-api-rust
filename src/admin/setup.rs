@@ -10,7 +10,9 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::error::AppError;
-use crate::setup::{AUTH_CLIENT_ID, AUTH_CLIENT_SECRET, issued_token_expires_at};
+use crate::setup::{
+    AUTH_CLIENT_ID, AUTH_CLIENT_SECRET, REQUEST_CLIENT_ID, REQUEST_CLIENT_SECRET, issued_token_expires_at,
+};
 use crate::AppState;
 
 #[derive(Clone)]
@@ -103,26 +105,19 @@ pub struct StartSetupRequest {
     /// When true, the new account serves metadata only.
     #[serde(default)]
     pub catalog: bool,
-    /// Client the account is stored under: one already used by an account
-    /// in the pool. None or the built-in client keeps the built-in TV client.
-    #[serde(default)]
-    pub client_id: Option<String>,
 }
 
-/// The client a new account is stored under. Another pool client reuses the
-/// secret stored with its accounts, so the secret never reaches the browser.
-async fn setup_client(state: &AppState, requested: Option<&str>) -> Result<(String, String), AppError> {
-    let Some(id) = requested.map(str::trim).filter(|id| !id.is_empty() && *id != AUTH_CLIENT_ID) else {
-        return Ok((AUTH_CLIENT_ID.to_string(), AUTH_CLIENT_SECRET.to_string()));
-    };
+/// New accounts are stored under REQUEST_CLIENT_ID, with the secret the pool's
+/// accounts on it already refresh with, so the stored pairing is a proven one.
+async fn setup_client_secret(state: &AppState) -> String {
     state
         .account_manager
         .list_accounts()
         .await
         .into_iter()
-        .find(|account| account.client_id == id)
-        .map(|account| (account.client_id.clone(), account.client_secret.clone()))
-        .ok_or_else(|| AppError::BadRequest(format!("No account in the pool uses client {id}")))
+        .find(|account| account.client_id == REQUEST_CLIENT_ID && !account.client_secret.is_empty())
+        .map(|account| account.client_secret.clone())
+        .unwrap_or_else(|| REQUEST_CLIENT_SECRET.to_string())
 }
 
 pub async fn start_setup(
@@ -130,8 +125,7 @@ pub async fn start_setup(
     body: Option<Json<StartSetupRequest>>,
 ) -> Result<Json<Value>, AppError> {
     let catalog = body.as_ref().is_some_and(|b| b.catalog);
-    let (client_id, client_secret) =
-        setup_client(&state, body.as_ref().and_then(|b| b.client_id.as_deref())).await?;
+    let client_secret = setup_client_secret(&state).await;
     let custom_label = body
         .and_then(|b| b.label.clone())
         .map(|s| s.trim().to_string())
@@ -283,31 +277,28 @@ pub async fn start_setup(
             let label = live_label
                 .or(custom_label.clone())
                 .unwrap_or_else(|| format!("Tidal Account ({})", user_id));
-            let (access_token, refresh_token, expires_in) = if client_id == AUTH_CLIENT_ID {
-                (token_resp.access_token, token_resp.refresh_token, token_resp.expires_in)
-            } else {
-                // The original setup signed in with the TV client and kept the
-                // account under another one; refreshing with that client now
-                // proves the pairing works before the account is stored.
-                match refresh_with_client(&hc, &client_id, &client_secret, &token_resp.refresh_token).await {
+            // Sign-in uses the TV client and the account is kept under
+            // REQUEST_CLIENT_ID; refreshing with it now proves the pairing
+            // works before the account is stored.
+            let (access_token, refresh_token, expires_in) =
+                match refresh_with_client(&hc, REQUEST_CLIENT_ID, &client_secret, &token_resp.refresh_token).await {
                     Ok((access, refresh, expires_in)) => (access, refresh.unwrap_or(token_resp.refresh_token), expires_in),
                     Err(e) => {
                         let mut sessions = sessions.write().await;
                         if let Some(session) = sessions.get_mut(&sid) {
                             session.status = SetupStatus::Error(format!(
-                                "Signed in, but client {client_id} could not refresh the token: {e}. Try the built-in client."
+                                "Signed in, but client {REQUEST_CLIENT_ID} could not refresh the token: {e}"
                             ));
                         }
                         break;
                     }
-                }
-            };
+                };
             let expires_at = issued_token_expires_at(expires_in);
 
             match am
                 .add_account(
                     label.clone(),
-                    client_id.clone(),
+                    REQUEST_CLIENT_ID.to_string(),
                     client_secret.clone(),
                     refresh_token.clone(),
                     Some(user_id.clone()),

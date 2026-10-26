@@ -48,10 +48,10 @@ pub(crate) async fn fetch_video_playback(
     let pool = state.account_manager.playback_count().await.max(1);
     let mut failed_ids: Vec<String> = Vec::new();
     let mut last_err: Option<AppError> = None;
-    let mut first_rate_limit_try: Option<usize> = None;
+    let mut rate_limits = crate::tidal_client::RateLimitFallback::default();
 
     for account_try in 0..pool {
-        if first_rate_limit_try.is_some_and(|first| account_try > first + 1) {
+        if rate_limits.exhausted(account_try) {
             break;
         }
         let lease = match state
@@ -67,12 +67,7 @@ pub(crate) async fn fetch_video_playback(
         let token = match state.token_manager.get_token(&account, &hc).await {
             Ok(t) => t,
             Err(e @ AppError::RateLimited(_)) => {
-                if first_rate_limit_try.is_some() {
-                    return Err(e);
-                }
-                first_rate_limit_try = Some(account_try);
-                failed_ids.push(account.id.clone());
-                last_err = Some(e);
+                rate_limits.schedule(account_try, &account.id, e, &mut failed_ids, &mut last_err)?;
                 continue;
             }
             Err(e) => {
@@ -123,12 +118,7 @@ pub(crate) async fn fetch_video_playback(
                                     crate::token_manager::TokenManager::reject_refreshed_token(&account, &fresh).await;
                                 }
                                 if matches!(e2, AppError::RateLimited(_)) {
-                                    if first_rate_limit_try.is_some() {
-                                        return Err(e2);
-                                    }
-                                    first_rate_limit_try = Some(account_try);
-                                    failed_ids.push(account.id.clone());
-                                    last_err = Some(e2);
+                                    rate_limits.schedule(account_try, &account.id, e2, &mut failed_ids, &mut last_err)?;
                                     continue;
                                 }
                                 state
@@ -146,12 +136,7 @@ pub(crate) async fn fetch_video_playback(
                     }
                     Err(e2) => {
                         if matches!(e2, AppError::RateLimited(_)) {
-                            if first_rate_limit_try.is_some() {
-                                return Err(e2);
-                            }
-                            first_rate_limit_try = Some(account_try);
-                            failed_ids.push(account.id.clone());
-                            last_err = Some(e2);
+                            rate_limits.schedule(account_try, &account.id, e2, &mut failed_ids, &mut last_err)?;
                             continue;
                         }
                         state
@@ -176,12 +161,7 @@ pub(crate) async fn fetch_video_playback(
                 continue;
             }
             Err(e @ AppError::RateLimited(_)) => {
-                if first_rate_limit_try.is_some() {
-                    return Err(e);
-                }
-                first_rate_limit_try = Some(account_try);
-                failed_ids.push(account.id.clone());
-                last_err = Some(e);
+                rate_limits.schedule(account_try, &account.id, e, &mut failed_ids, &mut last_err)?;
                 continue;
             }
             Err(e) => return Err(e),
