@@ -31,7 +31,7 @@ var ruToEn = {
     "без лимита": "no limit",
     "Страна": "Country",
     "Свежие ошибки": "Recent errors",
-    "Доля ошибок с учётом примерно последних 15 минут. Чем она выше, тем позже аккаунт получает следующий запрос.": "Error share weighted toward roughly the last 15 minutes. The higher it is, the later the account gets its next request.",
+    "Доля ошибок с учётом примерно последних 15 минут. Чем она выше, тем позже аккаунт получает следующий запрос. Прочерк — за это время запросов почти не было.": "Error share weighted toward roughly the last 15 minutes. The higher it is, the later the account gets its next request. A dash means there were almost no requests in that time.",
     "За час": "Last hour",
     "Запросы, начатые этим аккаунтом за последний час; лимит задаётся в настройках": "Requests this account started in the last hour; the limit is set in the settings",
     "Запросов в час на аккаунт воспроизведения": "Requests per hour per playback account",

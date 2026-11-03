@@ -1251,7 +1251,7 @@ function accountMenu(account, everyday) {
 }
 
 var ACCOUNT_ROW_HEAD = '<div class="account-row account-row-head"><span></span><span>Аккаунт</span><span class="c-access" title="Доступ к трекам">Треки</span><span>Подписка</span>' +
-    '<span class="c-country">Страна</span><span class="c-errors" title="Доля ошибок с учётом примерно последних 15 минут. Чем она выше, тем позже аккаунт получает следующий запрос.">Ошибки</span>' +
+    '<span class="c-country">Страна</span><span class="c-errors" title="Доля ошибок с учётом примерно последних 15 минут. Чем она выше, тем позже аккаунт получает следующий запрос. Прочерк — за это время запросов почти не было.">Ошибки</span>' +
     '<span class="c-hour" title="Запросы, начатые этим аккаунтом за последний час; лимит задаётся в настройках">За час</span><span class="c-token">Токен</span><span></span><span class="row-chevron"></span></div>';
 
 // When a pause ends, next to the status it explains: a 429 cooldown or the
@@ -1265,6 +1265,11 @@ function accountStatusDetail(account) {
 
 function errorRateTone(rate) {
     return rate >= 0.5 ? ' tone-status-err' : (rate >= 0.15 ? ' tone-status-warn' : '');
+}
+
+// Null means the account has had too little recent traffic for the share to mean anything.
+function recentErrorsText(rate) {
+    return rate == null ? '—' : metricNumber(rate * 100) + '%';
 }
 
 // One line per account in the list view; a click opens the full card under it.
@@ -1286,7 +1291,7 @@ function accountRow(account, number, expanded) {
         '<span class="c-access">' + accessCell + '</span>' +
         '<span data-no-i18n' + (endDate ? ' title="' + esc(tr('до') + ' ' + endDate) + '"' : '') + '>' + subscriptionShort(account) + '</span>' +
         '<span class="c-country" data-no-i18n>' + (countryFlag(account) || '<span class="row-muted">—</span>') + '</span>' +
-        '<span class="c-errors' + errorRateTone(account.recent_error_rate || 0) + '">' + metricNumber((account.recent_error_rate || 0) * 100) + '%</span>' +
+        '<span class="c-errors' + (account.recent_error_rate == null ? ' row-muted' : errorRateTone(account.recent_error_rate)) + '">' + recentErrorsText(account.recent_error_rate) + '</span>' +
         '<span class="c-hour">' + metricNumber(account.requests_last_hour) + '</span>' +
         '<span class="c-token' + (tokenValid ? '' : ' row-muted') + '">' + (tokenValid ? 'ещё ' : '') + token + '</span>' +
         accountMenu(account, true) +
@@ -2012,7 +2017,7 @@ function renderAccounts(list) {
                     '<div class="card-stats">' +
                         '<span class="card-stat" title="Обращения к этому аккаунту с запуска сервера, включая повторы для одного API-запроса">Обращений с запуска <strong>' + metricNumber(a.request_count) + '</strong></span>' +
                         '<span class="card-stat" title="Ошибки запросов и обновления токена этого аккаунта с запуска сервера">Ошибок с запуска <strong>' + metricNumber(a.error_count) + '</strong></span>' +
-                        '<span class="card-stat" title="Доля ошибок с учётом примерно последних 15 минут. Чем она выше, тем позже аккаунт получает следующий запрос.">Свежие ошибки <strong>' + metricNumber((a.recent_error_rate || 0) * 100) + '%</strong></span>' +
+                        '<span class="card-stat" title="Доля ошибок с учётом примерно последних 15 минут. Чем она выше, тем позже аккаунт получает следующий запрос. Прочерк — за это время запросов почти не было.">Свежие ошибки <strong>' + recentErrorsText(a.recent_error_rate) + '</strong></span>' +
                         '<span class="card-stat" title="Запросы, начатые этим аккаунтом за последний час; лимит задаётся в настройках">За час <strong>' + metricNumber(a.requests_last_hour) + '</strong></span>' +
                         (a.heal_next_retry > Date.now() / 1000 ? '<span class="card-stat">Повтор обновления через <strong>' + esc(uptimeDuration(a.heal_next_retry - Date.now() / 1000)) + '</strong></span>' : (a.auto_disabled ? '<span class="card-stat">Восстановление <strong>ожидает попытки</strong></span>' : '')) +
                         (a.rate_limited_until > Date.now() / 1000 ? '<span class="card-stat">Пауза 429 ещё <strong>' + esc(uptimeDuration(a.rate_limited_until - Date.now() / 1000)) + '</strong></span>' : '') +

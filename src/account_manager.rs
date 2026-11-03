@@ -39,6 +39,8 @@ impl Default for SwitchingWeights {
 pub const FULL_CHECK_MAX_AGE_SECS: i64 = 8 * 60 * 60;
 /// Recent errors fade with this half-life.
 const RECENT_HALF_LIFE_MS: f64 = 15.0 * 60.0 * 1000.0;
+/// Below this decayed request weight the error rate is stale and not reported.
+const RECENT_MIN_REQUESTS: f64 = 1.0;
 
 /// Limits a pool lease must respect; 0 turns each one off.
 #[derive(Clone, Copy, Debug, Default)]
@@ -70,12 +72,10 @@ impl RecentOutcomes {
         self.at_ms = self.at_ms.max(now_ms);
     }
 
-    fn error_rate(&self) -> f64 {
-        if self.requests < 1e-6 {
-            0.0
-        } else {
-            (self.errors / self.requests).clamp(0.0, 1.0)
-        }
+    /// None once traffic has faded: decay keeps the ratio of an idle
+    /// account frozen, so an old streak of errors would look current forever.
+    fn error_rate(&self) -> Option<f64> {
+        (self.requests >= RECENT_MIN_REQUESTS).then(|| (self.errors / self.requests).clamp(0.0, 1.0))
     }
 }
 
@@ -550,16 +550,23 @@ impl LeaseKind {
 }
 
 impl AccountState {
-    /// Share of failed requests, weighted toward the last 15 minutes.
-    pub fn recent_error_rate(&self) -> f64 {
+    /// Share of failed requests, weighted toward the last 15 minutes;
+    /// None when too little recent traffic to tell.
+    pub fn recent_error_rate(&self) -> Option<f64> {
         let now_ms = Utc::now().timestamp_millis();
         self.recent
             .lock()
-            .map(|mut recent| {
+            .ok()
+            .and_then(|mut recent| {
                 recent.decay(now_ms);
                 recent.error_rate()
             })
-            .unwrap_or(0.0)
+    }
+
+    fn reset_recent(&self) {
+        if let Ok(mut recent) = self.recent.lock() {
+            *recent = RecentOutcomes::default();
+        }
     }
 
     fn note_recent(&self, error: bool) {
@@ -1267,7 +1274,7 @@ impl AccountManager {
             let last_use = Self::effective_last_use(
                 &self.weights,
                 account.last_pick_ms.load(Ordering::Relaxed),
-                account.recent_error_rate(),
+                account.recent_error_rate().unwrap_or(0.0),
             );
             scored.push((tier, account.pool_inflight(), Self::rate_limit_heat(account, now), last_use, i));
         }
@@ -1769,6 +1776,10 @@ impl AccountManager {
             crate::token_manager::persist_token(db, account, old_refresh, rotated, token, expires_at).await?;
         }
         if let Some(rotated) = rotated { account.replace_refresh_token(rotated.into()); }
+        // Errors piled up while the token was dead say nothing about the new one.
+        let recovered = account.access_token.read().await.is_none()
+            || account.token_expires_at.load(Ordering::Relaxed) <= Utc::now().timestamp();
+        if recovered { account.reset_recent(); }
         *account.access_token.write().await = Some(token.into());
         account.token_expires_at.store(expires_at, Ordering::Relaxed);
         self.observe_uptime(account).await;
@@ -2300,11 +2311,24 @@ mod tests {
         recent.decay(1);
         recent.requests = 100.0;
         recent.errors = 100.0;
-        assert_eq!(recent.error_rate(), 1.0);
+        assert_eq!(recent.error_rate(), Some(1.0));
         // After a quiet hour four half-lives have passed; new clean traffic dominates.
         recent.decay(1 + 60 * 60 * 1000);
         recent.requests += 20.0;
-        assert!(recent.error_rate() < 0.25, "{}", recent.error_rate());
+        let rate = recent.error_rate().unwrap();
+        assert!(rate < 0.25, "{}", rate);
+    }
+
+    #[test]
+    fn recent_error_rate_goes_stale_without_traffic() {
+        let mut recent = super::RecentOutcomes::default();
+        recent.decay(1);
+        recent.requests = 3.0;
+        recent.errors = 3.0;
+        assert_eq!(recent.error_rate(), Some(1.0));
+        // Hours later the ratio is unchanged, but there is too little left to trust it.
+        recent.decay(1 + 4 * 60 * 60 * 1000);
+        assert_eq!(recent.error_rate(), None);
     }
 
     #[tokio::test]
