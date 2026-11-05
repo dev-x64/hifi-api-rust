@@ -54,6 +54,11 @@ pub struct AppSettings {
     auth_failure_disable_hours: RwLock<u32>,
     /// Requests one playback account may start within an hour. 0 = no limit.
     requests_per_hour_per_account: RwLock<u32>,
+    /// Days a track's genres are served from the SQLite genre cache before
+    /// they are fetched again. 0 = cache off.
+    genre_cache_days: RwLock<u32>,
+    /// Size cap of the genre cache file in MB; the oldest rows go first.
+    genre_cache_max_mb: RwLock<u32>,
     /// Secret: never include this in API snapshots or logs.
     discord_webhook_url: RwLock<String>,
     /// Shared cross-instance state (None = single-host mode, skip sync).
@@ -72,6 +77,8 @@ impl AppSettings {
             track_request_delay_ms: RwLock::new(0),
             auth_failure_disable_hours: RwLock::new(24),
             requests_per_hour_per_account: RwLock::new(0),
+            genre_cache_days: RwLock::new(DEFAULT_GENRE_CACHE_DAYS),
+            genre_cache_max_mb: RwLock::new(DEFAULT_GENRE_CACHE_MAX_MB),
             discord_webhook_url: RwLock::new(
                 std::env::var("DISCORD_WEBHOOK_URL").unwrap_or_default(),
             ),
@@ -102,6 +109,8 @@ impl AppSettings {
             "track_request_delay_ms": self.track_request_delay_ms(),
             "auth_failure_disable_hours": self.auth_failure_disable_hours(),
             "requests_per_hour_per_account": self.requests_per_hour_per_account(),
+            "genre_cache_days": self.genre_cache_days(),
+            "genre_cache_max_mb": self.genre_cache_max_mb(),
         })
     }
 
@@ -159,6 +168,14 @@ impl AppSettings {
             .requests_per_hour_per_account
             .read()
             .unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn genre_cache_days(&self) -> u32 {
+        *self.genre_cache_days.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn genre_cache_max_mb(&self) -> u32 {
+        *self.genre_cache_max_mb.read().unwrap_or_else(|e| e.into_inner())
     }
 
     pub fn discord_webhook_url(&self) -> String {
@@ -246,6 +263,14 @@ impl AppSettings {
                 .track_request_delay_ms
                 .write()
                 .unwrap_or_else(|e| e.into_inner()) = normalize_request_delay_ms(v);
+        }
+        if let Some(v) = first_opt_u32(updates, "genre_cache_days")? {
+            *self.genre_cache_days.write().unwrap_or_else(|e| e.into_inner()) =
+                normalize_genre_cache_days(v);
+        }
+        if let Some(v) = first_opt_u32(updates, "genre_cache_max_mb")? {
+            *self.genre_cache_max_mb.write().unwrap_or_else(|e| e.into_inner()) =
+                normalize_genre_cache_max_mb(v);
         }
         Ok(())
     }
@@ -350,6 +375,18 @@ impl AppSettings {
                         .unwrap_or_else(|e| e.into_inner()) = normalize_request_delay_ms(value);
                 }
             }
+            "genre_cache_days" => {
+                if let Ok(value) = value.parse::<u32>() {
+                    *self.genre_cache_days.write().unwrap_or_else(|e| e.into_inner()) =
+                        normalize_genre_cache_days(value);
+                }
+            }
+            "genre_cache_max_mb" => {
+                if let Ok(value) = value.parse::<u32>() {
+                    *self.genre_cache_max_mb.write().unwrap_or_else(|e| e.into_inner()) =
+                        normalize_genre_cache_max_mb(value);
+                }
+            }
             _ => {}
         }
     }
@@ -366,6 +403,8 @@ impl AppSettings {
         "track_request_delay_ms",
         "auth_failure_disable_hours",
         "requests_per_hour_per_account",
+        "genre_cache_days",
+        "genre_cache_max_mb",
     ];
 
     /// Canonical (key, value) snapshot, shared by the SQLite and Redis writers.
@@ -408,6 +447,8 @@ impl AppSettings {
                 "requests_per_hour_per_account",
                 self.requests_per_hour_per_account().to_string(),
             ),
+            ("genre_cache_days", self.genre_cache_days().to_string()),
+            ("genre_cache_max_mb", self.genre_cache_max_mb().to_string()),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v))
@@ -548,6 +589,19 @@ fn normalize_request_delay_ms(value: u32) -> u32 {
     value.min(10_000)
 }
 
+pub const DEFAULT_GENRE_CACHE_DAYS: u32 = 30;
+pub const DEFAULT_GENRE_CACHE_MAX_MB: u32 = 64;
+
+/// Up to ten years; 0 turns the cache off.
+fn normalize_genre_cache_days(value: u32) -> u32 {
+    value.min(3650)
+}
+
+/// 1 MB to 10 GB.
+fn normalize_genre_cache_max_mb(value: u32) -> u32 {
+    value.clamp(1, 10_240)
+}
+
 fn first_opt_u32(obj: &Value, key: &str) -> Result<Option<u32>, String> {
     match obj.get(key) {
         None | Some(Value::Null) => Ok(None),
@@ -657,6 +711,26 @@ mod tests {
             .unwrap();
         settings.load_from_db(&db).await;
         assert!(settings.discord_webhook_url().is_empty());
+    }
+
+    #[test]
+    fn genre_cache_defaults_to_30_days_and_64_mb_and_clamps() {
+        let settings = AppSettings::from_env();
+        assert_eq!(settings.snapshot()["genre_cache_days"], 30);
+        assert_eq!(settings.snapshot()["genre_cache_max_mb"], 64);
+        settings
+            .apply(&serde_json::json!({"genre_cache_days": 0, "genre_cache_max_mb": 0}))
+            .unwrap();
+        assert_eq!(settings.genre_cache_days(), 0);
+        assert_eq!(settings.genre_cache_max_mb(), 1);
+        settings.apply_kv("genre_cache_days", "99999");
+        settings.apply_kv("genre_cache_max_mb", "99999");
+        assert_eq!(settings.genre_cache_days(), 3650);
+        assert_eq!(settings.genre_cache_max_mb(), 10_240);
+        assert!(settings
+            .settings_entries()
+            .iter()
+            .any(|(k, v)| k == "genre_cache_max_mb" && v == "10240"));
     }
 
     #[test]

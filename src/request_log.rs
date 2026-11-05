@@ -159,7 +159,7 @@ impl Traffic {
             Some("search") => Traffic::Search,
             Some(
                 "info" | "album" | "artist" | "mix" | "playlist" | "cover" | "lyrics"
-                | "recommendations" | "topvideos",
+                | "genres" | "recommendations" | "topvideos",
             ) => Traffic::Catalog,
             _ => return Traffic::Service,
         };
@@ -774,7 +774,7 @@ mod tests {
         }
         assert_eq!(classify("/track/:id", "", false), Traffic::Playback);
         assert_eq!(classify("/track/:id", "", true), Traffic::Service);
-        for path in ["/album/similar", "/artist", "/cover", "/lyrics", "/info", "/topvideos"] {
+        for path in ["/album/similar", "/artist", "/cover", "/lyrics", "/genres", "/info", "/topvideos"] {
             assert_eq!(classify(path, "", false), Traffic::Catalog, "{path}");
         }
         for path in ["/", "/playback/requests", "/robots.txt", "/searching"] {

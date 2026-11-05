@@ -68,6 +68,9 @@ hifi.db
 hifi.db-journal
 hifi.db-shm
 hifi.db-wal
+hifi-genres.db
+hifi-genres.db-shm
+hifi-genres.db-wal
 
 # Flask stuff:
 instance/

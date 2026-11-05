@@ -14,7 +14,25 @@ pub async fn cache_stats(State(state): State<AppState>) -> Result<Json<Value>, A
         "stale": state.cache.stale.load(Ordering::Relaxed),
         "negative": state.cache.negative_hits.load(Ordering::Relaxed),
         "tracks": state.playback.cache_hits.load(Ordering::Relaxed),
+        "genres": match &state.genre_cache {
+            Some(cache) => cache.stats().await,
+            None => Value::Null,
+        },
     } })))
+}
+
+/// The genre cache lives on disk and outlasts "Clear cache" on purpose:
+/// genres do not change and refetching them costs Tidal requests.
+pub async fn genre_cache_clear(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    let cache = state
+        .genre_cache
+        .as_ref()
+        .ok_or_else(|| AppError::ServiceUnavailable("Genre cache is unavailable".into()))?;
+    let removed = cache
+        .clear()
+        .await
+        .map_err(|e| AppError::Internal(format!("Genre cache clear failed: {e}")))?;
+    Ok(Json(json!({"message": "Genre cache cleared", "removed": removed})))
 }
 
 pub async fn cache_clear(State(state): State<AppState>) -> Result<Json<Value>, AppError> {

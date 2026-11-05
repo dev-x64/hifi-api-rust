@@ -6,6 +6,7 @@ mod autoheal;
 mod config;
 mod db;
 mod error;
+mod genre_cache;
 mod cache;
 mod notifier;
 mod playback;
@@ -54,6 +55,8 @@ pub struct AppState {
     pub scanner_guard: Arc<scanner_guard::ScannerGuard>,
     pub admin_auth_guard: Arc<admin::auth_guard::AdminAuthGuard>,
     pub db: Option<sqlx::SqlitePool>,
+    /// Track genres on disk (memory without a database); None if it failed to open.
+    pub genre_cache: Option<Arc<genre_cache::GenreCache>>,
     pub setup_sessions: admin::setup::Sessions,
     /// Shared cross-instance state (None = single-host mode, skip sync).
     pub upstash: Option<Arc<UpstashStore>>,
@@ -278,6 +281,18 @@ async fn main() {
         settings.clone(),
     ));
 
+    let genre_file = genre_cache::file_for(&config.database_url);
+    let genre_cache = match genre_cache::GenreCache::open(genre_file.as_deref(), settings.clone()).await {
+        Ok(cache) => {
+            tracing::info!("Genre cache at {}", genre_file.as_deref().unwrap_or("memory"));
+            Some(cache)
+        }
+        Err(e) => {
+            tracing::warn!("Genre cache unavailable, genres are fetched every time: {}", e);
+            None
+        }
+    };
+
     let state = AppState {
         config: config.clone(),
         account_manager: account_manager.clone(),
@@ -293,6 +308,7 @@ async fn main() {
         scanner_guard: Arc::new(scanner_guard::ScannerGuard::new()),
         admin_auth_guard: Arc::new(admin::auth_guard::AdminAuthGuard::new()),
         db,
+        genre_cache,
         setup_sessions: admin::setup::new_session_store(),
         upstash: upstash.clone(),
     };
@@ -337,6 +353,7 @@ async fn main() {
         .route("/playlist/", get(routes::playlist::get_playlist))
         .route("/cover/", get(routes::cover::get_cover))
         .route("/lyrics/", get(routes::lyrics::get_lyrics))
+        .route("/genres/", get(routes::genres::get_genres))
         .route("/topvideos/", get(routes::topvideos::get_top_videos))
         .route("/video/", get(routes::video::get_video))
         .route("/health", get(routes::health::health))
@@ -504,6 +521,7 @@ fn admin_api(state: AppState) -> Router<AppState> {    Router::new()
         .route("/alerts/report", post(crate::admin::alerts::alert_report))
         .route("/cache", get(crate::admin::cache::cache_stats))
         .route("/cache/clear", post(crate::admin::cache::cache_clear))
+        .route("/cache/genres/clear", post(crate::admin::cache::genre_cache_clear))
         .route("/playback/clear", post(crate::playback::clear_playback_queue))
         .route("/keys", get(crate::admin::api_keys::list_keys).post(crate::admin::api_keys::create_key))
         .route("/keys/{id}", delete(crate::admin::api_keys::remove_key))

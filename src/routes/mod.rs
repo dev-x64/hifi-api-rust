@@ -1,6 +1,7 @@
 pub mod album;
 pub mod artist;
 pub mod cover;
+pub mod genres;
 pub mod health;
 pub mod info;
 pub mod lyrics;
