@@ -587,7 +587,7 @@ button:focus-visible,input:focus-visible,select:focus-visible { outline:2px soli
   <section id="view-accounts" class="view">
     <div id="readyHistory" class="ready-history" data-no-i18n></div>
     <div class="section-head"><div><h2>Tidal-аккаунты</h2><p>Управляйте пулом воспроизведения, токенами и каталогом.</p></div><div class="section-actions"><button class="btn" onclick="testAll()" id="testAllBtn">Проверить все</button><button class="btn btn-primary" onclick="openAddAccount()">+ Добавить</button></div></div>
-    <div class="toolbar"><div class="search-wrap"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg><input id="accountSearch" type="search" placeholder="Найти аккаунт..." oninput="filterAccounts(this.value)"></div><div class="toolbar-stats"><div class="account-summary" id="accountCount"><span class="status-dot status-ok"></span><span>Готовы сейчас</span><strong>— / —</strong></div><div class="toolbar-stats" id="subscriptionSummary" data-no-i18n></div></div></div>
+    <div class="toolbar"><div class="search-wrap"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg><input id="accountSearch" type="search" placeholder="Найти аккаунт..." oninput="filterAccounts(this.value)"></div><div class="toolbar-stats"><div class="account-summary" id="accountCount"><span class="status-dot status-ok"></span><span>Готовы сейчас</span><strong>— / —</strong></div><div class="toolbar-stats" id="poolSummary" data-no-i18n></div><div class="toolbar-stats" id="subscriptionSummary" data-no-i18n></div></div></div>
     <div class="account-filters" id="accountFiltersBar"><div class="mode-tabs" role="tablist" id="accountFilters" data-no-i18n></div><div class="account-view-controls"><label class="account-sort">Сортировка <select id="accountSort" class="select" onchange="setAccountSort(this.value)"><option value="added">Порядок добавления</option><option value="name">По названию</option><option value="expiry">По сроку подписки</option><option value="problems">Сначала проблемные</option><option value="errors">По свежим ошибкам</option><option value="load">По нагрузке за час</option></select></label><div class="mode-tabs" role="tablist" id="accountViewTabs"><button type="button" role="tab" data-view="list" onclick="setAccountView('list')">Списком</button><button type="button" role="tab" data-view="cards" onclick="setAccountView('cards')">Карточками</button></div></div></div>
     <div id="accounts-container" class="accounts-grid"></div>
     <p class="helper" id="accountFilterEmpty" style="display:none">Ни один аккаунт не подходит под фильтр и поиск.</p>
@@ -1263,6 +1263,42 @@ function accountStatusDetail(account) {
     if (account.rate_limited_until > now) return tr('ещё ' + uptimeDuration(account.rate_limited_until - now));
     if (account.heal_next_retry > now) return tr('повтор через') + ' ' + uptimeDuration(account.heal_next_retry - now);
     return quotaDetail(account);
+}
+
+// How many playback accounts can serve tracks and search right now. Both go
+// through the playback pool; search additionally skips accounts whose daily
+// Tidal search quota is used up.
+function poolCounts(accounts) {
+    var now = Date.now() / 1000;
+    var counts = {total: 0, tracks: 0, search: 0, searchReset: 0};
+    (accounts || []).forEach(function(a) {
+        if (a.is_catalog || !a.is_active) return;
+        counts.total++;
+        var availability = a.availability || {};
+        if (!availability.metadata_ready) return;
+        if (availability.state !== 'preview_only') counts.tracks++;
+        var searchUntil = (a.quotas || {}).search || 0;
+        if (searchUntil > now) {
+            if (!counts.searchReset || searchUntil < counts.searchReset) counts.searchReset = searchUntil;
+        } else {
+            counts.search++;
+        }
+    });
+    return counts;
+}
+
+function poolSummary(accounts) {
+    var c = poolCounts(accounts);
+    if (!c.total) return '';
+    function pill(label, value, title, extra) {
+        var tone = value === 0 ? ' warn' : '';
+        return '<div class="account-summary' + tone + '" title="' + esc(tr(title)) + '"><span class="status-dot ' + (value > 0 ? 'status-ok' : 'status-warn') + '"></span><span>' + tr(label) + '</span><strong>' +
+            metricNumber(value) + ' <span>' + tr('из') + '</span> ' + metricNumber(c.total) + '</strong>' + (extra || '') + '</div>';
+    }
+    var reset = c.searchReset && c.search < c.total
+        ? '<span>· ' + tr('сброс через') + ' ' + uptimeDuration(c.searchReset - Date.now() / 1000) + '</span>' : '';
+    return pill('Треки', c.tracks, 'Включённые аккаунты воспроизведения с действующим токеном, не на паузе и не PREVIEW') +
+        pill('Поиск', c.search, 'Из них те, у кого не исчерпан дневной лимит поиска Tidal', reset);
 }
 
 var QUOTA_SCOPE_NAMES = {search:'поиск', tracks:'треки', albums:'альбомы', artists:'артисты', playlists:'плейлисты',
@@ -1959,6 +1995,7 @@ async function fetchData() {
         var liveAccounts = Number(stats.live_accounts || 0);
         var totalAccounts = Number(stats.total_accounts || accounts.accounts.length || 0);
         document.getElementById('accountCount').innerHTML = '<span class="status-dot ' + (liveAccounts > 0 ? 'status-ok' : (totalAccounts > 0 ? 'status-warn' : 'status-unknown')) + '"></span><span>Готовы сейчас</span><strong>' + metricNumber(liveAccounts) + ' <span>из</span> ' + metricNumber(totalAccounts) + '</strong>';
+        document.getElementById('poolSummary').innerHTML = poolSummary(accounts.accounts);
         return true;
     } catch(e) {
         document.getElementById('error').textContent = 'Failed: ' + e.message;
