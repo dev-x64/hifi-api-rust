@@ -156,7 +156,19 @@ impl TidalClient {
         exclude_ids: &[String],
         kind: LeaseKind,
     ) -> Result<PlaybackLease, AppError> {
+        self.lease_pool_account_for(exclude_ids, kind, None).await
+    }
+
+    /// Like `lease_pool_account`, also skipping accounts whose Tidal quota
+    /// for this endpoint `scope` is used up.
+    async fn lease_pool_account_for(
+        &self,
+        exclude_ids: &[String],
+        kind: LeaseKind,
+        scope: Option<&'static str>,
+    ) -> Result<PlaybackLease, AppError> {
         let rules = LeaseRules {
+            scope,
             concurrency: self.settings.track_concurrency_per_account(),
             rest_ms: self.settings.track_request_delay_ms(),
             per_hour: self.settings.requests_per_hour_per_account(),
@@ -187,6 +199,7 @@ impl TidalClient {
         let mut last_account_error: Option<AppError> = None;
         let mut rate_limits = RateLimitFallback::default();
         let mut preferred_cooldown_consumed = false;
+        let scope = AccountManager::quota_scope(url);
 
         for account_try in 0..max_account_attempts {
             if preferred_cooldown_consumed && account_try > 0
@@ -198,7 +211,10 @@ impl TidalClient {
             let lease = if account_try == 0 && failed_ids.is_empty() {
                 match preferred_account.clone() {
                     Some(a) => {
-                        if let Some(seconds) = AccountManager::rate_limit_remaining(&a) {
+                        let blocked = AccountManager::rate_limit_remaining(&a).or_else(|| {
+                            scope.and_then(|s| a.quota_remaining(s, Utc::now().timestamp()))
+                        });
+                        if let Some(seconds) = blocked {
                             rate_limits.schedule(
                                 account_try,
                                 &a.id,
@@ -207,7 +223,7 @@ impl TidalClient {
                                 &mut last_account_error,
                             )?;
                             preferred_cooldown_consumed = true;
-                            match self.lease_pool_account(&failed_ids, kind).await {
+                            match self.lease_pool_account_for(&failed_ids, kind, scope).await {
                                 Ok(alternative) => alternative,
                                 Err(_) => return Err(AppError::RateLimited(seconds)),
                             }
@@ -218,7 +234,7 @@ impl TidalClient {
                         }
                     }
                     None => match self
-                        .lease_pool_account(&failed_ids, kind)
+                        .lease_pool_account_for(&failed_ids, kind, scope)
                         .await
                     {
                         Ok(a) => a,
@@ -230,7 +246,7 @@ impl TidalClient {
                 }
             } else {
                 match self
-                    .lease_pool_account(&failed_ids, kind)
+                    .lease_pool_account_for(&failed_ids, kind, scope)
                     .await
                 {
                     Ok(a) => a,
@@ -349,12 +365,21 @@ impl TidalClient {
                         return Err(AppError::NotFound("Resource not found".into()));
                     }
                     429 => {
-                        let seconds = AccountManager::pause_account(
+                        let (seconds, quota) = AccountManager::note_429(
                             &account,
+                            url,
                             resp.headers()
                                 .get(reqwest::header::RETRY_AFTER)
                                 .and_then(|v| v.to_str().ok()),
                         ).await;
+                        if quota {
+                            // Only this endpoint is exhausted on this account;
+                            // others may still have quota left, and this one
+                            // is skipped for it from now on.
+                            failed_ids.push(account.id.clone());
+                            last_account_error = Some(AppError::RateLimited(seconds));
+                            break;
+                        }
                         self.account_manager
                             .mark_account_error(&account.id, "Tidal HTTP 429")
                             .await;
@@ -477,10 +502,12 @@ impl TidalClient {
         account_id: &str,
     ) -> Result<Value, AppError> {
         let account = self.account_manager.get_account_by_id(account_id).await;
-        if let Some(seconds) = account
-            .as_deref()
-            .and_then(AccountManager::rate_limit_remaining)
-        {
+        if let Some(seconds) = account.as_deref().and_then(|a| {
+            AccountManager::rate_limit_remaining(a).or_else(|| {
+                AccountManager::quota_scope(url)
+                    .and_then(|s| a.quota_remaining(s, Utc::now().timestamp()))
+            })
+        }) {
             return Err(AppError::RateLimited(seconds));
         }
         let http = self.working_client_for(account_id).await?;
@@ -517,12 +544,13 @@ impl TidalClient {
 
         if status.as_u16() == 429 {
             let seconds = match account {
-                Some(ref account) => AccountManager::pause_account(
+                Some(ref account) => AccountManager::note_429(
                     account,
+                    url,
                     resp.headers()
                         .get(reqwest::header::RETRY_AFTER)
                         .and_then(|v| v.to_str().ok()),
-                ).await,
+                ).await.0,
                 None => AccountManager::retry_after_secs(
                     resp.headers()
                         .get(reqwest::header::RETRY_AFTER)
@@ -783,6 +811,16 @@ impl TidalClient {
         if let Some(seconds) = AccountManager::rate_limit_remaining(account) {
             return Err(AppError::RateLimited(seconds));
         }
+        // An endpoint quota is not a rate limit: let catalog_get fall back to
+        // the pool, where accounts with quota left can still answer.
+        if let Some(seconds) = AccountManager::quota_scope(url)
+            .and_then(|s| account.quota_remaining(s, Utc::now().timestamp()))
+        {
+            return Err(AppError::ServiceUnavailableRetry(
+                "Catalog account quota for this endpoint is used up".into(),
+                seconds,
+            ));
+        }
         let mut http = self.working_client_for(&account.id).await?;
         let mut token = self.token_manager.get_token(account, &http).await?;
         let requests_per_account = self.settings.catalog_requests_per_account().max(1);
@@ -818,12 +856,19 @@ impl TidalClient {
             };
             let status = resp.status();
             if status.as_u16() == 429 {
-                let seconds = AccountManager::pause_account(
+                let (seconds, quota) = AccountManager::note_429(
                     account,
+                    url,
                     resp.headers()
                         .get(reqwest::header::RETRY_AFTER)
                         .and_then(|v| v.to_str().ok()),
                 ).await;
+                if quota {
+                    return Err(AppError::ServiceUnavailableRetry(
+                        "Catalog account quota for this endpoint is used up".into(),
+                        seconds,
+                    ));
+                }
                 self.account_manager
                     .mark_account_error(&account.id, "Tidal HTTP 429")
                     .await;
@@ -971,8 +1016,9 @@ impl TidalClient {
                         .await?;
                 }
                 429 => {
-                    let seconds = AccountManager::pause_account(
+                    let (seconds, _) = AccountManager::note_429(
                         account,
+                        url,
                         response
                             .headers()
                             .get(reqwest::header::RETRY_AFTER)
@@ -1129,8 +1175,9 @@ impl TidalClient {
                         );
                     }
                     429 => {
-                        AccountManager::pause_account(
+                        AccountManager::note_429(
                             account,
+                            &url,
                             response
                                 .headers()
                                 .get(reqwest::header::RETRY_AFTER)
@@ -1489,6 +1536,57 @@ mod rate_limit_tests {
         let result = client.make_request(&url, None).await;
         server.abort();
         assert!(matches!(result, Err(AppError::NotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn search_quota_skips_only_search_and_moves_to_the_next_account() {
+        use axum::http::HeaderMap;
+        let search_hits = Arc::new(AtomicUsize::new(0));
+        let calls = search_hits.clone();
+        let midnight = (chrono::Utc::now() + chrono::Duration::hours(5)).to_rfc2822();
+        let app = Router::new()
+            .route(
+                "/v1/search/tracks",
+                get(move || {
+                    let calls = calls.clone();
+                    let midnight = midnight.clone();
+                    async move {
+                        // The first account's daily search quota is gone.
+                        if calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                            let mut headers = HeaderMap::new();
+                            headers.insert("retry-after", midnight.parse().unwrap());
+                            (StatusCode::TOO_MANY_REQUESTS, headers, "{}")
+                        } else {
+                            (StatusCode::OK, HeaderMap::new(), "{\"items\":[]}")
+                        }
+                    }
+                }),
+            )
+            .route("/v1/tracks/1", get(|| async { (StatusCode::OK, "{\"title\":\"ok\"}") }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (client, manager) = client_with_accounts(2).await;
+
+        let search = format!("{base}/v1/search/tracks");
+        assert!(client.make_request(&search, None).await.is_ok());
+        assert_eq!(search_hits.load(Ordering::Relaxed), 2);
+        let accounts = manager.list_accounts().await;
+        let now = chrono::Utc::now().timestamp();
+        let exhausted: Vec<_> = accounts
+            .iter()
+            .filter(|a| a.quota_remaining("search", now).is_some())
+            .collect();
+        assert_eq!(exhausted.len(), 1);
+        // No account is paused: tracks keep using both.
+        assert!(accounts.iter().all(|a| AccountManager::rate_limit_remaining(a).is_none()));
+        // The exhausted account is skipped for search without asking Tidal.
+        for _ in 0..3 {
+            assert!(client.make_request(&search, None).await.is_ok());
+        }
+        assert_eq!(search_hits.load(Ordering::Relaxed), 5);
+        assert!(client.make_request(&format!("{base}/v1/tracks/1"), None).await.is_ok());
+        server.abort();
     }
 
     #[tokio::test]

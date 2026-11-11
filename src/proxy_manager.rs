@@ -252,7 +252,11 @@ impl ProxyManager {
     pub fn normalize_proxies(proxies: Vec<String>, enabled: bool) -> Result<Vec<String>, AppError> {
         let mut normalized = Vec::new();
         for raw in proxies {
-            let url = raw.trim();
+            // A pasted address can carry a tab or space inside it ("http://\t1.2.3.4");
+            // the URL parser tolerates it but the stored value then never
+            // matches saved assignments, so drop all whitespace.
+            let url: String = raw.chars().filter(|c| !c.is_whitespace()).collect();
+            let url = url.as_str();
             if url.is_empty() { continue; }
             reqwest::Proxy::all(url).map_err(|e| AppError::BadRequest(format!("Invalid proxy URL: {e}")))?;
             if !normalized.iter().any(|existing| existing == url) {
@@ -939,6 +943,20 @@ fn mask_proxy(url: &str) -> String {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn proxy_urls_lose_inner_whitespace_and_duplicates() {
+        let normalized = ProxyManager::normalize_proxies(
+            vec![
+                "http://\t1.2.3.4:8099".into(),
+                " http://1.2.3.4:8099 ".into(),
+                "\t".into(),
+            ],
+            true,
+        )
+        .unwrap();
+        assert_eq!(normalized, vec!["http://1.2.3.4:8099".to_string()]);
+    }
 
     async fn fake_proxy() -> (String, tokio::task::JoinHandle<()>) {
         fake_proxy_answering("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await

@@ -47,6 +47,9 @@ const RECENT_MIN_REQUESTS: f64 = 1.0;
 pub struct LeaseRules {
     /// Requests one account sends to Tidal at once.
     pub concurrency: u32,
+    /// Endpoint scope of the request (see `AccountManager::quota_scope`):
+    /// accounts whose Tidal quota for it is used up are skipped.
+    pub scope: Option<&'static str>,
     /// Milliseconds an account rests after each request.
     pub rest_ms: u32,
     /// Requests one account may start within an hour.
@@ -155,6 +158,10 @@ pub struct AccountState {
     /// 429 pauses in a row, each starting within `RATE_LIMIT_FORGIVE_SECS`
     /// of the previous one's end. Every strike doubles the next pause.
     pub rate_limit_strikes: AtomicU32,
+    /// Endpoint quotas Tidal reported with a long Retry-After (e.g. a daily
+    /// search allowance until midnight): (scope, until). Only requests in that
+    /// scope skip the account; everything else keeps using it.
+    pub quotas: std::sync::Mutex<Vec<(&'static str, i64)>>,
     /// Result of the latest automatic or manual FULL/PREVIEW probe; informational only.
     pub premium_status: RwLock<String>,
     pub premium_checked_at: AtomicI64,
@@ -222,6 +229,7 @@ impl AccountState {
             hour_picks: std::sync::Mutex::new(std::collections::VecDeque::new()),
             rate_limited_until: AtomicI64::new(0),
             rate_limit_strikes: AtomicU32::new(0),
+            quotas: std::sync::Mutex::new(Vec::new()),
             premium_status: RwLock::new("unknown".to_string()),
             premium_checked_at: AtomicI64::new(0),
             preview_streak: AtomicI64::new(0),
@@ -249,6 +257,9 @@ impl AccountState {
             *dst = src.clone();
         }
         if let (Ok(src), Ok(mut dst)) = (old.hour_picks.lock(), new.hour_picks.lock()) {
+            *dst = src.clone();
+        }
+        if let (Ok(src), Ok(mut dst)) = (old.quotas.lock(), new.quotas.lock()) {
             *dst = src.clone();
         }
         new.rate_limited_until.store(
@@ -607,6 +618,31 @@ impl AccountState {
         }
     }
 
+    /// Seconds left on Tidal's quota for `scope` on this account, if used up.
+    pub fn quota_remaining(&self, scope: &str, now: i64) -> Option<u64> {
+        let quotas = self.quotas.lock().ok()?;
+        quotas
+            .iter()
+            .find(|(s, until)| *s == scope && *until > now)
+            .map(|(_, until)| (until - now) as u64)
+    }
+
+    /// Active quotas as (scope, until), for the admin panel.
+    pub fn active_quotas(&self, now: i64) -> Vec<(&'static str, i64)> {
+        self.quotas
+            .lock()
+            .map(|q| q.iter().copied().filter(|(_, until)| *until > now).collect())
+            .unwrap_or_default()
+    }
+
+    fn set_quota(&self, scope: &'static str, until: i64) {
+        if let Ok(mut quotas) = self.quotas.lock() {
+            let now = Utc::now().timestamp();
+            quotas.retain(|(s, u)| *s != scope && *u > now);
+            quotas.push((scope, until));
+        }
+    }
+
     /// Seconds until this account can try a token refresh again, when it has
     /// no usable token and its last refresh failed. Such an account cannot
     /// serve anything, so selection skips it instead of failing over from it.
@@ -740,6 +776,11 @@ impl AccountManager {
     const DEFAULT_RATE_LIMIT_SECS: u64 = 30;
     /// Longest pause that repeated strikes build up to.
     const RATE_LIMIT_MAX_SECS: u64 = 15 * 60;
+    /// Hard ceiling even when Tidal's Retry-After asks for longer: a date such
+    /// as "until midnight" once froze every account (and its token refresh)
+    /// for half a day. After this the account is tried again and, if Tidal
+    /// still refuses, simply paused once more.
+    const RATE_LIMIT_HARD_CAP_SECS: u64 = 60 * 60;
     /// A 429 this long after the previous pause ended starts again at strike 1.
     const RATE_LIMIT_FORGIVE_SECS: i64 = 30 * 60;
 
@@ -767,11 +808,92 @@ impl AccountManager {
 
     /// Pause for the given strike: Retry-After (or the default) doubled for
     /// every earlier strike, up to `RATE_LIMIT_MAX_SECS` unless Tidal asked
-    /// for longer. Pure function, unit tested.
+    /// for longer, and never past `RATE_LIMIT_HARD_CAP_SECS`. Pure function,
+    /// unit tested.
     pub(crate) fn rate_limit_pause_secs(retry_after: Option<&str>, strike: u32) -> u64 {
         let base = Self::retry_after_secs(retry_after);
         let doubled = base.saturating_mul(1u64 << strike.saturating_sub(1).min(16));
-        doubled.min(Self::RATE_LIMIT_MAX_SECS.max(base))
+        doubled
+            .min(Self::RATE_LIMIT_MAX_SECS.max(base))
+            .min(Self::RATE_LIMIT_HARD_CAP_SECS)
+    }
+
+    /// Longest endpoint quota honoured; Tidal's daily ones end within a day.
+    const QUOTA_MAX_SECS: u64 = 24 * 60 * 60;
+
+    /// Which family of Tidal endpoints a URL belongs to, for quotas Tidal
+    /// applies per endpoint rather than per account. `None` when unknown.
+    pub fn quota_scope(url: &str) -> Option<&'static str> {
+        let parsed = reqwest::Url::parse(url).ok()?;
+        let mut segments = parsed.path_segments()?.filter(|s| !s.is_empty());
+        let mut first = segments.next()?;
+        if matches!(first, "v1" | "v2") {
+            first = segments.next()?;
+        }
+        Some(match first {
+            "search" | "searchResults" | "searchSuggestions" => "search",
+            "tracks" | "trackManifests" => "tracks",
+            "albums" => "albums",
+            "artists" => "artists",
+            "playlists" => "playlists",
+            "mixes" => "mixes",
+            "videos" => "videos",
+            "pages" => "pages",
+            "users" | "userCollections" => "users",
+            "lyrics" => "lyrics",
+            _ => return None,
+        })
+    }
+
+    /// Handle a 429 from Tidal for `url`. A Retry-After longer than
+    /// `RATE_LIMIT_MAX_SECS` is a quota on that endpoint (Tidal answers
+    /// search with "until midnight" while tracks keep playing): only that
+    /// scope skips the account, the account itself stays in service.
+    /// Anything else is an ordinary rate limit that pauses the account.
+    /// Returns the seconds to report and whether it was an endpoint quota.
+    pub(crate) async fn note_429(
+        account: &AccountState,
+        url: &str,
+        retry_after: Option<&str>,
+    ) -> (u64, bool) {
+        let requested = Self::retry_after_secs(retry_after);
+        if requested > Self::RATE_LIMIT_MAX_SECS {
+            if let Some(scope) = Self::quota_scope(url) {
+                let seconds = requested.min(Self::QUOTA_MAX_SECS);
+                let until = Utc::now()
+                    .timestamp()
+                    .saturating_add(i64::try_from(seconds).unwrap_or(i64::MAX));
+                account.set_quota(scope, until);
+                tracing::warn!(
+                    account = %account.label,
+                    scope,
+                    retry_after = retry_after.unwrap_or(""),
+                    seconds,
+                    "Tidal quota used up for this endpoint; account stays in service for others"
+                );
+                return (seconds, true);
+            }
+        }
+        (Self::pause_account(account, retry_after).await, false)
+    }
+
+    /// Manual override from the admin panel: forget the pause, its strikes
+    /// and any endpoint quotas.
+    pub(crate) async fn clear_pause(account: &AccountState) {
+        account.rate_limited_until.store(0, Ordering::Relaxed);
+        account.rate_limit_strikes.store(0, Ordering::Relaxed);
+        if let Ok(mut quotas) = account.quotas.lock() {
+            quotas.clear();
+        }
+        if let Some(db) = account.db.get() {
+            if let Err(error) = sqlx::query("UPDATE accounts SET rate_limited_until = 0 WHERE id = ?")
+                .bind(&account.id)
+                .execute(db)
+                .await
+            {
+                tracing::warn!(account = %account.id, "Could not persist cleared pause: {error}");
+            }
+        }
     }
 
     /// Strikes against an account that is resting after recent 429s; 0 once
@@ -800,6 +922,16 @@ impl AccountManager {
             1
         };
         let seconds = Self::rate_limit_pause_secs(retry_after, strike);
+        let requested = Self::retry_after_secs(retry_after);
+        if requested > Self::RATE_LIMIT_MAX_SECS {
+            tracing::warn!(
+                account = %account.label,
+                retry_after = retry_after.unwrap_or(""),
+                requested_secs = requested,
+                pause_secs = seconds,
+                "Tidal asked for an unusually long 429 pause"
+            );
+        }
         let until = now.saturating_add(i64::try_from(seconds).unwrap_or(i64::MAX));
         account.rate_limited_until.fetch_max(until, Ordering::Relaxed);
         // The deadline is absolute, so a restart keeps the remaining pause
@@ -1144,7 +1276,7 @@ impl AccountManager {
         kind: LeaseKind,
         rules: LeaseRules,
     ) -> Result<PlaybackLease, AppError> {
-        let LeaseRules { concurrency: limit, rest_ms, per_hour } = rules;
+        let LeaseRules { concurrency: limit, rest_ms, per_hour, .. } = rules;
         let deadline = tokio::time::Instant::now() + LEASE_WAIT;
         loop {
             // Register before checking, so a release in between is not missed.
@@ -1191,7 +1323,7 @@ impl AccountManager {
         kind: LeaseKind,
         rules: LeaseRules,
     ) -> Result<Option<PlaybackLease>, AppError> {
-        let LeaseRules { concurrency: limit, rest_ms, per_hour } = rules;
+        let LeaseRules { concurrency: limit, rest_ms, per_hour, scope } = rules;
         // Serialize select+account: without this, N concurrent requests read
         // the same counters and all pick the same (currently-best) account,
         // leaving the rest idle under load.
@@ -1214,7 +1346,9 @@ impl AccountManager {
             {
                 continue;
             }
-            if let Some(seconds) = Self::rate_limit_remaining(account) {
+            let blocked = Self::rate_limit_remaining(account)
+                .or_else(|| scope.and_then(|scope| account.quota_remaining(scope, now)));
+            if let Some(seconds) = blocked {
                 if !exclude_ids.contains(&account.id) {
                     shortest_pause = Some(shortest_pause.map_or(seconds, |old| old.min(seconds)));
                 }
@@ -2075,12 +2209,12 @@ impl AccountManager {
 
 #[cfg(test)]
 mod tests {
-    use super::{AccountManager, AccountState, SwitchingWeights, utc_day};
+    use super::{AccountManager, AccountState, LeaseKind, LeaseRules, SwitchingWeights, utc_day};
     use crate::error::AppError;
     use std::sync::atomic::Ordering;
 
     fn rules(concurrency: u32, rest_ms: u32) -> super::LeaseRules {
-        super::LeaseRules { concurrency, rest_ms, per_hour: 0 }
+        super::LeaseRules { concurrency, rest_ms, per_hour: 0, scope: None }
     }
 
     #[test]
@@ -3071,7 +3205,7 @@ mod tests {
                     .unwrap(),
             );
         }
-        let per_hour = LeaseRules { concurrency: 0, rest_ms: 0, per_hour: 2 };
+        let per_hour = LeaseRules { concurrency: 0, rest_ms: 0, per_hour: 2, scope: None };
         for _ in 0..4 {
             am.lease_account_for(&[], LeaseKind::Playback, per_hour).await.unwrap();
         }
@@ -3118,8 +3252,80 @@ mod tests {
         assert_eq!(AccountManager::rate_limit_pause_secs(None, 4), 240);
         assert_eq!(AccountManager::rate_limit_pause_secs(None, 9), 900);
         assert_eq!(AccountManager::rate_limit_pause_secs(Some("10"), 3), 40);
-        // A longer Retry-After than the cap is still honoured.
+        // A longer Retry-After than the strike cap is still honoured...
         assert_eq!(AccountManager::rate_limit_pause_secs(Some("3600"), 2), 3600);
+        // ...but never past the hard cap, whether in seconds or as a date.
+        assert_eq!(AccountManager::rate_limit_pause_secs(Some("43200"), 1), 3600);
+        let tomorrow = (chrono::Utc::now() + chrono::Duration::hours(12)).to_rfc2822();
+        assert_eq!(AccountManager::rate_limit_pause_secs(Some(&tomorrow), 1), 3600);
+    }
+
+    #[test]
+    fn quota_scopes_group_tidal_endpoints() {
+        let scope = AccountManager::quota_scope;
+        assert_eq!(scope("https://api.tidal.com/v1/search/top-hits?query=x"), Some("search"));
+        assert_eq!(scope("https://api.tidal.com/v1/search/tracks"), Some("search"));
+        assert_eq!(scope("https://api.tidal.com/v1/tracks/1/playbackinfo"), Some("tracks"));
+        assert_eq!(scope("https://openapi.tidal.com/v2/searchResults/x"), Some("search"));
+        assert_eq!(scope("https://api.tidal.com/v1/albums/5"), Some("albums"));
+        assert_eq!(scope("https://widevine.tidal.com/license"), None);
+    }
+
+    #[tokio::test]
+    async fn long_429_is_an_endpoint_quota_not_an_account_pause() {
+        let am = AccountManager::new(None, SwitchingWeights::default());
+        let account = am
+            .add_account("a".into(), "c".into(), "s".into(), "rt".into(), None)
+            .await
+            .unwrap();
+        let midnight = (chrono::Utc::now() + chrono::Duration::hours(5)).to_rfc2822();
+        let (seconds, quota) = AccountManager::note_429(
+            &account,
+            "https://api.tidal.com/v1/search/tracks?query=x",
+            Some(&midnight),
+        )
+        .await;
+        assert!(quota && seconds > 4 * 3600);
+        // The account keeps serving tracks; only search skips it.
+        assert!(AccountManager::rate_limit_remaining(&account).is_none());
+        let now = chrono::Utc::now().timestamp();
+        assert!(account.quota_remaining("search", now).is_some());
+        assert!(account.quota_remaining("tracks", now).is_none());
+
+        let rules = |scope| LeaseRules { scope, ..LeaseRules::default() };
+        let err = am
+            .lease_account_for(&[], LeaseKind::Playback, rules(Some("search")))
+            .await
+            .err()
+            .expect("search has no account left");
+        assert!(matches!(err, AppError::RateLimited(s) if s > 4 * 3600));
+        assert!(am.lease_account_for(&[], LeaseKind::Playback, rules(Some("tracks"))).await.is_ok());
+
+        // A short 429 is still an ordinary pause of the whole account.
+        let (_, quota) = AccountManager::note_429(
+            &account,
+            "https://api.tidal.com/v1/tracks/1",
+            Some("30"),
+        )
+        .await;
+        assert!(!quota && AccountManager::rate_limit_remaining(&account).is_some());
+
+        AccountManager::clear_pause(&account).await;
+        assert!(account.quota_remaining("search", now).is_none());
+    }
+
+    #[tokio::test]
+    async fn clearing_a_pause_forgets_deadline_and_strikes() {
+        let am = AccountManager::new(None, SwitchingWeights::default());
+        let account = am
+            .add_account("a".into(), "c".into(), "s".into(), "rt".into(), None)
+            .await
+            .unwrap();
+        AccountManager::pause_account(&account, Some("600")).await;
+        assert!(AccountManager::rate_limit_remaining(&account).is_some());
+        AccountManager::clear_pause(&account).await;
+        assert!(AccountManager::rate_limit_remaining(&account).is_none());
+        assert_eq!(account.rate_limit_strikes.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]

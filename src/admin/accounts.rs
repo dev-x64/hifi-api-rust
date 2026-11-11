@@ -78,6 +78,8 @@ pub async fn list_accounts(State(state): State<AppState>) -> Result<Json<Value>,
             "request_count": a.request_count.load(std::sync::atomic::Ordering::Relaxed),
             "error_count": a.error_count.load(std::sync::atomic::Ordering::Relaxed),
             "rate_limited_until": a.rate_limited_until.load(std::sync::atomic::Ordering::Relaxed),
+            // Endpoint quotas Tidal reported as used up: {scope: until}.
+            "quotas": a.active_quotas(now).into_iter().collect::<std::collections::HashMap<_, _>>(),
             "is_catalog": a.is_catalog.load(std::sync::atomic::Ordering::Relaxed),
             "token_expires_at": a.token_expires_at.load(std::sync::atomic::Ordering::Relaxed),
             "last_used": a.last_used.load(std::sync::atomic::Ordering::Relaxed),
@@ -255,6 +257,21 @@ pub async fn refresh_account_token(
     }
 }
 
+/// Lift a 429 pause by hand, e.g. after Tidal asked for an overly long one.
+pub async fn unpause_account(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    let account = state
+        .account_manager
+        .get_account_by_id(&id)
+        .await
+        .ok_or_else(|| AppError::NotFound(format!("Account {} not found", id)))?;
+    AccountManager::clear_pause(&account).await;
+    tracing::info!(account = %account.label, "429 pause cleared by admin");
+    Ok(Json(json!({"status": "ok", "message": "Pause cleared"})))
+}
+
 /// Manual, read-only probe of FULL versus PREVIEW for one account.
 pub async fn check_account_premium(
     State(state): State<AppState>,
@@ -355,8 +372,9 @@ pub async fn test_all_accounts(State(state): State<AppState>) -> Result<Json<Val
                             let elapsed = start.elapsed().as_millis() as u64;
                             let status_code = resp.status().as_u16();
                             if status_code == 429 {
-                                AccountManager::pause_account(
+                                AccountManager::note_429(
                                     &acc,
+                                    &url,
                                     resp.headers().get(reqwest::header::RETRY_AFTER).and_then(|v| v.to_str().ok()),
                                 ).await;
                                 am.mark_account_error(&id, "Tidal admin test HTTP 429").await;
@@ -558,8 +576,9 @@ pub async fn test_account(
                 Ok(r) => {
                     let status_code = r.status().as_u16();
                     if status_code == 429 {
-                        AccountManager::pause_account(
+                        AccountManager::note_429(
                             &account,
+                            "https://api.tidal.com/v1/tracks/1/",
                             r.headers().get(reqwest::header::RETRY_AFTER).and_then(|v| v.to_str().ok()),
                         ).await;
                         state.account_manager.mark_account_error(&account.id, "Tidal admin test HTTP 429").await;

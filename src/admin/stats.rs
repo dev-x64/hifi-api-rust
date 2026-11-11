@@ -57,12 +57,14 @@ pub async fn account_availability(account: &AccountState, now: i64) -> AccountAv
     let enabled = account.is_active.load(Ordering::Relaxed);
     let paused = account.rate_limited_until.load(Ordering::Relaxed) > now;
     let premium = account.premium_status.read().await;
+    // A pause also holds back token refresh, so an expired token on a paused
+    // account is a consequence: name the pause, the cause the admin can act on.
     let state = if !enabled {
         Readiness::Disabled
-    } else if token_status != TokenStatus::Valid {
-        Readiness::NoToken
     } else if paused {
         Readiness::RateLimited
+    } else if token_status != TokenStatus::Valid {
+        Readiness::NoToken
     } else if account.is_catalog.load(Ordering::Relaxed) {
         Readiness::Ready
     } else if premium.as_str() == "preview-only" && fresh {

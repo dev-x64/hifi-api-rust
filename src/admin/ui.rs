@@ -1235,7 +1235,9 @@ function accountMenu(account, everyday) {
     function item(onclick, text, title, className) {
         return '<button type="button" class="menu-item' + (className ? ' ' + className : '') + '" onclick="' + onclick + '"' + (title ? ' title="' + title + '"' : '') + '>' + text + '</button>';
     }
-    var items = (everyday ? item('refreshAccount(' + id + ')', 'Обновить токен') : '') +
+    var paused = account.rate_limited_until > Date.now() / 1000 || Object.keys(account.quotas || {}).length > 0;
+    var items = (paused ? item('unpauseAccount(' + id + ')', 'Снять паузу 429', 'Вернуть аккаунт в работу до конца паузы или лимита, назначенных Tidal') : '') +
+        (everyday ? item('refreshAccount(' + id + ')', 'Обновить токен') : '') +
         item('checkPremium(' + id + ')', 'Проверить FULL', 'Проверка FULL/PREVIEW отправляет до четырёх запросов к Tidal') +
         item('checkSubscription(' + id + ')', 'Проверить подписку', 'Запрашивает у Tidal тариф и срок подписки') +
         item('openEdit(' + id + ')', 'Изменить') +
@@ -1260,7 +1262,20 @@ function accountStatusDetail(account) {
     var now = Date.now() / 1000;
     if (account.rate_limited_until > now) return tr('ещё ' + uptimeDuration(account.rate_limited_until - now));
     if (account.heal_next_retry > now) return tr('повтор через') + ' ' + uptimeDuration(account.heal_next_retry - now);
-    return '';
+    return quotaDetail(account);
+}
+
+var QUOTA_SCOPE_NAMES = {search:'поиск', tracks:'треки', albums:'альбомы', artists:'артисты', playlists:'плейлисты',
+    mixes:'миксы', videos:'видео', pages:'страницы', users:'профиль', lyrics:'тексты'};
+
+// Endpoint quotas Tidal reported as used up: the account still serves
+// everything else, only these requests skip it until the quota resets.
+function quotaDetail(account) {
+    var now = Date.now() / 1000;
+    var quotas = account.quotas || {};
+    return Object.keys(quotas).filter(function(scope) { return quotas[scope] > now; }).map(function(scope) {
+        return tr('лимит') + ' ' + tr(QUOTA_SCOPE_NAMES[scope] || scope) + ' ' + uptimeDuration(quotas[scope] - now);
+    }).join(', ');
 }
 
 function errorRateTone(rate) {
@@ -2077,6 +2092,18 @@ async function refreshAccount(id) {
         } else {
             document.getElementById('error').textContent = 'Refresh failed: ' + (data.message || data.detail || res.status);
         }
+    } catch(e) {
+        document.getElementById('error').textContent = e.message;
+    }
+}
+
+async function unpauseAccount(id) {
+    try {
+        var res = await fetch('/admin/accounts/' + id + '/unpause', { method: 'POST', headers: headers() });
+        var data = await res.json();
+        if (!res.ok) throw new Error(data.detail || 'HTTP ' + res.status);
+        document.getElementById('success').textContent = 'Пауза снята';
+        fetchData();
     } catch(e) {
         document.getElementById('error').textContent = e.message;
     }
