@@ -23,13 +23,13 @@ pub struct TidalClient {
     config: Arc<Config>,
     settings: Arc<AppSettings>,
     catalog_rate_limited_until: AtomicI64,
-    /// Round-robin cursor over account proxies for search without login.
+    /// Round-robin cursor over account proxies for requests without login.
     search_egress: AtomicUsize,
-    /// Client id sent with search without login.
+    /// Client id sent with requests without login.
     search_client_id: &'static str,
 }
 
-/// Egresses one search tries without login before it falls back to the
+/// Egresses one request tries without login before it falls back to the
 /// accounts.
 const SEARCH_WITHOUT_LOGIN_TRIES: usize = 2;
 
@@ -649,10 +649,10 @@ impl TidalClient {
     /// Catalog accounts at their concurrency limit are skipped; when all are
     /// busy the request overflows to the pool.
     async fn catalog_get(&self, url: &str, params: Vec<(&str, &str)>) -> Result<Value, AppError> {
-        if AccountManager::quota_scope(url) == Some("search") {
-            match self.search_without_login(url, &params).await {
+        if Self::works_without_login(url, &params) {
+            match self.get_without_login(url, &params).await {
                 Ok(data) => return Ok(data),
-                Err(e) => tracing::warn!("Search without login failed, using accounts: {}", e),
+                Err(e) => tracing::warn!("Request without login failed, using accounts: {}", e),
             }
         }
         let mut rate_limit_error: Option<AppError> = None;
@@ -749,13 +749,24 @@ impl TidalClient {
             .map(|wrapped| wrapped.get("data").cloned().unwrap_or(Value::Null))
     }
 
-    /// Search sent with only `X-Tidal-Token`, no account token. Tidal counts
-    /// the daily search quota per signed-in user and answers about half of
-    /// the account searches with 429 once it is used up; without login the
-    /// same searches go through (load-tested at 300/min over the proxies,
-    /// 180/min on one proxy, no 429). Goes out through the account proxies
-    /// in turn so the host IP is never used.
-    async fn search_without_login(
+    /// Search and ISRC lookup: Tidal answers both without an account token.
+    fn works_without_login(url: &str, params: &[(&str, &str)]) -> bool {
+        if AccountManager::quota_scope(url) == Some("search") {
+            return true;
+        }
+        params.iter().any(|(k, _)| *k == "isrc")
+            && reqwest::Url::parse(url)
+                .is_ok_and(|u| u.path().trim_end_matches('/').ends_with("/v1/tracks"))
+    }
+
+    /// GET with only `X-Tidal-Token`, no account token. Tidal counts the
+    /// daily search quota per signed-in user and answers about half of the
+    /// account searches with 429 once it is used up; without login the same
+    /// searches go through (load-tested at 300/min over the proxies, 180/min
+    /// on one proxy, no 429). ISRC lookups return the same tracks and fields
+    /// (1000 ISRCs compared). Goes out through the account proxies in turn
+    /// so the host IP is never used.
+    async fn get_without_login(
         &self,
         url: &str,
         params: &[(&str, &str)],
@@ -820,7 +831,7 @@ impl TidalClient {
             if !status.is_success() {
                 last_error = AppError::UpstreamError(
                     status,
-                    "Search without login failed".into(),
+                    "Request without login failed".into(),
                 );
                 // A 4xx other than 403 (a blocked proxy) is the same on any
                 // egress.
@@ -1703,6 +1714,14 @@ mod rate_limit_tests {
         let (calls, limited) = (seen.clone(), anon_429.clone());
         let track_seen = Arc::new(std::sync::Mutex::new(Vec::<(bool, String)>::new()));
         let track_calls = track_seen.clone();
+        let track_handler = move |headers: HeaderMap| {
+            let calls = track_calls.clone();
+            async move {
+                let token = headers["x-tidal-token"].to_str().unwrap().to_string();
+                calls.lock().unwrap().push((headers.contains_key("authorization"), token));
+                (StatusCode::OK, "{\"title\":\"ok\"}")
+            }
+        };
         let app = Router::new()
             .route(
                 "/v1/search/tracks",
@@ -1720,17 +1739,8 @@ mod rate_limit_tests {
                     }
                 }),
             )
-            .route(
-                "/v1/tracks/1",
-                get(move |headers: HeaderMap| {
-                    let calls = track_calls.clone();
-                    async move {
-                        let token = headers["x-tidal-token"].to_str().unwrap().to_string();
-                        calls.lock().unwrap().push((headers.contains_key("authorization"), token));
-                        (StatusCode::OK, "{\"title\":\"ok\"}")
-                    }
-                }),
-            );
+            .route("/v1/tracks", get(track_handler.clone()))
+            .route("/v1/tracks/{id}", get(track_handler));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -1744,7 +1754,14 @@ mod rate_limit_tests {
 
         // Other metadata keeps using the accounts.
         assert!(client.make_catalog_request(&format!("{base}/v1/tracks/1"), None).await.is_ok());
-        assert_eq!(track_seen.lock().unwrap().clone(), vec![(true, "client".to_string())]);
+        assert_eq!(track_seen.lock().unwrap().drain(..).collect::<Vec<_>>(), vec![(true, "client".to_string())]);
+
+        // ISRC lookup goes without login; a plain track list does not.
+        let tracks = format!("{base}/v1/tracks");
+        assert!(client.make_catalog_request(&tracks, Some(vec![("isrc", "X")])).await.is_ok());
+        assert_eq!(track_seen.lock().unwrap().drain(..).collect::<Vec<_>>(), vec![anon.clone()]);
+        assert!(client.make_catalog_request(&tracks, Some(vec![("ids", "1")])).await.is_ok());
+        assert_eq!(track_seen.lock().unwrap().drain(..).collect::<Vec<_>>(), vec![(true, "client".to_string())]);
 
         // A 429 without login tries one more egress, then the accounts answer.
         anon_429.store(true, Ordering::Relaxed);
