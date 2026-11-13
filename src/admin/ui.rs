@@ -2751,7 +2751,7 @@ function logTime(ts) {
 function accountChain(accounts) {
     return (accounts || []).map(function(account) {
         var label = account.label || account.id || '—';
-        var shortId = account.id && account.id !== 'catalog-token' ? ' [' + account.id.slice(0, 8) + ']' : '';
+        var shortId = account.id && account.id !== 'catalog-token' && account.id !== 'search-client' ? ' [' + account.id.slice(0, 8) + ']' : '';
         var role = account.role === 'catalog' ? ' · catalog' : '';
         return esc(label) + esc(shortId + role);
     }).join(' → ');

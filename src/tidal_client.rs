@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use chrono::Utc;
@@ -23,7 +23,15 @@ pub struct TidalClient {
     config: Arc<Config>,
     settings: Arc<AppSettings>,
     catalog_rate_limited_until: AtomicI64,
+    /// Round-robin cursor over account proxies for search without login.
+    search_egress: AtomicUsize,
+    /// Client id sent with search without login.
+    search_client_id: &'static str,
 }
+
+/// Egresses one search tries without login before it falls back to the
+/// accounts.
+const SEARCH_WITHOUT_LOGIN_TRIES: usize = 2;
 
 /// Other accounts one request may try after Tidal rate limits it. One more
 /// 429 is returned to the caller instead of walking the whole pool.
@@ -81,6 +89,8 @@ impl TidalClient {
             config,
             settings,
             catalog_rate_limited_until: AtomicI64::new(0),
+            search_egress: AtomicUsize::new(0),
+            search_client_id: crate::setup::REQUEST_CLIENT_ID,
         }
     }
 
@@ -639,6 +649,12 @@ impl TidalClient {
     /// Catalog accounts at their concurrency limit are skipped; when all are
     /// busy the request overflows to the pool.
     async fn catalog_get(&self, url: &str, params: Vec<(&str, &str)>) -> Result<Value, AppError> {
+        if AccountManager::quota_scope(url) == Some("search") {
+            match self.search_without_login(url, &params).await {
+                Ok(data) => return Ok(data),
+                Err(e) => tracing::warn!("Search without login failed, using accounts: {}", e),
+            }
+        }
         let mut rate_limit_error: Option<AppError> = None;
         let mut fallback_tried = false;
         let mut catalog_busy = false;
@@ -731,6 +747,95 @@ impl TidalClient {
         )
             .await
             .map(|wrapped| wrapped.get("data").cloned().unwrap_or(Value::Null))
+    }
+
+    /// Search sent with only `X-Tidal-Token`, no account token. Tidal counts
+    /// the daily search quota per signed-in user and answers about half of
+    /// the account searches with 429 once it is used up; without login the
+    /// same searches go through (load-tested at 300/min over the proxies,
+    /// 180/min on one proxy, no 429). Goes out through the account proxies
+    /// in turn so the host IP is never used.
+    async fn search_without_login(
+        &self,
+        url: &str,
+        params: &[(&str, &str)],
+    ) -> Result<Value, AppError> {
+        crate::request_log::note_account("search-client", "без входа", "search");
+        let accounts: Vec<Arc<AccountState>> = self
+            .account_manager
+            .list_accounts()
+            .await
+            .into_iter()
+            .filter(|a| a.is_active.load(Ordering::Relaxed))
+            .collect();
+        let tries = accounts.len().clamp(1, SEARCH_WITHOUT_LOGIN_TRIES);
+        let mut last_error = AppError::ServiceUnavailable("No egress for search".into());
+        for _ in 0..tries {
+            let egress = (!accounts.is_empty()).then(|| {
+                let i = self.search_egress.fetch_add(1, Ordering::Relaxed);
+                accounts[i % accounts.len()].id.clone()
+            });
+            let http = match egress.as_deref() {
+                Some(id) => self.working_client_for(id).await?,
+                None => self.working_client().await?,
+            };
+            let mut req = http
+                .get(url)
+                .header("X-Tidal-Token", self.search_client_id)
+                .header("User-Agent", self.config.user_agent.as_str())
+                .header("Accept", "*/*")
+                .header("Accept-Encoding", "gzip")
+                .header("Accept-Language", "en-US,en;q=0.9")
+                .header("X-Platform", "android")
+                .header("X-Tidal-Platform", "android");
+            if !params.is_empty() {
+                req = req.query(params);
+            }
+            let resp = match req.send().await {
+                Ok(resp) => {
+                    if let Some(id) = egress.as_deref() {
+                        self.proxy_manager.note_success_for(id).await;
+                    }
+                    resp
+                }
+                Err(e) => {
+                    if let Some(id) = egress.as_deref()
+                        && (e.is_connect() || e.is_timeout())
+                    {
+                        self.proxy_manager.note_failure_for(id).await;
+                    }
+                    last_error = e.into();
+                    continue;
+                }
+            };
+            let status = resp.status();
+            if status.as_u16() == 429 {
+                last_error = AppError::RateLimited(AccountManager::retry_after_secs(
+                    resp.headers()
+                        .get(reqwest::header::RETRY_AFTER)
+                        .and_then(|v| v.to_str().ok()),
+                ));
+                continue;
+            }
+            if !status.is_success() {
+                last_error = AppError::UpstreamError(
+                    status,
+                    "Search without login failed".into(),
+                );
+                // A 4xx other than 403 (a blocked proxy) is the same on any
+                // egress.
+                if status.is_client_error() && status.as_u16() != 403 {
+                    break;
+                }
+                continue;
+            }
+            let body = resp.text().await?;
+            self.dev_log("GET", url, status.as_u16(), &body);
+            return serde_json::from_str(&body).map_err(|e| {
+                AppError::UpstreamError(status, format!("Failed to parse Tidal response: {}", e))
+            });
+        }
+        Err(last_error)
     }
 
     async fn catalog_static_get(
@@ -1586,6 +1691,68 @@ mod rate_limit_tests {
         }
         assert_eq!(search_hits.load(Ordering::Relaxed), 5);
         assert!(client.make_request(&format!("{base}/v1/tracks/1"), None).await.is_ok());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn search_goes_without_login_and_falls_back_to_accounts() {
+        use axum::http::HeaderMap;
+        // (authorization present, x-tidal-token) per call.
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<(bool, String)>::new()));
+        let anon_429 = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (calls, limited) = (seen.clone(), anon_429.clone());
+        let track_seen = Arc::new(std::sync::Mutex::new(Vec::<(bool, String)>::new()));
+        let track_calls = track_seen.clone();
+        let app = Router::new()
+            .route(
+                "/v1/search/tracks",
+                get(move |headers: HeaderMap| {
+                    let calls = calls.clone();
+                    let limited = limited.clone();
+                    async move {
+                        let authed = headers.contains_key("authorization");
+                        let token = headers["x-tidal-token"].to_str().unwrap().to_string();
+                        calls.lock().unwrap().push((authed, token));
+                        if !authed && limited.load(Ordering::Relaxed) {
+                            return (StatusCode::TOO_MANY_REQUESTS, "{}");
+                        }
+                        (StatusCode::OK, "{\"items\":[]}")
+                    }
+                }),
+            )
+            .route(
+                "/v1/tracks/1",
+                get(move |headers: HeaderMap| {
+                    let calls = track_calls.clone();
+                    async move {
+                        let token = headers["x-tidal-token"].to_str().unwrap().to_string();
+                        calls.lock().unwrap().push((headers.contains_key("authorization"), token));
+                        (StatusCode::OK, "{\"title\":\"ok\"}")
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (client, _manager) = client_with_accounts(3).await;
+        let search = format!("{base}/v1/search/tracks");
+        let anon = (false, crate::setup::REQUEST_CLIENT_ID.to_string());
+
+        // Search: no account token at all.
+        assert!(client.make_catalog_request(&search, None).await.is_ok());
+        assert_eq!(seen.lock().unwrap().drain(..).collect::<Vec<_>>(), vec![anon.clone()]);
+
+        // Other metadata keeps using the accounts.
+        assert!(client.make_catalog_request(&format!("{base}/v1/tracks/1"), None).await.is_ok());
+        assert_eq!(track_seen.lock().unwrap().clone(), vec![(true, "client".to_string())]);
+
+        // A 429 without login tries one more egress, then the accounts answer.
+        anon_429.store(true, Ordering::Relaxed);
+        assert!(client.make_catalog_request(&search, None).await.is_ok());
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            vec![anon.clone(), anon, (true, "client".to_string())]
+        );
         server.abort();
     }
 
