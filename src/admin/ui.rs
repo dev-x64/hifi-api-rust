@@ -1571,14 +1571,18 @@ function playbackCard(pb, readiness) {
     var unlimited = pb.limit === null, limit = unlimited ? 0 : (pb.limit != null ? pb.limit : (pb.pool_size || 0)), active = pb.active || 0;
     var meter = '<div class="stat-bar stat-meter" aria-hidden="true"><i style="width:' +
         (limit > 0 ? Math.min(100, active * 100 / limit) : 0).toFixed(1) + '%"></i></div>';
-    var rows = [metricRow('Лимит одновременно', unlimited ? 'без лимита' : esc(metricNumber(limit))), metricRow('В очереди', esc(metricNumber(pb.pending)))];
+    var rows = [
+        metricRow('Среднее за 60 с', esc(metricNumber(pb.avg_active_60s, 2))),
+        metricRow('Лимит одновременно', unlimited ? 'без лимита' : esc(metricNumber(limit))),
+        metricRow('В очереди', esc(metricNumber(pb.pending)))
+    ];
     if (pb.pending > 0) rows.push(metricRow('Самое долгое ожидание', esc(uptimeDuration(pb.oldest_pending_secs))));
     var note = '';
     if (readiness.enabled === 0) note = '<span>Нет включённых аккаунтов воспроизведения.</span>';
     else if ((pb.pool_size || 0) < readiness.enabled) note = '<span>Обслуживать запросы могут</span> <strong>' + esc(metricNumber(readiness.metadata_ready)) +
         '</strong> <span>из</span> <strong>' + esc(metricNumber(readiness.enabled)) + '</strong> <span>включённых аккаунтов; остальные без токена или на паузе 429.</span>';
     return metricCard('Запросы воспроизведения', esc(metricNumber(pb.active)) + ' <span class="metric-unit">выполняются</span>', [],
-        'Запросы треков, видео и лицензий, выполняемые в момент обновления. Лимит — число аккаунтов воспроизведения с действующим токеном и без паузы 429, умноженное на число одновременных запросов на аккаунт из настроек.',
+        'Сколько слотов занимают запросы треков, видео и лицензий. Среднее учитывает время простоя. В первую минуту считается по времени с запуска. Лимит — число аккаунтов воспроизведения с действующим токеном и без паузы 429, умноженное на число одновременных запросов на аккаунт из настроек.',
         meter + metricRows(rows) + (note ? '<div class="stat-note">' + note + '</div>' : ''));
 }
 

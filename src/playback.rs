@@ -11,8 +11,9 @@
 //! inside its slot.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::sync::Mutex;
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 
 use axum::Json;
 use axum::extract::{Path, State};
@@ -44,6 +45,7 @@ const OP_TIMEOUT_SECS: u64 = 120;
 /// Fallback wakeup for slot waiters. Releases broadcast via Notify; the
 /// timeout covers pool-size changes with no completions in flight.
 const SLOT_WAIT_SECS: u64 = 2;
+const SLOT_USAGE_WINDOW: Duration = Duration::from_secs(60);
 
 /// A queued playback operation. All data owned so jobs can outlive the request.
 #[derive(Clone)]
@@ -142,12 +144,59 @@ struct TrackTiming {
     total_ms: u64,
 }
 
+struct SlotUsage {
+    active: usize,
+    changes: VecDeque<(Instant, usize)>,
+}
+
+impl SlotUsage {
+    fn new(now: Instant) -> Self {
+        Self {
+            active: 0,
+            changes: VecDeque::from([(now, 0)]),
+        }
+    }
+
+    // Keep the last state at or before the start of the window as its baseline.
+    fn prune(&mut self, now: Instant) -> Instant {
+        let start = now - (now - self.changes[0].0).min(SLOT_USAGE_WINDOW);
+        while self.changes.get(1).is_some_and(|&(at, _)| at <= start) {
+            self.changes.pop_front();
+        }
+        start
+    }
+
+    fn set_active(&mut self, now: Instant, active: usize) {
+        self.active = active;
+        self.changes.push_back((now, active));
+        self.prune(now);
+    }
+
+    /// Occupied slot-seconds divided by the time observed, including idle time.
+    fn average(&mut self, now: Instant) -> f64 {
+        let start = self.prune(now);
+        if now == start {
+            return self.active as f64;
+        }
+        let mut last = start;
+        let mut active = self.changes[0].1;
+        let mut occupied = 0.0;
+        for &(at, next_active) in self.changes.iter().skip(1) {
+            occupied += (at - last).as_secs_f64() * active as f64;
+            last = at;
+            active = next_active;
+        }
+        occupied += (now - last).as_secs_f64() * active as f64;
+        occupied / (now - start).as_secs_f64()
+    }
+}
+
 pub struct PlaybackQueue {
     /// Recent successful track answers by request (see `cache_key`).
     results: moka::future::Cache<String, JobResult>,
     pub cache_hits: std::sync::atomic::AtomicU64,
     timings: std::sync::Mutex<VecDeque<TrackTiming>>,
-    inflight: AtomicUsize,
+    slots: Mutex<SlotUsage>,
     jobs: RwLock<HashMap<String, Job>>,
     /// Broadcast on slot release so waiters wake immediately instead of
     /// polling on a timer.
@@ -163,39 +212,35 @@ impl PlaybackQueue {
                 .build(),
             cache_hits: std::sync::atomic::AtomicU64::new(0),
             timings: std::sync::Mutex::new(VecDeque::with_capacity(TIMING_SAMPLES)),
-            inflight: AtomicUsize::new(0),
+            slots: Mutex::new(SlotUsage::new(Instant::now())),
             jobs: RwLock::new(HashMap::new()),
             wakeup: tokio::sync::Notify::new(),
         }
     }
 
     fn try_acquire(&self, pool: usize) -> bool {
-        let mut current = self.inflight.load(Ordering::Relaxed);
-        loop {
-            if current >= pool.max(1) {
-                return false;
-            }
-            match self.inflight.compare_exchange_weak(
-                current,
-                current + 1,
-                Ordering::SeqCst,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return true,
-                Err(actual) => current = actual,
-            }
+        let mut slots = self.slots.lock().unwrap();
+        let active = slots.active;
+        if active >= pool.max(1) {
+            return false;
         }
+        slots.set_active(Instant::now(), active + 1);
+        true
     }
 
     fn release(&self) {
-        self.inflight
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
-                Some(v.saturating_sub(1))
-            })
-            .ok();
+        {
+            let mut slots = self.slots.lock().unwrap();
+            let active = slots.active.saturating_sub(1);
+            slots.set_active(Instant::now(), active);
+        }
         // Wake one waiter: a freed slot should be re-leased immediately,
         // not discovered on the next timer tick.
         self.wakeup.notify_one();
+    }
+
+    fn active(&self) -> usize {
+        self.slots.lock().unwrap().active
     }
 
     /// True when the queue is past the shed threshold. Pure function —
@@ -383,7 +428,7 @@ impl PlaybackQueue {
                 },
             );
         }
-        let active = self.inflight.load(Ordering::Relaxed);
+        let active = self.active();
         let position = self.pending_position(&id).await;
 
         // Background worker: wait for a slot, then run. Cancellation is
@@ -478,7 +523,7 @@ impl PlaybackQueue {
         Ok(Self::pending_response(&id, position, accounts, active))
     }
 
-    async fn snapshot(&self, pool: usize) -> (usize, usize, usize, i64) {
+    async fn snapshot(&self) -> (usize, usize, i64) {
         let jobs = self.jobs.read().await;
         let now = chrono::Utc::now().timestamp();
         let mut pending = 0usize;
@@ -490,9 +535,7 @@ impl PlaybackQueue {
             }
         }
         let total = jobs.len();
-        let active = self.inflight.load(Ordering::Relaxed);
-        let _ = pool;
-        (active, pending, total, oldest)
+        (pending, total, oldest)
     }
 
     /// Identity of a cacheable answer: every input that shapes it, plus the
@@ -570,12 +613,17 @@ impl PlaybackQueue {
 
     /// Queue counters for /admin/stats. `limit` None means unlimited.
     pub async fn stats(&self, pool: usize, limit: Option<usize>) -> Value {
-        let (active, pending, total, oldest) = self.snapshot(pool).await;
+        let (pending, total, oldest) = self.snapshot().await;
+        let (active, avg_active_60s) = {
+            let mut slots = self.slots.lock().unwrap();
+            (slots.active, slots.average(Instant::now()))
+        };
         json!({
             "pool_size": pool,
             "limit": limit,
             "track_latency": self.track_latency(),
             "active": active,
+            "avg_active_60s": avg_active_60s,
             "pending": pending,
             "jobs": total,
             "oldest_pending_secs": oldest,
@@ -707,7 +755,7 @@ pub async fn get_playback_request(
 ) -> Response {
     state.playback.prune().await;
     let pool = PlaybackQueue::pool_size(&state).await;
-    let active = state.playback.inflight.load(Ordering::Relaxed);
+    let active = state.playback.active();
     // Presence heartbeat: a polled job has a live waiter. Unpolled pending
     // jobs expire via prune instead of burning slots on corpses.
     {
@@ -782,7 +830,7 @@ pub async fn cancel_playback_request(
 ) -> Response {
     state.playback.prune().await;
     let pool = PlaybackQueue::pool_size(&state).await;
-    let active = state.playback.inflight.load(Ordering::Relaxed);
+    let active = state.playback.active();
     {
         let mut jobs = state.playback.jobs.write().await;
         if let Some(job) = jobs.get_mut(&request_id) {
@@ -835,8 +883,9 @@ pub async fn clear_playback_queue(State(state): State<AppState>) -> Result<Json<
 
 #[cfg(test)]
 mod tests {
-    use super::{Job, JobState, PENDING_TIMEOUT_SECS, PlaybackQueue};
+    use super::{Job, JobState, PENDING_TIMEOUT_SECS, PlaybackQueue, SlotUsage};
     use std::collections::HashMap;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn cache_key_covers_every_input_and_skips_video_and_licenses() {
@@ -919,6 +968,32 @@ mod tests {
         let q2 = PlaybackQueue::new();
         assert!(q2.try_acquire(0));
         assert!(!q2.try_acquire(0));
+    }
+
+    #[test]
+    fn slot_average_counts_short_requests_and_idle_time() {
+        let start = Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+        let mut usage = SlotUsage::new(start);
+        assert_eq!(usage.average(start), 0.0);
+        usage.set_active(at(250), 1);
+        usage.set_active(at(500), 2);
+        usage.set_active(at(750), 0);
+        assert_eq!(usage.average(at(1_000)), 0.75);
+    }
+
+    #[test]
+    fn slot_average_counts_only_the_part_of_a_request_inside_the_window() {
+        let start = Instant::now();
+        let at = |secs| start + Duration::from_secs(secs);
+        let mut usage = SlotUsage::new(start);
+        usage.set_active(at(5), 1);
+        usage.set_active(at(10), 3);
+        assert_eq!(usage.average(at(80)), 3.0);
+        usage.set_active(at(90), 0);
+        assert_eq!(usage.average(at(110)), 2.0);
+        assert_eq!(usage.average(at(150)), 0.0);
+        assert_eq!(usage.changes.len(), 1);
     }
 
     #[test]

@@ -228,6 +228,19 @@ for (const language of ['en', 'ru']) {
         // Older servers send only the account count.
         assert.ok(card({ active: 0, pending: 0, pool_size: 5 }).includes(label + '</span><strong>5<'));
     });
+
+    test(`playback card shows time-weighted slot use separately from current use (${language})`, () => {
+        const { ctx } = context(language);
+        const card = playback => localized(ctx, vm.runInContext('playbackCard(' + JSON.stringify(playback) + ')', ctx));
+        const label = language === 'en' ? '60-second average' : 'Среднее за 60 с';
+        const decimal = language === 'en' ? '.' : ',';
+        const current = { active: 1, pending: 0, pool_size: 25, limit: 25 };
+        const html = card({ ...current, avg_active_60s: 0.42 });
+        assert.match(html, /class="value">1 </);
+        assert.ok(html.includes(label + '</span><strong>0' + decimal + '42<'));
+        assert.ok(card({ ...current, avg_active_60s: 0 }).includes(label + '</span><strong>0' + decimal + '00<'));
+        assert.ok(card(current).includes(label + '</span><strong>—<'));
+    });
 }
 
 test('uptime reset is sent only after confirmation and then reloads accounts', async () => {
